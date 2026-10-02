@@ -1,6 +1,6 @@
 """Скрипт для очистки и переименования аудиофайлов в указанной директории."""
 
-import os
+import sys
 import re
 from pathlib import Path
 from collections import Counter
@@ -11,7 +11,10 @@ from mutagen.oggvorbis import OggVorbis
 from mutagen.asf import ASF
 from mutagen.id3 import ID3NoHeaderError, TIT2, TPE1
 
-DEBUG = True  # включаем отладку
+# Сухой режим: если True, скрипт только показывает, что сделает,
+# но не переименовывает и не удаляет файлы.
+DRY_RUN = '--dry-run' in sys.argv
+DEBUG = '--debug' in sys.argv
 
 JUNK_PATTERN = re.compile(
     r'\s*[\(\[][^)\]]*vksaver[^)\]]*[\)\]]', re.IGNORECASE
@@ -36,7 +39,6 @@ def get_valid_path() -> Path:
     """Запрашивает у пользователя путь и проверяет его корректность."""
     while True:
         raw = input("Введите путь к папке: ").strip().strip('"')
-        print('raw:', raw)
         path_obj = Path(raw)
         if path_obj.is_dir():
             return path_obj
@@ -199,8 +201,9 @@ def write_audio_tags(filepath: Path, artist: str, title: str) -> bool:
                 audio = MP3(filepath, ID3=ID3)
             if audio.tags is None:
                 audio.add_tags()
-            audio.tags.add(TPE1(encoding=3, text=artist))
-            audio.tags.add(TIT2(encoding=3, text=title))
+            # Заменяем теги вместо добавления (иначе будут дубликаты)
+            audio.tags['TPE1'] = TPE1(encoding=3, text=artist)
+            audio.tags['TIT2'] = TIT2(encoding=3, text=title)
             audio.save()
             return True
         elif ext in ('.m4a', '.mp4'):
@@ -269,6 +272,19 @@ def rename_case_sensitive(old_path: Path, new_path: Path) -> bool:
         return False
 
 
+def safe_unlink(filepath: Path) -> bool:
+    """Безопасно удаляет файл, обрабатывая ошибки блокировки."""
+    try:
+        filepath.unlink()
+        return True
+    except PermissionError:
+        print(f"  Ошибка: файл заблокирован, не могу удалить: {filepath.name}")
+        return False
+    except OSError as e:
+        print(f"  Ошибка при удалении {filepath.name}: {e}")
+        return False
+
+
 def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
     """Безопасно переименовывает файл, обрабатывая дубликаты."""
     dbg(f"rename: {old_path.name!r} -> {new_path.name!r}")
@@ -280,6 +296,9 @@ def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
     # КЛЮЧЕВАЯ ПРОВЕРКА: один ли это файл на диске?
     if files_are_same(old_path, new_path):
         dbg("Это один и тот же файл (samefile), меняем только регистр")
+        if DRY_RUN:
+            dbg("[DRY RUN] Пропускаю смену регистра")
+            return 'renamed', new_path
         if rename_case_sensitive(old_path, new_path):
             dbg(f"Регистр успешно изменён: {new_path.name}")
             return 'renamed', new_path
@@ -287,6 +306,9 @@ def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
         return 'skipped', None
     
     if not new_path.exists():
+        if DRY_RUN:
+            dbg(f"[DRY RUN] Переименовал бы: {old_path.name} -> {new_path.name}")
+            return 'renamed', new_path
         old_path.rename(new_path)
         return 'renamed', new_path
 
@@ -308,7 +330,7 @@ def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
         and old_tags[1].lower().strip() == existing_tags[1].lower().strip()
     )
     
-    print(f"\n  Обнаружен РЕАЛЬНЫЙ дубликат на диске: {new_path.name}")
+    print(f"\n  Обнаружен дубликат на диске: {new_path.name}")
     if tags_match:
         print("  Теги обеих композиций совпадают — это одна и та же песня.")
     
@@ -320,6 +342,10 @@ def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
     print(f"  2. {new_path.name} ({existing_info}) [уже есть на диске]")
     print(f"     Теги: {existing_tags_str}")
 
+    if DRY_RUN:
+        print("  [DRY RUN] Пропускаю выбор дубликата")
+        return 'skipped', None
+
     choice = input(
         "Какой файл оставить? (1/2/n - пропустить) [1]: "
     ).strip().lower()
@@ -327,15 +353,18 @@ def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
     if choice in ('n', 'no', 'н', 'нет'):
         return 'skipped', None
     if choice in ('', '1'):
-        new_path.unlink()
+        if not safe_unlink(new_path):
+            return 'skipped', None
         old_path.rename(new_path)
         return 'renamed', new_path
     if choice == '2':
-        old_path.unlink()
+        if not safe_unlink(old_path):
+            return 'skipped', None
         return 'kept_existing', new_path
     
     print("  Некорректный ввод, выбираю вариант 1.")
-    new_path.unlink()
+    if not safe_unlink(new_path):
+        return 'skipped', None
     old_path.rename(new_path)
     return 'renamed', new_path
 
@@ -471,6 +500,9 @@ def process_rename_batch(
 def main() -> None:
     """Запускает основной цикл обработки и переименования файлов."""
     print("=== Обработчик аудиофайлов ===")
+    if DRY_RUN:
+        print("*** СУХОЙ РЕЖИМ: изменения не будут применены ***")
+    
     target_dir = get_valid_path()
     files = get_audio_files(target_dir)
 
@@ -533,6 +565,11 @@ def main() -> None:
             for i, f in enumerate(sorted_group, 1):
                 info = file_info_line(f)
                 print(f"  {i}. {f.name} ({info})")
+            
+            if DRY_RUN:
+                print("  [DRY RUN] Пропускаю выбор дубликата")
+                continue
+            
             choice = input(
                 "Введите номер файла для сохранения "
                 "(n - пропустить) [1]: "
@@ -554,8 +591,7 @@ def main() -> None:
                     keep_idx = 0
             for i, f in enumerate(sorted_group):
                 if i != keep_idx:
-                    if f.exists():
-                        f.unlink()
+                    if safe_unlink(f):
                         print(f"  Удалён: {f.name}")
                         processed_stats['duplicates_removed'] += 1
             files = [f for f in files if f.exists()]
@@ -648,6 +684,9 @@ def main() -> None:
         )
         for i in idx:
             f, artist, title = tags_to_write[i]
+            if DRY_RUN:
+                print(f"  [DRY RUN] Записал бы теги: {f.name}")
+                continue
             if write_audio_tags(f, artist, title):
                 print(f"  Записаны теги: {f.name}")
                 processed_stats['tags_written'] += 1
@@ -703,11 +742,14 @@ def main() -> None:
                     dbg(f"Файл {f.name} уже не существует, пропускаю")
                     continue
                 if artist != canonical:
-                    dbg(f"Файл {f.name} имеет тег {artist!r}, "
-                        f"меняю на {canonical!r}")
                     tags = read_audio_tags(f)
                     if tags:
-                        if write_audio_tags(f, canonical, tags[1]):
+                        if DRY_RUN:
+                            print(
+                                f"  [DRY RUN] Обновил бы тег: {f.name} "
+                                f"({artist} -> {canonical})"
+                            )
+                        elif write_audio_tags(f, canonical, tags[1]):
                             print(
                                 f"  Обновлено: {f.name} "
                                 f"({artist} -> {canonical})"
@@ -718,8 +760,6 @@ def main() -> None:
                     if parsed and parsed[0] != canonical:
                         new_name = f"{canonical} - {parsed[1]}{f.suffix}"
                         new_path = f.with_name(new_name)
-                        dbg(f"Пытаюсь переименовать: {f.name!r} "
-                            f"-> {new_path.name!r}")
                         status, result_path = safe_rename(f, new_path)
                         handle_rename_result(
                             status, f, result_path,
