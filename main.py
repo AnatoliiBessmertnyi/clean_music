@@ -11,8 +11,6 @@ from mutagen.oggvorbis import OggVorbis
 from mutagen.asf import ASF
 from mutagen.id3 import ID3NoHeaderError, TIT2, TPE1
 
-# Сухой режим: если True, скрипт только показывает, что сделает,
-# но не переименовывает и не удаляет файлы.
 DRY_RUN = '--dry-run' in sys.argv
 DEBUG = '--debug' in sys.argv
 
@@ -28,11 +26,21 @@ LEADING_TRACK_PATTERN = re.compile(
 )
 SUPPORTED_EXTENSIONS = {'.mp3', '.m4a', '.mp4', '.flac', '.ogg', '.wma'}
 
+TOTAL_STAGES = 8
+
 
 def dbg(msg: str) -> None:
     """Выводит отладочное сообщение, если включён DEBUG."""
     if DEBUG:
         print(f"  [DEBUG] {msg}")
+
+
+def stage(number: int, name: str) -> None:
+    """Печатает заголовок этапа обработки."""
+    print(f"\n{'='*60}")
+    print(f"[Этап {number}/{TOTAL_STAGES}] {name}")
+    print(f"{'='*60}")
+    dbg(f"Начинаю этап {number}/{TOTAL_STAGES}: {name}")
 
 
 def get_valid_path() -> Path:
@@ -151,6 +159,20 @@ def extract_title_from_filename(filename: str) -> str:
     return filename
 
 
+def name_quality_score(filepath: Path) -> int:
+    """Оценивает качество имени файла (чем выше, тем лучше)."""
+    if parse_artist_title(filepath.stem):
+        return 3  # Формат "Artist - Title" (лучший)
+    if LEADING_TRACK_PATTERN.match(filepath.stem):
+        return 1  # Начинается с номера трека (худший)
+    return 2  # Что-то среднее
+
+
+def get_best_name_from_group(group: list[Path]) -> Path:
+    """Выбирает файл с наиболее правильным именем из группы дубликатов."""
+    return max(group, key=name_quality_score)
+
+
 def read_audio_tags(filepath: Path) -> tuple[str, str] | None:
     """Читает теги из аудиофайла и возвращает (Исполнитель, Название)."""
     ext = filepath.suffix.lower()
@@ -201,7 +223,6 @@ def write_audio_tags(filepath: Path, artist: str, title: str) -> bool:
                 audio = MP3(filepath, ID3=ID3)
             if audio.tags is None:
                 audio.add_tags()
-            # Заменяем теги вместо добавления (иначе будут дубликаты)
             audio.tags['TPE1'] = TPE1(encoding=3, text=artist)
             audio.tags['TIT2'] = TIT2(encoding=3, text=title)
             audio.save()
@@ -278,7 +299,10 @@ def safe_unlink(filepath: Path) -> bool:
         filepath.unlink()
         return True
     except PermissionError:
-        print(f"  Ошибка: файл заблокирован, не могу удалить: {filepath.name}")
+        print(
+            f"  Ошибка: файл заблокирован, "
+            f"не могу удалить: {filepath.name}"
+        )
         return False
     except OSError as e:
         print(f"  Ошибка при удалении {filepath.name}: {e}")
@@ -293,7 +317,6 @@ def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
         print(f"  Файл не найден: {old_path.name}")
         return 'skipped', None
     
-    # КЛЮЧЕВАЯ ПРОВЕРКА: один ли это файл на диске?
     if files_are_same(old_path, new_path):
         dbg("Это один и тот же файл (samefile), меняем только регистр")
         if DRY_RUN:
@@ -307,12 +330,12 @@ def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
     
     if not new_path.exists():
         if DRY_RUN:
-            dbg(f"[DRY RUN] Переименовал бы: {old_path.name} -> {new_path.name}")
+            dbg(f"[DRY RUN] Переименовал бы: "
+                f"{old_path.name} -> {new_path.name}")
             return 'renamed', new_path
         old_path.rename(new_path)
         return 'renamed', new_path
 
-    # Реальный дубликат — другой файл на диске
     old_tags = read_audio_tags(old_path)
     existing_tags = read_audio_tags(new_path)
     
@@ -332,7 +355,7 @@ def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
     
     print(f"\n  Обнаружен дубликат на диске: {new_path.name}")
     if tags_match:
-        print("  Теги обеих композиций совпадают — это одна и та же песня.")
+        print("  Теги обеих композиций совпадают — одна и та же песня.")
     
     old_info = file_info_line(old_path)
     existing_info = file_info_line(new_path)
@@ -497,6 +520,82 @@ def process_rename_batch(
     return new_files
 
 
+def process_duplicates(
+    files: list[Path], stats: dict[str, int]
+) -> list[Path]:
+    """Обрабатывает группы дубликатов с умным объединением имён."""
+    duplicates = find_duplicates(files)
+    if not duplicates:
+        return files
+    
+    print(f"\nНайдено {len(duplicates)} групп дубликатов.")
+    for group_idx, group in enumerate(duplicates, 1):
+        print(f"\n--- Группа {group_idx} ---")
+        sorted_group = sorted(
+            group, key=lambda p: p.stat().st_size, reverse=True
+        )
+        best_name_file = get_best_name_from_group(group)
+        
+        print("Какой файл оставить по качеству? "
+              "(остальные будут удалены):")
+        for i, f in enumerate(sorted_group, 1):
+            info = file_info_line(f)
+            marker = " [лучшее имя]" if f == best_name_file else ""
+            print(f"  {i}. {f.name} ({info}){marker}")
+        
+        if DRY_RUN:
+            print("  [DRY RUN] Пропускаю выбор дубликата")
+            continue
+        
+        choice = input(
+            "Введите номер файла для сохранения "
+            "(n - пропустить) [1]: "
+        ).strip().lower()
+        
+        if choice in ('n', 'no', 'н', 'нет'):
+            continue
+        if choice in ('', '1'):
+            keep_idx = 0
+        else:
+            try:
+                keep_idx = int(choice) - 1
+                if not (0 <= keep_idx < len(sorted_group)):
+                    print("Некорректный номер, пропускаю группу.")
+                    continue
+            except ValueError:
+                print("Некорректный ввод, выбираю вариант 1.")
+                keep_idx = 0
+        
+        keep_file = sorted_group[keep_idx]
+        
+        # Удаляем все файлы, кроме выбранного
+        for i, f in enumerate(sorted_group):
+            if i != keep_idx:
+                if safe_unlink(f):
+                    print(f"  Удалён: {f.name}")
+                    stats['duplicates_removed'] += 1
+        
+        # Переименовываем выбранный файл в лучшее имя, если нужно
+        if keep_file != best_name_file and best_name_file.exists():
+            # Файл с лучшим именем ещё существует — это дубликат
+            # Он уже должен был быть удалён выше, но на всякий случай
+            dbg("Файл с лучшим именем ещё существует, удаляю")
+            safe_unlink(best_name_file)
+        
+        if keep_file != best_name_file:
+            new_name = best_name_file.name
+            new_path = keep_file.with_name(new_name)
+            dbg(f"Переименовываю в лучшее имя: "
+                f"{keep_file.name} -> {new_name}")
+            status, result_path = safe_rename(keep_file, new_path)
+            if status == 'renamed':
+                print(f"  Переименован в лучшее имя: "
+                      f"{keep_file.name} -> {result_path.name}")
+                stats['duplicates_removed'] += 1
+    
+    return [f for f in files if f.exists()]
+
+
 def main() -> None:
     """Запускает основной цикл обработки и переименования файлов."""
     print("=== Обработчик аудиофайлов ===")
@@ -526,6 +625,7 @@ def main() -> None:
     }
 
     # --- Шаг 1: Очистка от мусора ---
+    stage(1, "Очистка от мусора")
     junk = [f for f in files if JUNK_PATTERN.search(f.stem)]
     files = process_rename_batch(
         files, junk, remove_junk,
@@ -534,6 +634,7 @@ def main() -> None:
     )
 
     # --- Шаг 2: Нормализация тире ---
+    stage(2, "Нормализация тире")
     dash = [f for f in files if '–' in f.stem or '—' in f.stem]
     files = process_rename_batch(
         files, dash, normalize_dash,
@@ -541,7 +642,8 @@ def main() -> None:
         processed_stats, 'dash_normalized',
     )
 
-    # --- Шаг 2.5: Нормализация пробелов ---
+    # --- Шаг 3: Нормализация пробелов ---
+    stage(3, "Нормализация пробелов")
     spaces = [
         f for f in files
         if normalize_filename_stem(f.stem) != f.stem
@@ -552,51 +654,12 @@ def main() -> None:
         processed_stats, 'spaces_normalized',
     )
 
-    # --- Шаг 3: Поиск дубликатов ---
-    duplicates = find_duplicates(files)
-    if duplicates:
-        print(f"\nНайдено {len(duplicates)} групп дубликатов.")
-        for group_idx, group in enumerate(duplicates, 1):
-            print(f"\n--- Группа {group_idx} ---")
-            sorted_group = sorted(
-                group, key=lambda p: p.stat().st_size, reverse=True
-            )
-            print("Какой файл оставить? (остальные будут удалены):")
-            for i, f in enumerate(sorted_group, 1):
-                info = file_info_line(f)
-                print(f"  {i}. {f.name} ({info})")
-            
-            if DRY_RUN:
-                print("  [DRY RUN] Пропускаю выбор дубликата")
-                continue
-            
-            choice = input(
-                "Введите номер файла для сохранения "
-                "(n - пропустить) [1]: "
-            ).strip().lower()
-            if choice in ('n', 'no', 'н', 'нет'):
-                continue
-            if choice in ('', '1'):
-                keep_idx = 0
-            elif choice == '2':
-                keep_idx = 1
-            else:
-                try:
-                    keep_idx = int(choice) - 1
-                    if not (0 <= keep_idx < len(sorted_group)):
-                        print("Некорректный номер, пропускаю группу.")
-                        continue
-                except ValueError:
-                    print("Некорректный ввод, выбираю вариант 1.")
-                    keep_idx = 0
-            for i, f in enumerate(sorted_group):
-                if i != keep_idx:
-                    if safe_unlink(f):
-                        print(f"  Удалён: {f.name}")
-                        processed_stats['duplicates_removed'] += 1
-            files = [f for f in files if f.exists()]
+    # --- Шаг 4: Поиск дубликатов ---
+    stage(4, "Поиск и объединение дубликатов")
+    files = process_duplicates(files, processed_stats)
 
-    # --- Шаг 4: Переименование по тегам с проверкой ---
+    # --- Шаг 5: Переименование по тегам с проверкой ---
+    stage(5, "Переименование по тегам")
     safe_candidates = []
     mismatch_candidates = []
     missing = []
@@ -661,7 +724,8 @@ def main() -> None:
                 processed_stats, 'renamed_by_tags',
             )
 
-    # --- Шаг 5: Запись тегов из имени файла ---
+    # --- Шаг 6: Запись тегов из имени файла ---
+    stage(6, "Запись тегов из имени файла")
     tags_to_write = []
     for f in files:
         if not f.exists():
@@ -691,7 +755,8 @@ def main() -> None:
                 print(f"  Записаны теги: {f.name}")
                 processed_stats['tags_written'] += 1
 
-    # --- Шаг 5.5: Нормализация имён исполнителей ---
+    # --- Шаг 7: Нормализация имён исполнителей ---
+    stage(7, "Нормализация имён исполнителей")
     artist_variations = find_artist_variations(files)
     if artist_variations:
         print(
@@ -758,7 +823,9 @@ def main() -> None:
                     
                     parsed = parse_artist_title(f.stem)
                     if parsed and parsed[0] != canonical:
-                        new_name = f"{canonical} - {parsed[1]}{f.suffix}"
+                        new_name = (
+                            f"{canonical} - {parsed[1]}{f.suffix}"
+                        )
                         new_path = f.with_name(new_name)
                         status, result_path = safe_rename(f, new_path)
                         handle_rename_result(
@@ -766,7 +833,8 @@ def main() -> None:
                             processed_stats, 'renamed_by_tags',
                         )
 
-    # --- Шаг 6: Ручной ввод для файлов без метаданных ---
+    # --- Шаг 8: Ручной ввод для файлов без метаданных ---
+    stage(8, "Ручной ввод для файлов без метаданных")
     still_missing = []
     if missing:
         labels = [f.name for f in missing]
@@ -797,7 +865,9 @@ def main() -> None:
             )
 
     # --- Финальная статистика ---
-    print("\n=== Статистика обработки ===")
+    print("\n" + "="*60)
+    print("=== Статистика обработки ===")
+    print("="*60)
     print(f"Очистка от мусора: {processed_stats['junk_removed']}")
     print(f"Нормализация тире: {processed_stats['dash_normalized']}")
     print(
