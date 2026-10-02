@@ -1,5 +1,6 @@
 """Скрипт для очистки и переименования аудиофайлов в указанной директории."""
 
+import os
 import re
 from pathlib import Path
 from collections import Counter
@@ -9,6 +10,8 @@ from mutagen.flac import FLAC
 from mutagen.oggvorbis import OggVorbis
 from mutagen.asf import ASF
 from mutagen.id3 import ID3NoHeaderError, TIT2, TPE1
+
+DEBUG = True  # включаем отладку
 
 JUNK_PATTERN = re.compile(
     r'\s*[\(\[][^)\]]*vksaver[^)\]]*[\)\]]', re.IGNORECASE
@@ -23,10 +26,17 @@ LEADING_TRACK_PATTERN = re.compile(
 SUPPORTED_EXTENSIONS = {'.mp3', '.m4a', '.mp4', '.flac', '.ogg', '.wma'}
 
 
+def dbg(msg: str) -> None:
+    """Выводит отладочное сообщение, если включён DEBUG."""
+    if DEBUG:
+        print(f"  [DEBUG] {msg}")
+
+
 def get_valid_path() -> Path:
     """Запрашивает у пользователя путь и проверяет его корректность."""
     while True:
         raw = input("Введите путь к папке: ").strip().strip('"')
+        print('raw:', raw)
         path_obj = Path(raw)
         if path_obj.is_dir():
             return path_obj
@@ -233,17 +243,54 @@ def titles_match(file_title: str, tag_title: str) -> bool:
     return False
 
 
+def files_are_same(old_path: Path, new_path: Path) -> bool:
+    """Проверяет, являются ли два пути одним и тем же файлом на диске."""
+    try:
+        return old_path.samefile(new_path)
+    except (OSError, FileNotFoundError, ValueError):
+        return False
+
+
+def rename_case_sensitive(old_path: Path, new_path: Path) -> bool:
+    """Переименовывает файл с изменением только регистра (Windows)."""
+    temp_name = new_path.stem + "__temp__" + new_path.suffix
+    temp_path = old_path.with_name(temp_name)
+    try:
+        old_path.rename(temp_path)
+        temp_path.rename(new_path)
+        return True
+    except OSError as e:
+        dbg(f"Ошибка при case-sensitive rename: {e}")
+        if temp_path.exists():
+            try:
+                temp_path.rename(old_path)
+            except OSError:
+                pass
+        return False
+
+
 def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
     """Безопасно переименовывает файл, обрабатывая дубликаты."""
+    dbg(f"rename: {old_path.name!r} -> {new_path.name!r}")
+    
     if not old_path.exists():
         print(f"  Файл не найден: {old_path.name}")
+        return 'skipped', None
+    
+    # КЛЮЧЕВАЯ ПРОВЕРКА: один ли это файл на диске?
+    if files_are_same(old_path, new_path):
+        dbg("Это один и тот же файл (samefile), меняем только регистр")
+        if rename_case_sensitive(old_path, new_path):
+            dbg(f"Регистр успешно изменён: {new_path.name}")
+            return 'renamed', new_path
+        dbg("Не удалось изменить регистр, пропускаю")
         return 'skipped', None
     
     if not new_path.exists():
         old_path.rename(new_path)
         return 'renamed', new_path
 
-    # Файл с целевым именем уже существует на диске
+    # Реальный дубликат — другой файл на диске
     old_tags = read_audio_tags(old_path)
     existing_tags = read_audio_tags(new_path)
     
@@ -261,7 +308,7 @@ def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
         and old_tags[1].lower().strip() == existing_tags[1].lower().strip()
     )
     
-    print(f"\n  Обнаружен дубликат на диске: {new_path.name}")
+    print(f"\n  Обнаружен РЕАЛЬНЫЙ дубликат на диске: {new_path.name}")
     if tags_match:
         print("  Теги обеих композиций совпадают — это одна и та же песня.")
     
@@ -648,10 +695,16 @@ def main() -> None:
                     selected_idx = 0
             
             canonical = sorted_artists[selected_idx][0]
+            dbg(f"Обрабатываю исполнителя {key!r}, "
+                f"канонический вариант: {canonical!r}")
+            
             for f, artist in entries:
                 if not f.exists():
+                    dbg(f"Файл {f.name} уже не существует, пропускаю")
                     continue
                 if artist != canonical:
+                    dbg(f"Файл {f.name} имеет тег {artist!r}, "
+                        f"меняю на {canonical!r}")
                     tags = read_audio_tags(f)
                     if tags:
                         if write_audio_tags(f, canonical, tags[1]):
@@ -665,6 +718,8 @@ def main() -> None:
                     if parsed and parsed[0] != canonical:
                         new_name = f"{canonical} - {parsed[1]}{f.suffix}"
                         new_path = f.with_name(new_name)
+                        dbg(f"Пытаюсь переименовать: {f.name!r} "
+                            f"-> {new_path.name!r}")
                         status, result_path = safe_rename(f, new_path)
                         handle_rename_result(
                             status, f, result_path,
