@@ -781,11 +781,11 @@ def main() -> None:
     for f in files:
         if not f.exists():
             continue
-        if parse_artist_title(f.stem):
-            continue
 
         file_title = extract_title_from_filename(f.stem)
         tags = read_audio_tags(f)
+        dbg(f"Анализ: {f.name}, теги: {tags}, "
+            f"извлечённое название: {file_title!r}")
 
         if tags:
             artist = remove_junk(str(tags[0]))
@@ -973,15 +973,25 @@ def main() -> None:
     # --- Шаг 8: Ручной ввод для файлов без метаданных ---
     stage(8, "Ручной ввод для файлов без метаданных")
     still_missing = []
-    if missing:
-        labels = [f.name for f in missing]
+    
+    # После Этапа 6 у некоторых файлов могли появиться теги —
+    # их не нужно обрабатывать вручную
+    actually_missing = [
+        f for f in missing
+        if f.exists() and read_audio_tags(f) is None
+    ]
+    dbg(f"Файлов без тегов после Этапа 6: {len(actually_missing)} "
+        f"(было {len(missing)})")
+    
+    if actually_missing:
+        labels = [f.name for f in actually_missing]
         idx = select_indices(
             labels,
-            f"Найдено {len(missing)} файлов без тегов и формата. "
+            f"Найдено {len(actually_missing)} файлов без тегов и формата. "
             f"Ввести исполнителя вручную?",
         )
         for i in idx:
-            f = missing[i]
+            f = actually_missing[i]
             if not f.exists():
                 continue
             title = extract_title_from_filename(f.stem)
