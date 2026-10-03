@@ -22,7 +22,8 @@ TRACK_NUMBER_PATTERN = re.compile(
     r'^(track\s*)?\d{1,3}\.?\s*$', re.IGNORECASE
 )
 LEADING_TRACK_PATTERN = re.compile(
-    r'^\d{1,3}\.?\s*[-–—]?\s*(.+)$'
+    r'^(?:track\s*)?\d{1,3}(?:\.\s*|\s*[-–—]+\s*)(.+)$',
+    re.IGNORECASE
 )
 INVALID_FILENAME_CHARS = re.compile(r'[\\:*?"<>|/]')
 SUPPORTED_EXTENSIONS = {'.mp3', '.m4a', '.mp4', '.flac', '.ogg', '.wma'}
