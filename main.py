@@ -794,6 +794,18 @@ def main() -> None:
             raw_name = f"{artist} - {title}"
             
             if INVALID_FILENAME_CHARS.search(raw_name):
+                # Быстрая проверка: если после очистки получается
+                # текущее имя файла — пропускаем без диалога
+                cleaned = INVALID_FILENAME_CHARS.sub('', raw_name)
+                cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+                if f"{cleaned}{f.suffix}" == f.name:
+                    dbg(
+                        f"Пропущен (имя уже корректно "
+                        f"после очистки): {f.name}"
+                    )
+                    continue
+                
+                # Иначе — интерактивный выбор
                 base_name = sanitize_filename_interactive(
                     raw_name, f.name
                 )
