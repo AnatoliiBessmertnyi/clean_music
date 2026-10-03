@@ -45,47 +45,60 @@ def get_choice_with_default(prompt: str, default: str = '1') -> str:
     return choice
 
 
-def sanitize_filename_interactive(name: str) -> str | None:
+def sanitize_filename_interactive(
+    name: str, current_filename: str
+) -> str | None:
     """Интерактивно очищает имя файла от недопустимых символов.
     
-    Возвращает очищенное имя или None, если пользователь пропустил файл.
+    Args:
+        name: Предлагаемое новое имя (без расширения)
+        current_filename: Текущее имя файла с расширением
+        
+    Returns:
+        Очищенное имя, или None если файл нужно пропустить.
     """
     invalid_chars = set(INVALID_FILENAME_CHARS.findall(name))
     if not invalid_chars:
         return name
     
     chars_str = ''.join(sorted(invalid_chars))
-    print(f"\n  Внимание! Недопустимые символы в имени: {name}")
-    print(f"  Недопустимые символы: {chars_str}")
+    print(f"\n  Внимание! Недопустимые символы: {chars_str}")
+    print(f"  Предлагаемое имя: {name}")
+    print(f"  Текущий файл:     {current_filename}")
     
     options = []
     
-    # Вариант 1: пропустить (по умолчанию)
-    options.append(("Пропустить файл", None))
+    # Вариант 1: удалить все недопустимые (по умолчанию)
+    opt1 = name
+    for c in invalid_chars:
+        opt1 = opt1.replace(c, '')
+    opt1 = re.sub(r'\s+', ' ', opt1).strip()
+    options.append((f"Удалить символы → {opt1}", opt1))
     
-    # Вариант 2: заменить все недопустимые на '-'
+    # Вариант 2: заменить все на '-'
     opt2 = name
     for c in invalid_chars:
         opt2 = opt2.replace(c, '-')
     opt2 = re.sub(r'\s+', ' ', opt2).strip()
     options.append((f"Заменить на '-' → {opt2}", opt2))
     
-    # Вариант 3: заменить все недопустимые на '_'
+    # Вариант 3: заменить '/' на '; ', остальное удалить
+    # Хорошо для feat./vs. (Dr. Dre/Snoop Dogg → Dr. Dre; Snoop Dogg)
     opt3 = name
-    for c in invalid_chars:
-        opt3 = opt3.replace(c, '_')
-    opt3 = re.sub(r'\s+', ' ', opt3).strip()
-    options.append((f"Заменить на '_' → {opt3}", opt3))
+    if '/' in invalid_chars:
+        opt3 = opt3.replace('/', '; ')
+        for c in invalid_chars - {'/'}:
+            opt3 = opt3.replace(c, '')
+        opt3 = re.sub(r'\s+', ' ', opt3).strip()
+        options.append((f"Заменить '/' на '; ' → {opt3}", opt3))
     
-    # Вариант 4: удалить все недопустимые символы
-    opt4 = name
-    for c in invalid_chars:
-        opt4 = opt4.replace(c, '')
-    opt4 = re.sub(r'\s+', ' ', opt4).strip()
-    options.append((f"Удалить символы → {opt4}", opt4))
-    
-    # Вариант 5: ввести вручную
+    # Вариант 4: ввести вручную
     options.append(("Ввести имя вручную", "manual"))
+    
+    # Вариант 5: оставить как есть (не переименовывать)
+    options.append(
+        (f"Оставить как есть: {current_filename}", "SKIP")
+    )
     
     for i, (label, _) in enumerate(options, 1):
         marker = " [по умолчанию]" if i == 1 else ""
@@ -96,7 +109,7 @@ def sanitize_filename_interactive(name: str) -> str | None:
     )
     
     if choice in ('n', 'no', 'н', 'нет'):
-        return None
+        return "SKIP"
     
     try:
         idx = int(choice) - 1
@@ -105,19 +118,19 @@ def sanitize_filename_interactive(name: str) -> str | None:
             if value == "manual":
                 custom = input("  Введите имя (без расширения): ").strip()
                 if not custom:
-                    return None
+                    return "SKIP"
                 if INVALID_FILENAME_CHARS.search(custom):
                     print(
-                        "  Имя всё ещё содержит недопустимые символы, "
-                        "пропускаю."
+                        "  Имя всё ещё содержит недопустимые "
+                        "символы, оставляю как есть."
                     )
-                    return None
+                    return "SKIP"
                 return custom
             return value
     except ValueError:
         pass
     
-    return None
+    return "SKIP"
 
 
 def stage(number: int, name: str) -> None:
@@ -764,9 +777,11 @@ def main() -> None:
             raw_name = f"{artist} - {title}"
             
             if INVALID_FILENAME_CHARS.search(raw_name):
-                base_name = sanitize_filename_interactive(raw_name)
-                if not base_name:
-                    dbg(f"Пропущен из-за недопустимых символов: {f.name}")
+                base_name = sanitize_filename_interactive(
+                    raw_name, f.name
+                )
+                if base_name == "SKIP":
+                    print(f"  Оставлен без изменений: {f.name}")
                     continue
             else:
                 base_name = raw_name
@@ -921,10 +936,8 @@ def main() -> None:
                         raw_name = f"{canonical} - {parsed[1]}"
                         
                         if INVALID_FILENAME_CHARS.search(raw_name):
-                            base_name = sanitize_filename_interactive(
-                                raw_name
-                            )
-                            if not base_name:
+                            base_name = sanitize_filename_interactive(raw_name, f.name)
+                            if base_name == "SKIP":
                                 dbg(
                                     f"Пропущен из-за недопустимых "
                                     f"символов: {f.name}"
@@ -968,9 +981,12 @@ def main() -> None:
             raw_name = f"{artist} - {title}"
             
             if INVALID_FILENAME_CHARS.search(raw_name):
-                base_name = sanitize_filename_interactive(raw_name)
-                if not base_name:
-                    still_missing.append(f)
+                base_name = sanitize_filename_interactive(
+                    raw_name, f.name
+                )
+                if base_name == "SKIP":
+                    print(f"  Оставлен без изменений: {f.name}")
+                    # Не добавляем в still_missing, файл просто пропускается
                     continue
             else:
                 base_name = raw_name
