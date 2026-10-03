@@ -593,7 +593,12 @@ def select_indices(items: list[str], description: str) -> list[int]:
     print(f"\n{description}:")
     for i, item in enumerate(items, 1):
         print(f"  [✓] {i}. {item}")
-    prompt = "(y - все / n - отмена / номера для исключения): "
+
+    prompt = (
+        "(Enter - применить ко всем / "
+        "номера - ИСКЛЮЧИТЬ из обработки / "
+        "n - отменить все): "
+    )
     choice = input(prompt).strip().lower()
     if not choice or choice in ('y', 'yes', 'д', 'да'):
         return list(range(len(items)))
