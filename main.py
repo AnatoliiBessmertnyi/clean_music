@@ -28,6 +28,7 @@ INVALID_FILENAME_CHARS = re.compile(r'[\\:*?"<>|/]')
 SUPPORTED_EXTENSIONS = {'.mp3', '.m4a', '.mp4', '.flac', '.ogg', '.wma'}
 
 TOTAL_STAGES = 8
+_remembered_sanitize_choices: dict[frozenset, int] = {}
 
 
 def dbg(msg: str) -> None:
@@ -50,63 +51,78 @@ def sanitize_filename_interactive(
 ) -> str | None:
     """Интерактивно очищает имя файла от недопустимых символов.
     
-    Args:
-        name: Предлагаемое новое имя (без расширения)
-        current_filename: Текущее имя файла с расширением
-        
-    Returns:
-        Очищенное имя, или None если файл нужно пропустить.
+    Запоминает выбор пользователя для каждого набора символов.
     """
     invalid_chars = set(INVALID_FILENAME_CHARS.findall(name))
     if not invalid_chars:
         return name
     
+    chars_key = frozenset(invalid_chars)
     chars_str = ''.join(sorted(invalid_chars))
-    print(f"\n  Внимание! Недопустимые символы: {chars_str}")
-    print(f"  Предлагаемое имя: {name}")
-    print(f"  Текущий файл:     {current_filename}")
     
+    # Формируем опции (как раньше)
     options = []
     
-    # Вариант 1: удалить все недопустимые (по умолчанию)
     opt1 = name
     for c in invalid_chars:
         opt1 = opt1.replace(c, '')
     opt1 = re.sub(r'\s+', ' ', opt1).strip()
     options.append((f"Удалить символы → {opt1}", opt1))
     
-    # Вариант 2: заменить все на '-'
     opt2 = name
     for c in invalid_chars:
         opt2 = opt2.replace(c, '-')
     opt2 = re.sub(r'\s+', ' ', opt2).strip()
     options.append((f"Заменить на '-' → {opt2}", opt2))
     
-    # Вариант 3: заменить '/' на '; ', остальное удалить
-    # Хорошо для feat./vs. (Dr. Dre/Snoop Dogg → Dr. Dre; Snoop Dogg)
-    opt3 = name
     if '/' in invalid_chars:
-        opt3 = opt3.replace('/', '; ')
+        opt3 = name.replace('/', '; ')
         for c in invalid_chars - {'/'}:
             opt3 = opt3.replace(c, '')
         opt3 = re.sub(r'\s+', ' ', opt3).strip()
         options.append((f"Заменить '/' на '; ' → {opt3}", opt3))
     
-    # Вариант 4: ввести вручную
     options.append(("Ввести имя вручную", "manual"))
+    options.append((f"Оставить как есть: {current_filename}", "SKIP"))
     
-    # Вариант 5: оставить как есть (не переименовывать)
-    options.append(
-        (f"Оставить как есть: {current_filename}", "SKIP")
-    )
+    # Проверяем, есть ли запомненный выбор
+    if chars_key in _remembered_sanitize_choices:
+        remembered_idx = _remembered_sanitize_choices[chars_key]
+        if 0 <= remembered_idx < len(options):
+            _, value = options[remembered_idx]
+            dbg(
+                f"Применяю запомненный выбор #{remembered_idx+1} "
+                f"для символов '{chars_str}'"
+            )
+            # Для "manual" и "SKIP" не применяем запомненный выбор
+            if value not in ("manual", "SKIP"):
+                return value
+    
+    # Выводим меню
+    print(f"\n  Внимание! Недопустимые символы: {chars_str}")
+    print(f"  Предлагаемое имя: {name}")
+    print(f"  Текущий файл:     {current_filename}")
     
     for i, (label, _) in enumerate(options, 1):
         marker = " [по умолчанию]" if i == 1 else ""
-        print(f"  {i}. {label}{marker}")
+        remembered = " [запомнено]" if (
+            chars_key in _remembered_sanitize_choices 
+            and _remembered_sanitize_choices[chars_key] == i - 1
+        ) else ""
+        print(f"  {i}. {label}{marker}{remembered}")
+    
+    print(f"  a. Запомнить и применить вариант 1 ко всем файлам с '{chars_str}'")
     
     choice = get_choice_with_default(
         "  Выберите вариант [1]: ", default='1'
     )
+    
+    # Обработка "запомнить для всех"
+    if choice == 'a':
+        _remembered_sanitize_choices[chars_key] = 0
+        print(f"  Запомнено: применять 'Удалить символы' для всех '{chars_str}'")
+        _, value = options[0]
+        return value
     
     if choice in ('n', 'no', 'н', 'нет'):
         return "SKIP"
