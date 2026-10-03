@@ -35,6 +35,15 @@ def dbg(msg: str) -> None:
         print(f"  [DEBUG] {msg}")
 
 
+def get_choice_with_default(prompt: str, default: str = '1') -> str:
+    """Запрашивает выбор у пользователя и помечает выбор по умолчанию."""
+    choice = input(prompt).strip().lower()
+    if not choice:
+        print(f"  [Выбран вариант {default} по умолчанию]")
+        return default
+    return choice
+
+
 def stage(number: int, name: str) -> None:
     """Печатает заголовок этапа обработки."""
     print(f"\n{'='*60}")
@@ -369,9 +378,9 @@ def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
         print("  [DRY RUN] Пропускаю выбор дубликата")
         return 'skipped', None
 
-    choice = input(
+    choice = get_choice_with_default(
         "Какой файл оставить? (1/2/n - пропустить) [1]: "
-    ).strip().lower()
+    )
 
     if choice in ('n', 'no', 'н', 'нет'):
         return 'skipped', None
@@ -547,10 +556,10 @@ def process_duplicates(
             print("  [DRY RUN] Пропускаю выбор дубликата")
             continue
         
-        choice = input(
+        choice = get_choice_with_default(
             "Введите номер файла для сохранения "
             "(n - пропустить) [1]: "
-        ).strip().lower()
+        )
         
         if choice in ('n', 'no', 'н', 'нет'):
             continue
@@ -779,9 +788,9 @@ def main() -> None:
             for i, (artist, count) in enumerate(sorted_artists, 1):
                 print(f"  {i}. {artist} ({count} файлов)")
             
-            choice = input(
+            choice = get_choice_with_default(
                 "Выберите номер варианта (n - пропустить) [1]: "
-            ).strip().lower()
+            )
             
             if choice in ('n', 'no', 'н', 'нет'):
                 continue
