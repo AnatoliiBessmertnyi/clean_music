@@ -14,8 +14,21 @@ from mutagen.id3 import ID3NoHeaderError, TIT2, TPE1
 DRY_RUN = '--dry-run' in sys.argv
 DEBUG = '--debug' in sys.argv
 
+# Список мусорных ключевых слов для очистки из имён файлов и тегов.
+# Добавляйте новые паттерны сюда. Точку в доменах экранируйте: 'site\.ru'
+JUNK_KEYWORDS = [
+    'vksaver',
+    'muzmo\.ru',
+    # Добавляйте новые мусорные паттерны ниже:
+    # 'example\.com',
+    # 'another-junk',
+]
+
+# Динамически строим паттерн из списка ключевых слов
+_junk_keywords_regex = '|'.join(JUNK_KEYWORDS)
 JUNK_PATTERN = re.compile(
-    r'\s*[\(\[][^)\]]*vksaver[^)\]]*[\)\]]', re.IGNORECASE
+    r'\s*[\(\[][^)\]]*(?:' + _junk_keywords_regex + r')[^)\]]*[\)\]]',
+    re.IGNORECASE
 )
 NAME_PATTERN = re.compile(r'^(.+?)\s+[-–—]\s+(.+)$')
 TRACK_NUMBER_PATTERN = re.compile(
