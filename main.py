@@ -59,6 +59,13 @@ def get_choice_with_default(prompt: str, default: str = '1') -> str:
     return choice
 
 
+def has_encoding_issues(text: str) -> bool:
+    """Проверяет, содержит ли текст признаки неправильной кодировки."""
+    # Типичные артефакты двойной кодировки (кириллица в Latin-1)
+    mojibake_pattern = re.compile(r'[À-ÿ]{2,}')
+    return bool(mojibake_pattern.search(text))
+
+
 def sanitize_filename_interactive(
     name: str, current_filename: str
 ) -> str | None:
@@ -946,24 +953,97 @@ def main() -> None:
             )
 
     if mismatch_candidates:
-        labels = [
-            f"{c[0].name}\n      Файл: {c[1] or '(нет)'}\n"
-            f"      Теги: {c[2]}"
-            for c in mismatch_candidates
-        ]
-        idx = select_indices(
-            labels,
-            f"Найдено {len(mismatch_candidates)} файлов "
-            f"с расхождением названий (файл vs теги)",
-        )
-        for i in idx:
-            old_path, file_title, new_name = mismatch_candidates[i]
-            new_path = old_path.with_name(new_name)
-            status, result_path = safe_rename(old_path, new_path)
-            handle_rename_result(
-                status, old_path, result_path,
-                processed_stats, 'renamed_by_tags',
+        print(f"\nНайдено {len(mismatch_candidates)} файлов "
+              f"с расхождением названий (файл vs теги):")
+        
+        for i, (f, file_title, new_name) in enumerate(
+            mismatch_candidates, 1
+        ):
+            tags = read_audio_tags(f)
+            tag_str = (
+                f"{tags[0]} - {tags[1]}" if tags else "(нет тегов)"
             )
+            enc_issue = (
+                has_encoding_issues(tag_str) if tags else False
+            )
+            marker = " [ПРОБЛЕМА КОДИРОВКИ]" if enc_issue else ""
+            print(f"  {i}. {f.name}{marker}")
+            print(f"      Файл: {file_title or '(нет)'}")
+            print(f"      Теги: {tag_str}")
+        
+        print("\nВозможные действия:")
+        print("  r - переименовать файлы по тегам "
+              "(теги считаются правильными)")
+        print("  t - обновить теги из имён файлов "
+              "(имена считаются правильными)")
+        print("  Пропустить - оставить как есть")
+        
+        rename_input = input(
+            "Номера для переименования по тегам "
+            "(через запятую, пусто - пропустить): "
+        ).strip()
+        
+        tags_input = input(
+            "Номера для обновления тегов из имён "
+            "(через запятую, пусто - пропустить): "
+        ).strip()
+        
+        rename_indices = set()
+        if rename_input:
+            try:
+                rename_indices = {
+                    int(p.strip()) for p in rename_input.split(',')
+                }
+            except ValueError:
+                print("Некорректный ввод, пропускаю переименование.")
+        
+        tags_indices = set()
+        if tags_input:
+            try:
+                tags_indices = {
+                    int(p.strip()) for p in tags_input.split(',')
+                }
+            except ValueError:
+                print("Некорректный ввод, пропускаю обновление тегов.")
+        
+        # Переименование по тегам
+        for i, (old_path, file_title, new_name) in enumerate(
+            mismatch_candidates, 1
+        ):
+            if i in rename_indices:
+                new_path = old_path.with_name(new_name)
+                status, result_path = safe_rename(old_path, new_path)
+                handle_rename_result(
+                    status, old_path, result_path,
+                    processed_stats, 'renamed_by_tags',
+                )
+        
+        # Обновление тегов из имён
+        for i, (old_path, file_title, new_name) in enumerate(
+            mismatch_candidates, 1
+        ):
+            if i in tags_indices:
+                parsed = parse_artist_title(old_path.stem)
+                if parsed:
+                    if DRY_RUN:
+                        dbg(f"[DRY RUN] Обновил бы теги из имени: "
+                            f"{old_path.name}")
+                    elif write_audio_tags(
+                        old_path, parsed[0], parsed[1]
+                    ):
+                        print(f"  Теги обновлены из имени: "
+                              f"{old_path.name}")
+                        processed_stats['tags_written'] += 1
+                else:
+                    print(f"  Не удалось извлечь теги из имени: "
+                          f"{old_path.name}")
+        
+        skipped = (
+            len(mismatch_candidates) - len(rename_indices) 
+            - len(tags_indices)
+        )
+        if skipped > 0:
+            print(f"  Оставлено без изменений: {skipped}")
 
     # --- Шаг 6: Запись тегов из имени файла ---
     stage(6, "Запись тегов из имени файла")
