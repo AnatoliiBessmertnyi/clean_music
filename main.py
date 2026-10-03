@@ -256,6 +256,44 @@ def remove_junk(text: str) -> str:
     return JUNK_PATTERN.sub('', text).strip()
 
 
+def find_tag_annotations(
+    files: list[Path],
+) -> dict[str, list[Path]]:
+    """Находит уникальные скобки в тегах названий (кроме известного мусора)."""
+    annotations = {}
+    bracket_pattern = re.compile(r'[\(\[]([^\)\]]+)[\)\]]')
+    
+    for f in files:
+        if not f.exists():
+            continue
+        tags = read_audio_tags(f)
+        if tags:
+            title = tags[1]
+            matches = bracket_pattern.findall(title)
+            for match in matches:
+                match = match.strip()
+                if not match:
+                    continue
+                # Пропускаем известный мусор (уже обработан)
+                if JUNK_PATTERN.search(f"({match})"):
+                    continue
+                if match not in annotations:
+                    annotations[match] = []
+                if f not in annotations[match]:
+                    annotations[match].append(f)
+    
+    return annotations
+
+
+def remove_annotation_from_text(text: str, annotation: str) -> str:
+    """Удаляет конкретное уточнение в скобках из текста."""
+    pattern = re.compile(
+        r'\s*[\(\[]\s*' + re.escape(annotation) + r'\s*[\)\]]\s*',
+        re.IGNORECASE
+    )
+    return pattern.sub('', text).strip()
+
+
 def normalize_dash(text: str) -> str:
     """Заменяет все виды тире на стандартный дефис."""
     return re.sub(r'[–—]', '-', text)
@@ -787,6 +825,58 @@ def main() -> None:
 
     # --- Шаг 5: Переименование по тегам с проверкой ---
     stage(5, "Переименование по тегам")
+    
+    # --- Подэтап 5.1: Анализ уточнений в скобках ---
+    annotations = find_tag_annotations(files)
+    if annotations:
+        sorted_annotations = sorted(
+            annotations.items(),
+            key=lambda x: len(x[1]),
+            reverse=True
+        )
+        print(f"\nНайдено {len(sorted_annotations)} уникальных "
+              f"уточнений в скобках:")
+        for i, (ann, file_list) in enumerate(sorted_annotations, 1):
+            print(f"  {i}. ({ann}) — {len(file_list)} файлов")
+        
+        choice = input(
+            "Какие удалить из тегов? (номера через запятую, "
+            "y - все, n - оставить все) [n]: "
+        ).strip().lower()
+        
+        to_remove = set()
+        if choice in ('y', 'yes', 'д', 'да'):
+            to_remove = {ann for ann, _ in sorted_annotations}
+        elif choice not in ('n', 'no', 'н', 'нет', ''):
+            try:
+                indices = [int(p.strip()) for p in choice.split(',')]
+                for idx in indices:
+                    if 1 <= idx <= len(sorted_annotations):
+                        to_remove.add(sorted_annotations[idx - 1][0])
+            except ValueError:
+                print("Некорректный ввод, пропускаю.")
+        
+        if to_remove:
+            removed_count = 0
+            for ann in to_remove:
+                for f in annotations[ann]:
+                    if not f.exists():
+                        continue
+                    tags = read_audio_tags(f)
+                    if tags:
+                        new_title = remove_annotation_from_text(
+                            tags[1], ann
+                        )
+                        if new_title != tags[1]:
+                            if DRY_RUN:
+                                dbg(f"[DRY RUN] Удалил бы из тега: "
+                                    f"({ann}) из {f.name}")
+                            elif write_audio_tags(f, tags[0], new_title):
+                                dbg(f"Удалено из тега: ({ann}) "
+                                    f"из {f.name}")
+                                removed_count += 1
+            print(f"  Удалено уточнений из тегов: {removed_count}")
+    
     safe_candidates = []
     mismatch_candidates = []
     missing = []
