@@ -84,6 +84,42 @@ def has_encoding_issues(text: str) -> bool:
     return bool(mojibake_pattern.search(text))
 
 
+def categorize_mismatch(
+    filepath: Path, 
+    file_title: str, 
+    tag_title: str,
+    tag_artist: str
+) -> str:
+    """Определяет категорию проблемы для файла с расхождением.
+    
+    Возвращает:
+        'A' - файл с номером трека (нет исполнителя в имени)
+        'B' - файл без тире (неправильный формат)
+        'C' - файл с feat в имени (нужна нормализация)
+        'D' - проблема с кодировкой в тегах
+        'E' - спорный случай
+    """
+    # Проверяем кодировку
+    if has_encoding_issues(f"{tag_artist} - {tag_title}"):
+        return 'D'
+    
+    # Проверяем, есть ли формат "Artist - Title" в имени
+    parsed = parse_artist_title(filepath.stem)
+    if not parsed:
+        # Нет формата - проверяем, есть ли номер трека
+        if LEADING_TRACK_PATTERN.match(filepath.stem):
+            return 'A'  # Есть номер трека, но нет исполнителя
+        else:
+            return 'B'  # Нет тире вообще
+    
+    # Есть формат, проверяем наличие feat в имени
+    if FEAT_VARIANTS_PATTERN.search(parsed[0]) or FEAT_VARIANTS_PATTERN.search(parsed[1]):
+        return 'C'
+    
+    # Всё остальное - спорные случаи
+    return 'E'
+
+
 def sanitize_filename_interactive(
     name: str, current_filename: str
 ) -> str | None:
@@ -1506,6 +1542,10 @@ def main() -> None:
             if new_name == f.name:
                 continue
 
+            if f.name == new_name:
+                dbg(f"Пропущен (имя уже целевое): {f.name}")
+                continue
+
             if user_already_chose or titles_match(file_title, title):
                 # Пользователь уже подтвердил выбор ИЛИ названия совпадают
                 safe_candidates.append((f, new_name))
@@ -1534,94 +1574,149 @@ def main() -> None:
         print(f"\nНайдено {len(mismatch_candidates)} файлов "
               f"с расхождением названий (файл vs теги):")
         
-        for i, (f, file_title, new_name) in enumerate(
-            mismatch_candidates, 1
-        ):
+        # Категоризируем файлы
+        categorized = {
+            'A': [],  # Файлы с номерами треков
+            'B': [],  # Файлы без тире
+            'C': [],  # Файлы с feat в имени
+            'D': [],  # Проблемы с кодировкой
+            'E': [],  # Спорные случаи
+        }
+        
+        for f, file_title, new_name in mismatch_candidates:
             tags = read_audio_tags(f)
-            tag_str = (
-                f"{tags[0]} - {tags[1]}" if tags else "(нет тегов)"
-            )
-            enc_issue = (
-                has_encoding_issues(tag_str) if tags else False
-            )
-            marker = " [ПРОБЛЕМА КОДИРОВКИ]" if enc_issue else ""
-            print(f"  {i}. {f.name}{marker}")
-            print(f"      Файл: {file_title or '(нет)'}")
-            print(f"      Теги: {tag_str}")
+            if not tags:
+                continue
+            tag_artist, tag_title = tags
+            category = categorize_mismatch(f, file_title, tag_title, tag_artist)
+            categorized[category].append((f, file_title, new_name, tag_artist, tag_title))
         
-        print("\nВозможные действия:")
-        print("  r - переименовать файлы по тегам "
-              "(теги считаются правильными)")
-        print("  t - обновить теги из имён файлов "
-              "(имена считаются правильными)")
-        print("  Пропустить - оставить как есть")
+        # Описания категорий
+        category_info = {
+            'A': {
+                'name': 'Файлы с номерами треков (нет исполнителя в имени)',
+                'hint': '💡 В имени нет исполнителя, но он есть в тегах',
+                'recommendation': 'Переименовать по тегам (добавит исполнителя)',
+                'default_action': 'r',
+            },
+            'B': {
+                'name': 'Файлы без тире (неправильный формат)',
+                'hint': '💡 Имя не в формате "Artist - Title", но теги правильные',
+                'recommendation': 'Переименовать по тегам (исправит формат)',
+                'default_action': 'r',
+            },
+            'C': {
+                'name': 'Файлы с feat в имени (нужна нормализация)',
+                'hint': '💡 В имени есть "feat" вне скобок',
+                'recommendation': 'Переименовать по тегам (нормализует feat)',
+                'default_action': 'r',
+            },
+            'D': {
+                'name': 'Проблемы с кодировкой в тегах',
+                'hint': '💡 Теги содержат кракозябры, имя файла корректное',
+                'recommendation': 'Обновить теги из имён файлов',
+                'default_action': 't',
+            },
+            'E': {
+                'name': 'Спорные случаи (требуют ручного решения)',
+                'hint': '💡 Имя и теги существенно различаются',
+                'recommendation': 'Нужно ручное решение для каждого файла',
+                'default_action': None,
+            },
+        }
         
-        rename_input = input(
-            "Номера для переименования по тегам "
-            "(через запятую, пусто - пропустить): "
-        ).strip()
-        
-        tags_input = input(
-            "Номера для обновления тегов из имён "
-            "(через запятую, пусто - пропустить): "
-        ).strip()
-        
-        rename_indices = set()
-        if rename_input:
-            try:
-                rename_indices = {
-                    int(p.strip()) for p in rename_input.split(',')
-                }
-            except ValueError:
-                print("Некорректный ввод, пропускаю переименование.")
-        
-        tags_indices = set()
-        if tags_input:
-            try:
-                tags_indices = {
-                    int(p.strip()) for p in tags_input.split(',')
-                }
-            except ValueError:
-                print("Некорректный ввод, пропускаю обновление тегов.")
-
-        # Переименование по тегам
-        for i, (old_path, file_title, new_name) in enumerate(
-            mismatch_candidates, 1
-        ):
-            if i in rename_indices:
-                new_path = old_path.with_name(new_name)
-                status, result_path = safe_rename(old_path, new_path)
-                handle_rename_result(
-                    status, old_path, result_path,
-                    processed_stats, 'renamed_by_tags',
-                )
-        
-        # Обновление тегов из имён
-        for i, (old_path, file_title, new_name) in enumerate(
-            mismatch_candidates, 1
-        ):
-            if i in tags_indices:
-                parsed = parse_artist_title(old_path.stem)
-                if parsed:
-                    if DRY_RUN:
-                        dbg(f"[DRY RUN] Обновил бы теги из имени: "
-                            f"{old_path.name}")
-                    elif write_audio_tags(
-                        old_path, parsed[0], parsed[1]
-                    ):
-                        print(f"  Теги обновлены из имени: "
-                              f"{old_path.name}")
-                        processed_stats['tags_written'] += 1
+        # Обрабатываем каждую категорию
+        for cat_key in ['A', 'B', 'C', 'D', 'E']:
+            if not categorized[cat_key]:
+                continue
+            
+            info = category_info[cat_key]
+            print(f"\n{'='*60}")
+            print(f"Группа {cat_key}: {info['name']} - {len(categorized[cat_key])} файлов")
+            print(f"{'='*60}")
+            print(info['hint'])
+            print(f"→ Рекомендация: {info['recommendation']}")
+            print()
+            
+            # Показываем файлы
+            for i, (f, file_title, new_name, tag_artist, tag_title) in enumerate(
+                categorized[cat_key], 1
+            ):
+                tag_str = f"{tag_artist} - {tag_title}"
+                print(f"  {i}. {f.name}")
+                print(f"      → {new_name}")
+                if cat_key == 'D':
+                    print(f"      Теги: {tag_str} [ПРОБЛЕМА КОДИРОВКИ]")
+                elif cat_key == 'E':
+                    print(f"      Файл: {file_title or '(нет)'}")
+                    print(f"      Теги: {tag_str}")
+            
+            # Для категорий A-D предлагаем пакетное действие
+            if cat_key != 'E':
+                default = info['default_action']
+                action_name = 'переименовать по тегам' if default == 'r' else 'обновить теги из имён'
+                
+                choice = input(
+                    f"\nПрименить '{action_name}' ко всей группе? (y/n) [y]: "
+                ).strip().lower()
+                
+                if choice in ('', 'y', 'yes', 'д', 'да'):
+                    # Применяем ко всем файлам в группе
+                    for f, file_title, new_name, tag_artist, tag_title in categorized[cat_key]:
+                        if default == 'r':
+                            # Переименовать по тегам
+                            new_path = f.with_name(new_name)
+                            status, result_path = safe_rename(f, new_path)
+                            handle_rename_result(
+                                status, f, result_path,
+                                processed_stats, 'renamed_by_tags',
+                            )
+                        else:
+                            # Обновить теги из имён
+                            parsed = parse_artist_title(f.stem)
+                            if parsed:
+                                if DRY_RUN:
+                                    dbg(f"[DRY RUN] Обновил бы теги из имени: {f.name}")
+                                elif write_audio_tags(f, parsed[0], parsed[1]):
+                                    print(f"  Теги обновлены из имени: {f.name}")
+                                    processed_stats['tags_written'] += 1
                 else:
-                    print(f"  Не удалось извлечь теги из имени: "
-                          f"{old_path.name}")
-        
-        skipped = (
-            len(mismatch_candidates) - len(rename_indices) 
-            - len(tags_indices)
-        )
-        if skipped > 0:
-            print(f"  Оставлено без изменений: {skipped}")
+                    print(f"  Группа {cat_key} пропущена.")
+            
+            # Для категории E спрашиваем по каждому файлу
+            else:
+                print("\nДля каждого файла выберите действие:")
+                print("  r - переименовать по тегу")
+                print("  t - обновить тег из имени")
+                print("  n - пропустить")
+                
+                for i, (f, file_title, new_name, tag_artist, tag_title) in enumerate(
+                    categorized[cat_key], 1
+                ):
+                    print(f"\n  {i}. {f.name}")
+                    print(f"      Файл: {file_title or '(нет)'}")
+                    print(f"      Теги: {tag_artist} - {tag_title}")
+                    print(f"      Новое имя (если r): {new_name}")
+                    
+                    choice = input("      Действие [r/t/n] (n): ").strip().lower()
+                    
+                    if choice == 'r':
+                        new_path = f.with_name(new_name)
+                        status, result_path = safe_rename(f, new_path)
+                        handle_rename_result(
+                            status, f, result_path,
+                            processed_stats, 'renamed_by_tags',
+                        )
+                    elif choice == 't':
+                        parsed = parse_artist_title(f.stem)
+                        if parsed:
+                            if DRY_RUN:
+                                dbg(f"[DRY RUN] Обновил бы теги из имени: {f.name}")
+                            elif write_audio_tags(f, parsed[0], parsed[1]):
+                                print(f"      Теги обновлены из имени: {f.name}")
+                                processed_stats['tags_written'] += 1
+                    else:
+                        print(f"      Пропущен: {f.name}")
 
     print("\n" + "="*60)
     print("  Этап нормализации тегов и имён завершён.")
