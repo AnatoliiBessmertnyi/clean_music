@@ -897,75 +897,104 @@ def process_tag_junk_cleaning(
 def process_duplicates(
     files: list[Path], stats: dict[str, int]
 ) -> list[Path]:
-    """Обрабатывает группы дубликатов с умным объединением имён."""
+    """Обрабатывает группы дубликатов с умным объединением имён.
+    
+    Сначала показывает все группы с планом действий,
+    потом один раз спрашивает, какие обработать.
+    """
     duplicates = find_duplicates(files)
     if not duplicates:
         return files
     
-    print(f"\nНайдено {len(duplicates)} групп дубликатов.")
-    for group_idx, group in enumerate(duplicates, 1):
-        print(f"\n--- Группа {group_idx} ---")
+    # Собираем план действий для каждой группы
+    plans = []
+    for group in duplicates:
         sorted_group = sorted(
             group, key=lambda p: p.stat().st_size, reverse=True
         )
         best_name_file = get_best_name_from_group(group)
+        keep_file = sorted_group[0]
+        files_to_delete = [f for f in sorted_group if f != keep_file]
         
-        print("Какой файл оставить по качеству? "
-              "(остальные будут удалены):")
-        for i, f in enumerate(sorted_group, 1):
-            info = file_info_line(f)
-            marker = " [лучшее имя]" if f == best_name_file else ""
-            print(f"  {i}. {f.name} ({info}){marker}")
-        
-        if DRY_RUN:
-            print("  [DRY RUN] Пропускаю выбор дубликата")
-            continue
-        
-        choice = get_choice_with_default(
-            "Введите номер файла для сохранения "
-            "(n - пропустить) [1]: "
+        # Нужно ли переименование?
+        needs_rename = (
+            keep_file != best_name_file 
+            and not files_are_same(keep_file, best_name_file)
         )
         
-        if choice in ('n', 'no', 'н', 'нет'):
-            continue
-        if choice in ('', '1'):
-            keep_idx = 0
-        else:
-            try:
-                keep_idx = int(choice) - 1
-                if not (0 <= keep_idx < len(sorted_group)):
-                    print("Некорректный номер, пропускаю группу.")
-                    continue
-            except ValueError:
-                print("Некорректный ввод, выбираю вариант 1.")
-                keep_idx = 0
+        plans.append({
+            'group': sorted_group,
+            'keep': keep_file,
+            'delete': files_to_delete,
+            'best_name_file': best_name_file,
+            'needs_rename': needs_rename,
+        })
+    
+    # Показываем все группы с планом действий
+    print(f"\nНайдено {len(plans)} групп дубликатов:")
+    
+    for i, plan in enumerate(plans, 1):
+        keep_info = file_info_line(plan['keep'])
+        print(f"\n  {i}. Группа из {len(plan['group'])} файлов:")
+        print(f"      Оставить: {plan['keep'].name} ({keep_info})")
         
-        keep_file = sorted_group[keep_idx]
+        for f in plan['delete']:
+            del_info = file_info_line(f)
+            print(f"      Удалить:  {f.name} ({del_info})")
+        
+        if plan['needs_rename']:
+            final_name = plan['best_name_file'].name
+            print(f"      Итог:     {plan['keep'].name} → {final_name}")
+        else:
+            print(f"      Итог:     без переименования")
+    
+    # Один вопрос для всех групп
+    group_labels = []
+    for plan in plans:
+        label = f"{plan['keep'].name}"
+        if plan['needs_rename']:
+            label += f" → {plan['best_name_file'].name}"
+        group_labels.append(label)
+    
+    idx = select_indices(
+        group_labels,
+        "\nКакие группы обработать?",
+    )
+    
+    if not idx:
+        print("  Все группы пропущены.")
+        return files
+    
+    # Применяем выбор
+    processed_count = 0
+    for i in idx:
+        plan = plans[i]
+        
+        if DRY_RUN:
+            dbg(f"[DRY RUN] Обработал бы группу: {plan['keep'].name}")
+            processed_count += 1
+            continue
         
         # Удаляем все файлы, кроме выбранного
-        for i, f in enumerate(sorted_group):
-            if i != keep_idx:
-                if safe_unlink(f):
-                    print(f"  Удалён: {f.name}")
-                    stats['duplicates_removed'] += 1
+        for f in plan['delete']:
+            if safe_unlink(f):
+                print(f"  Удалён: {f.name}")
+                stats['duplicates_removed'] += 1
         
-        # Переименовываем выбранный файл в лучшее имя, если нужно
-        if keep_file != best_name_file and best_name_file.exists():
-            # Файл с лучшим именем ещё существует — это дубликат
-            # Он уже должен был быть удалён выше, но на всякий случай
-            dbg("Файл с лучшим именем ещё существует, удаляю")
-            safe_unlink(best_name_file)
-        
-        if keep_file != best_name_file:
-            new_name = best_name_file.name
-            new_path = keep_file.with_name(new_name)
-            dbg(f"Переименовываю в лучшее имя: "
-                f"{keep_file.name} -> {new_name}")
-            status, result_path = safe_rename(keep_file, new_path)
+        # Переименовываем в лучшее имя, если нужно
+        if plan['needs_rename']:
+            new_name = plan['best_name_file'].name
+            new_path = plan['keep'].with_name(new_name)
+            status, result_path = safe_rename(plan['keep'], new_path)
             if status == 'renamed':
                 print(f"  Переименован в лучшее имя: "
-                      f"{keep_file.name} -> {result_path.name}")
-                stats['duplicates_removed'] += 1
+                      f"{plan['keep'].name} → {result_path.name}")
+            elif status == 'kept_existing':
+                print(f"  Оставлен существующий: {result_path.name}")
+        
+        processed_count += 1
+    
+    print(f"  Обработано групп: {processed_count}")
     
     return [f for f in files if f.exists()]
 
