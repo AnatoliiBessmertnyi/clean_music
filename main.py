@@ -133,6 +133,21 @@ def sanitize_filename_interactive(
     
     print(f"  a. Запомнить и применить вариант 1 ко всем файлам с '{chars_str}'")
     
+    # Проверяем, сколько раз уже выбирали этот символ
+    if chars_key not in _remembered_sanitize_choices:
+        # Считаем, сколько раз уже спрашивали про этот символ
+        if not hasattr(sanitize_filename_interactive, '_ask_count'):
+            sanitize_filename_interactive._ask_count = {}
+        
+        if chars_key not in sanitize_filename_interactive._ask_count:
+            sanitize_filename_interactive._ask_count[chars_key] = 0
+        sanitize_filename_interactive._ask_count[chars_key] += 1
+        
+        count = sanitize_filename_interactive._ask_count[chars_key]
+        if count >= 3:
+            print(f"  [Подсказка: вы уже {count} раз выбрали этот вариант. "
+                  f"Нажмите 'a', чтобы запомнить.]")
+    
     choice = get_choice_with_default(
         "  Выберите вариант [1]: ", default='1'
     )
@@ -824,6 +839,52 @@ def process_duplicates(
     return [f for f in files if f.exists()]
 
 
+def categorize_annotations(annotations: dict[str, list[Path]]) -> dict[str, dict]:
+    """Группирует уточнения по категориям."""
+    categories = {
+        'remaster': {
+            'name': 'Ремастеринг',
+            'pattern': re.compile(r'(?:remaster|remastered|remix)', re.I),
+            'items': {},
+        },
+        'soundtrack': {
+            'name': 'Саундтреки (from/From)',
+            'pattern': re.compile(r'^(?:from|From)\s', re.I),
+            'items': {},
+        },
+        'version': {
+            'name': 'Версии треков (Edit/Version/Mix)',
+            'pattern': re.compile(r'(?:edit|version|mix|single|album|radio)', re.I),
+            'items': {},
+        },
+        'feat': {
+            'name': 'Участники (feat./Feat.)',
+            'pattern': re.compile(r'(?:feat\.?|featuring)', re.I),
+            'items': {},
+        },
+        'other': {
+            'name': 'Прочее',
+            'pattern': None,
+            'items': {},
+        },
+    }
+    
+    for ann, files in annotations.items():
+        categorized = False
+        for cat_key, cat_data in categories.items():
+            if cat_key == 'other':
+                continue
+            if cat_data['pattern'] and cat_data['pattern'].search(ann):
+                cat_data['items'][ann] = files
+                categorized = True
+                break
+        if not categorized:
+            categories['other']['items'][ann] = files
+    
+    # Удаляем пустые категории
+    return {k: v for k, v in categories.items() if v['items']}
+
+
 def main() -> None:
     """Запускает основной цикл обработки и переименования файлов."""
     print("=== Обработчик аудиофайлов ===")
@@ -897,32 +958,69 @@ def main() -> None:
     # --- Подэтап 5.1: Анализ уточнений в скобках ---
     annotations = find_tag_annotations(files)
     if annotations:
-        sorted_annotations = sorted(
-            annotations.items(),
-            key=lambda x: len(x[1]),
-            reverse=True
-        )
-        print(f"\nНайдено {len(sorted_annotations)} уникальных "
-              f"уточнений в скобках:")
-        for i, (ann, file_list) in enumerate(sorted_annotations, 1):
-            print(f"  {i}. ({ann}) — {len(file_list)} файлов")
+        # Автоматически помечаем уточнения с недопустимыми символами
+        problematic = [
+            ann for ann in annotations
+            if INVALID_FILENAME_CHARS.search(ann)
+        ]
+        if problematic:
+            print(f"\n  Внимание: {len(problematic)} уточнений содержат "
+                  f"недопустимые символы и будут удалены автоматически:")
+            for ann in problematic:
+                print(f"    - ({ann})")
+            # Удаляем их без вопросов
+            removed_count = 0
+            for ann in problematic:
+                for f in annotations[ann]:
+                    if not f.exists():
+                        continue
+                    tags = read_audio_tags(f)
+                    if tags:
+                        new_title = remove_annotation_from_text(tags[1], ann)
+                        if new_title != tags[1]:
+                            if DRY_RUN:
+                                dbg(f"[DRY RUN] Автоудалил бы: ({ann}) из {f.name}")
+                            elif write_audio_tags(f, tags[0], new_title):
+                                dbg(f"Автоудалено: ({ann}) из {f.name}")
+                                removed_count += 1
+            if removed_count:
+                print(f"  Автоматически удалено: {removed_count}")
+                # Убираем их из списка для показа
+                for ann in problematic:
+                    del annotations[ann]
+    
+    if annotations:  # Показываем оставшиеся
+        categories = categorize_annotations(annotations)
         
-        choice = input(
-            "Какие удалить из тегов? (номера через запятую, "
-            "y - все, n - оставить все) [n]: "
-        ).strip().lower()
+        print(f"\nНайдено {len(annotations)} уникальных "
+              f"уточнений в {sum(len(cat['items']) for cat in categories.values())} категориях:")
+        
+        for cat_key, cat_data in categories.items():
+            total_files = sum(len(files) for files in cat_data['items'].values())
+            print(f"\n  {cat_data['name']} ({total_files} файлов):")
+            for i, (ann, file_list) in enumerate(
+                sorted(cat_data['items'].items(), key=lambda x: len(x[1]), reverse=True),
+                1
+            ):
+                print(f"    {i}. ({ann}) — {len(file_list)} файлов")
+        
+        print("\nКакие категории удалить из тегов?")
+        print("  (буквы через запятую: remaster, soundtrack, version, feat, other)")
+        print("  (y - все, n - оставить все) [n]: ", end='')
+        
+        choice = input().strip().lower()
         
         to_remove = set()
         if choice in ('y', 'yes', 'д', 'да'):
-            to_remove = {ann for ann, _ in sorted_annotations}
+            for cat_data in categories.values():
+                to_remove.update(cat_data['items'].keys())
         elif choice not in ('n', 'no', 'н', 'нет', ''):
-            try:
-                indices = [int(p.strip()) for p in choice.split(',')]
-                for idx in indices:
-                    if 1 <= idx <= len(sorted_annotations):
-                        to_remove.add(sorted_annotations[idx - 1][0])
-            except ValueError:
-                print("Некорректный ввод, пропускаю.")
+            selected_cats = [c.strip() for c in choice.split(',')]
+            for cat_key in selected_cats:
+                if cat_key in categories:
+                    to_remove.update(categories[cat_key]['items'].keys())
+                else:
+                    print(f"  Неизвестная категория: {cat_key}")
         
         if to_remove:
             removed_count = 0
