@@ -423,6 +423,28 @@ def normalize_dash(text: str) -> str:
     return re.sub(r'[–—]', '-', text)
 
 
+def normalize_title_spacing(text: str) -> str:
+    """Нормализует пробелы вокруг скобок в названии.
+    
+    Примеры:
+    - 'Waiting(feat. X)' → 'Waiting (feat. X)'
+    - 'Title  (feat. X)' → 'Title (feat. X)'
+    - 'Title ( feat. X )' → 'Title (feat. X)'
+    """
+    # Пробел перед открывающей скобкой
+    text = re.sub(r'\s*\(', ' (', text)
+    text = re.sub(r'\s*\[', ' [', text)
+    # Убираем пробелы сразу после открывающей скобки
+    text = re.sub(r'\(\s+', '(', text)
+    text = re.sub(r'\[\s+', '[', text)
+    # Убираем пробелы перед закрывающей скобкой
+    text = re.sub(r'\s+\)', ')', text)
+    text = re.sub(r'\s+\]', ']', text)
+    # Убираем множественные пробелы
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
 def normalize_feat_pair(artist: str, title: str) -> tuple[str, str]:
     """Нормализует пару тегов: переносит feat из artist в title.
     
@@ -541,6 +563,8 @@ def normalize_feat_pair(artist: str, title: str) -> tuple[str, str]:
         final_title = f"{cleaned_title} (feat. {guests_str})"
     else:
         final_title = cleaned_title
+    
+    final_title = normalize_title_spacing(final_title)
     
     return cleaned_artist, final_title
 
@@ -1290,10 +1314,10 @@ def main() -> None:
         if new_artist != artist or new_title != title:
             # Формируем новое имя файла для показа
             raw_name = f"{new_artist} - {new_title}"
+            raw_name = normalize_title_spacing(raw_name)
             cleaned = INVALID_FILENAME_CHARS.sub('', raw_name)
             cleaned = re.sub(r'\s+', ' ', cleaned).strip()
             new_filename = f"{cleaned}{f.suffix}"
-            
             feat_candidates.append(
                 (f, artist, title, new_artist, new_title, new_filename)
             )
@@ -1509,8 +1533,7 @@ def main() -> None:
             artist = remove_junk(str(tags[0]))
             title = remove_junk(str(tags[1]))
             raw_name = f"{artist} - {title}"
-            
-            # Флаг: пользователь уже принял решение в интерактивном диалоге
+            raw_name = normalize_title_spacing(raw_name)
             user_already_chose = False
             
             if INVALID_FILENAME_CHARS.search(raw_name):
