@@ -1667,12 +1667,24 @@ def main() -> None:
             ):
                 tag_str = f"{tag_artist} - {tag_title}"
                 print(f"  {i}. {f.name}")
-                print(f"      → {new_name}")
+                
                 if cat_key == 'D':
-                    print(f"      Теги: {tag_str} [ПРОБЛЕМА КОДИРОВКИ]")
+                    # Для группы D показываем обновление тегов из имени
+                    parsed = parse_artist_title(f.stem)
+                    if parsed:
+                        new_tag_str = f"{parsed[0]} - {parsed[1]}"
+                    else:
+                        new_tag_str = file_title or f.stem
+                    print(f"      Файл останется без изменений")
+                    print(f"      Теги: {tag_str}")
+                    print(f"         → {new_tag_str}")
                 elif cat_key == 'E':
                     print(f"      Файл: {file_title or '(нет)'}")
                     print(f"      Теги: {tag_str}")
+                    print(f"      → {new_name}")
+                else:
+                    # Для остальных групп показываем переименование
+                    print(f"      → {new_name}")
             
             # Для категорий A-D предлагаем пакетное действие
             if cat_key != 'E':
