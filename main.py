@@ -118,22 +118,31 @@ def sanitize_filename_interactive(
         options.append((f"Заменить '/' на '; ' → {opt3}", opt3))
     
     if '/' in invalid_chars:
+        # Извлекаем (feat. ...) отдельно, чтобы не потерять при разделении
+        feat_suffix = ""
+        feat_match = re.search(r'\s*\(feat\.\s*[^)]+\)\s*$', name)
+        if feat_match:
+            feat_suffix = feat_match.group(0)
+            name_without_feat = name[:feat_match.start()]
+        else:
+            name_without_feat = name
+        
         # Пытаемся найти паттерн "Artist - Name1 / Name2"
-        slash_match = re.search(r'^(.*?\s+-\s+)([^/]+)\s*/\s*(.+)$', name)
+        slash_match = re.search(r'^(.*?\s+-\s+)([^/]+)\s*/\s*(.+)$', name_without_feat)
         if slash_match:
             prefix = slash_match.group(1)  # "Artist - "
             first_title = slash_match.group(2).strip()  # "Name1"
             second_title = slash_match.group(3).strip()  # "Name2"
             
-            # Опция: оставить первое название
-            opt4 = f"{prefix}{first_title}"
+            # Опция: оставить первое название (с сохранением feat)
+            opt4 = f"{prefix}{first_title}{feat_suffix}"
             options.append((
                 f"Оставить первое название → {opt4}",
                 opt4
             ))
             
-            # Опция: оставить второе название
-            opt5 = f"{prefix}{second_title}"
+            # Опция: оставить второе название (с сохранением feat)
+            opt5 = f"{prefix}{second_title}{feat_suffix}"
             options.append((
                 f"Оставить второе название → {opt5}",
                 opt5
