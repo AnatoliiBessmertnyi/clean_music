@@ -452,6 +452,23 @@ def normalize_feat_pair(artist: str, title: str) -> tuple[str, str]:
     return cleaned_artist, final_title
 
 
+def normalize_artist_separators(artist: str) -> str:
+    """Нормализует разделители исполнителей на запятую с пробелом.
+    
+    Примеры:
+    - 'Artist1;Artist2' → 'Artist1, Artist2'
+    - 'Artist1 , Artist2' → 'Artist1, Artist2'
+    - 'Artist1,Artist2' → 'Artist1, Artist2'
+    """
+    # Заменяем ; на ,
+    result = artist.replace(';', ',')
+    # Нормализуем пробелы вокруг запятых
+    result = re.sub(r'\s*,\s*', ', ', result)
+    # Убираем лишние пробелы
+    result = re.sub(r'\s+', ' ', result).strip()
+    return result
+
+
 def is_track_number(text: str) -> bool:
     """Проверяет, является ли строка номером трека (01, 1., Track 5)."""
     return bool(TRACK_NUMBER_PATTERN.match(text.strip()))
@@ -1111,6 +1128,8 @@ def main() -> None:
     stage(5, "Переименование по тегам")
 
     # --- Подэтап 5.1: Нормализация (feat. X) в тегах ---
+    print("\n  [Подэтап 5.1] Нормализация участников (feat./ft./featuring)")
+    print("  Приводим все вариации к единому формату: (feat. Guest)")
     dbg("Подэтап 5.1: нормализация (feat. X)")
     feat_candidates = []
     
@@ -1177,7 +1196,59 @@ def main() -> None:
     else:
         dbg("Файлов для нормализации (feat.) не найдено.")
 
-    # --- Подэтап 5.2: Анализ уточнений в скобках ---
+    # --- Подэтап 5.2: Нормализация разделителей исполнителей ---
+    print("\n  [Подэтап 5.2] Нормализация разделителей исполнителей")
+    print("  Приводим все разделители к запятой с пробелом: 'Artist1, Artist2'")
+    dbg("Подэтап 5.2: нормализация разделителей исполнителей")
+    
+    sep_candidates = []
+    for f in files:
+        if not f.exists():
+            continue
+        tags = read_audio_tags(f)
+        if not tags:
+            continue
+        artist, title = tags
+        new_artist = normalize_artist_separators(str(artist))
+        if new_artist != artist:
+            sep_candidates.append((f, artist, title, new_artist))
+    
+    if sep_candidates:
+        print(f"\nНайдено {len(sep_candidates)} файлов "
+              f"для нормализации разделителей:")
+        for i, (f, artist, title, new_artist) in enumerate(
+            sep_candidates, 1
+        ):
+            print(f"\n  {i}. {f.name}")
+            print(f"      БЫЛО:")
+            print(f"        Исполнитель: {artist!r}")
+            print(f"      СТАНЕТ:")
+            print(f"        Исполнитель: {new_artist!r}")
+        
+        idx = select_indices(
+            [f.name for f, *_ in sep_candidates],
+            "\nКакие файлы нормализовать?",
+        )
+        
+        normalized_count = 0
+        for i in idx:
+            f, _, _, new_artist = sep_candidates[i]
+            if DRY_RUN:
+                dbg(f"[DRY RUN] Нормализовал бы разделители: {f.name}")
+                normalized_count += 1
+            elif write_audio_tags(f, new_artist, sep_candidates[i][2]):
+                print(f"  Нормализован: {f.name}")
+                normalized_count += 1
+        
+        if normalized_count:
+            print(f"  Нормализовано разделителей: {normalized_count}")
+    else:
+        dbg("Файлов для нормализации разделителей не найдено.")
+
+    # --- Подэтап 5.3: Анализ уточнений в скобках ---
+    print("\n  [Подэтап 5.3] Анализ уточнений в скобках")
+    print("  Находим уточнения (ремастеринг, версии, саундтреки)")
+    print("  и предлагаем удалить лишние из тегов.")
     annotations = find_tag_annotations(files)
     if annotations:
         # Автоматически помечаем уточнения с недопустимыми символами
@@ -1276,7 +1347,14 @@ def main() -> None:
                                 removed_count += 1
             print(f"  Удалено уточнений из тегов: {removed_count}")
 
-
+    # --- Подэтап 5.4: Формирование новых имён файлов по тегам ---
+    print("\n  [Подэтап 5.4] Формирование новых имён файлов по тегам")
+    dbg("Подэтап 5.4: формирование имён из тегов")
+    
+    safe_candidates = []
+    mismatch_candidates = []
+    missing = []
+    
     safe_candidates = []
     mismatch_candidates = []
     missing = []
