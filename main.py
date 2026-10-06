@@ -43,7 +43,7 @@ FEAT_VARIANTS_PATTERN = re.compile(
     re.IGNORECASE
 )
 SUPPORTED_EXTENSIONS = {'.mp3', '.m4a', '.mp4', '.flac', '.ogg', '.wma'}
-
+ARTIST_NAME_EXCEPTIONS = ['AC/DC',]
 TOTAL_STAGES = 8
 _remembered_sanitize_choices: dict[frozenset, int] = {}
 
@@ -455,16 +455,31 @@ def normalize_feat_pair(artist: str, title: str) -> tuple[str, str]:
 def normalize_artist_separators(artist: str) -> str:
     """Нормализует разделители исполнителей на запятую с пробелом.
     
+    Правила:
+    - ';' → ',' (стандартная замена)
+    - '/' → ',' (коллаборация), кроме групп из списка исключений
+    - Группы типа 'AC/DC' не обрабатываются как коллаборация
+    
     Примеры:
     - 'Artist1;Artist2' → 'Artist1, Artist2'
-    - 'Artist1 , Artist2' → 'Artist1, Artist2'
-    - 'Artist1,Artist2' → 'Artist1, Artist2'
+    - 'Dr. Dre/Snoop Dogg' → 'Dr. Dre, Snoop Dogg'
+    - 'AC/DC' → 'AC/DC' (без изменений, имя группы)
     """
-    # Заменяем ; на ,
+    # Проверяем, не является ли исполнитель исключением
+    artist_lower = artist.lower()
+    for exception in ARTIST_NAME_EXCEPTIONS:
+        if exception.lower() in artist_lower:
+            # Не трогаем '/' в именах групп из списка исключений
+            # Но всё равно нормализуем ; если они есть
+            result = artist.replace(';', ',')
+            result = re.sub(r'\s*,\s*', ', ', result)
+            result = re.sub(r'\s+', ' ', result).strip()
+            return result
+    
+    # Для остальных: заменяем ; и / на ,
     result = artist.replace(';', ',')
-    # Нормализуем пробелы вокруг запятых
+    result = re.sub(r'\s*/\s*', ', ', result)
     result = re.sub(r'\s*,\s*', ', ', result)
-    # Убираем лишние пробелы
     result = re.sub(r'\s+', ' ', result).strip()
     return result
 
