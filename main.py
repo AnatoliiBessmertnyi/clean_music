@@ -1035,7 +1035,59 @@ def main() -> None:
     # --- Шаг 5: Переименование по тегам с проверкой ---
     stage(5, "Переименование по тегам")
 
-    # --- Подэтап 5.1: Анализ уточнений в скобках ---
+    # --- Подэтап 5.1: Нормализация (feat. X) в тегах ---
+    dbg("Подэтап 5.1: нормализация (feat. X)")
+    feat_candidates = []
+    
+    for f in files:
+        if not f.exists():
+            continue
+        tags = read_audio_tags(f)
+        if not tags:
+            continue
+        
+        artist, title = tags
+        new_title = normalize_feat_in_text(str(title))
+        new_artist = normalize_feat_in_text(str(artist))
+        
+        if new_title != title or new_artist != artist:
+            feat_candidates.append(
+                (f, artist, title, new_artist, new_title)
+            )
+    
+    if feat_candidates:
+        print(f"\nНайдено {len(feat_candidates)} файлов "
+              f"для нормализации (feat.):")
+        for i, (f, artist, title, new_artist, new_title) in enumerate(
+            feat_candidates, 1
+        ):
+            print(f"  {i}. {f.name}")
+            if new_artist != artist:
+                print(f"      Исполнитель: {artist!r} → {new_artist!r}")
+            if new_title != title:
+                print(f"      Название:    {title!r} → {new_title!r}")
+        
+        idx = select_indices(
+            [f.name for f, *_ in feat_candidates],
+            "Какие файлы нормализовать?",
+        )
+        
+        normalized_count = 0
+        for i in idx:
+            f, _, _, new_artist, new_title = feat_candidates[i]
+            if DRY_RUN:
+                dbg(f"[DRY RUN] Нормализовал бы (feat.): {f.name}")
+                normalized_count += 1
+            elif write_audio_tags(f, new_artist, new_title):
+                print(f"  Нормализован: {f.name}")
+                normalized_count += 1
+        
+        if normalized_count:
+            print(f"  Нормализовано (feat.): {normalized_count}")
+    else:
+        dbg("Файлов для нормализации (feat.) не найдено.")
+
+    # --- Подэтап 5.2: Анализ уточнений в скобках ---
     annotations = find_tag_annotations(files)
     if annotations:
         # Автоматически помечаем уточнения с недопустимыми символами
@@ -1087,6 +1139,8 @@ def main() -> None:
         print("\nКакие категории удалить из тегов?")
         print("  Полные названия: remaster, soundtrack, version, feat, other")
         print("  Сокращения:      r,        s,          v,       f,    o")
+        print("  ⚠ feat — уже нормализованы. Удаление "
+              "сотрёт информацию об участниках.")
         print("  (y - все, n - оставить все) [n]: ", end='')
         
         choice = input().strip().lower()
@@ -1135,57 +1189,6 @@ def main() -> None:
                                 removed_count += 1
             print(f"  Удалено уточнений из тегов: {removed_count}")
 
-    # --- Подэтап 5.2: Нормализация (feat. X) в тегах ---
-    dbg("Подэтап 5.2: нормализация (feat. X)")
-    feat_candidates = []
-    
-    for f in files:
-        if not f.exists():
-            continue
-        tags = read_audio_tags(f)
-        if not tags:
-            continue
-        
-        artist, title = tags
-        new_title = normalize_feat_in_text(str(title))
-        new_artist = normalize_feat_in_text(str(artist))
-        
-        if new_title != title or new_artist != artist:
-            feat_candidates.append(
-                (f, artist, title, new_artist, new_title)
-            )
-    
-    if feat_candidates:
-        print(f"\nНайдено {len(feat_candidates)} файлов "
-              f"для нормализации (feat.):")
-        for i, (f, artist, title, new_artist, new_title) in enumerate(
-            feat_candidates, 1
-        ):
-            print(f"  {i}. {f.name}")
-            if new_artist != artist:
-                print(f"      Исполнитель: {artist!r} → {new_artist!r}")
-            if new_title != title:
-                print(f"      Название:    {title!r} → {new_title!r}")
-        
-        idx = select_indices(
-            [f.name for f, *_ in feat_candidates],
-            "Какие файлы нормализовать?",
-        )
-        
-        normalized_count = 0
-        for i in idx:
-            f, _, _, new_artist, new_title = feat_candidates[i]
-            if DRY_RUN:
-                dbg(f"[DRY RUN] Нормализовал бы (feat.): {f.name}")
-                normalized_count += 1
-            elif write_audio_tags(f, new_artist, new_title):
-                print(f"  Нормализован: {f.name}")
-                normalized_count += 1
-        
-        if normalized_count:
-            print(f"  Нормализовано (feat.): {normalized_count}")
-    else:
-        dbg("Файлов для нормализации (feat.) не найдено.")
 
     safe_candidates = []
     mismatch_candidates = []
