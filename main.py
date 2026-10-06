@@ -1474,6 +1474,9 @@ def main() -> None:
             title = remove_junk(str(tags[1]))
             raw_name = f"{artist} - {title}"
             
+            # Флаг: пользователь уже принял решение в интерактивном диалоге
+            user_already_chose = False
+            
             if INVALID_FILENAME_CHARS.search(raw_name):
                 # Быстрая проверка: если после очистки получается
                 # текущее имя файла — пропускаем без диалога
@@ -1493,6 +1496,8 @@ def main() -> None:
                 if base_name == "SKIP":
                     print(f"  Оставлен без изменений: {f.name}")
                     continue
+                # Пользователь принял решение — не нужно спрашивать снова
+                user_already_chose = True
             else:
                 base_name = raw_name
             
@@ -1501,7 +1506,8 @@ def main() -> None:
             if new_name == f.name:
                 continue
 
-            if titles_match(file_title, title):
+            if user_already_chose or titles_match(file_title, title):
+                # Пользователь уже подтвердил выбор ИЛИ названия совпадают
                 safe_candidates.append((f, new_name))
             else:
                 mismatch_candidates.append((f, file_title, new_name))
