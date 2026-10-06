@@ -332,12 +332,13 @@ def normalize_feat_pair(artist: str, title: str) -> tuple[str, str]:
     - feat должен быть ТОЛЬКО в title
     - Из artist feat удаляется
     - Все гости объединяются в один блок (feat. X, Y, Z)
+    - Если в блоке feat есть тире (feat. X - Y), 
+      то Y — это название, X — гость
     """
     # 1. Извлекаем всех feat-гостей из artist
     artist_guests = []
     cleaned_artist = artist
     
-    # Ищем "feat X" вне скобок в artist
     feat_matches = list(FEAT_VARIANTS_PATTERN.finditer(artist))
     if feat_matches:
         for i, match in enumerate(feat_matches):
@@ -352,7 +353,6 @@ def normalize_feat_pair(artist: str, title: str) -> tuple[str, str]:
                 if g and g not in artist_guests:
                     artist_guests.append(g)
         
-        # Удаляем "feat. ..." из artist
         base = artist
         for i, match in enumerate(feat_matches):
             if i + 1 < len(feat_matches):
@@ -362,9 +362,10 @@ def normalize_feat_pair(artist: str, title: str) -> tuple[str, str]:
             base = base[:match.start()] + base[end:]
         cleaned_artist = re.sub(r'\s+', ' ', base).strip()
     
-    # 2. Извлекаем feat-гостей из title (как было)
+    # 2. Извлекаем feat-гостей из title
     title_guests = []
     cleaned_title = title
+    real_title_part = ""  # часть, которая оказалась названием (после тире в feat)
     
     # Ищем feat в скобках
     bracket_feat_pattern = re.compile(
@@ -390,29 +391,47 @@ def normalize_feat_pair(artist: str, title: str) -> tuple[str, str]:
     # Ищем feat вне скобок в title
     title_feat_matches = list(FEAT_VARIANTS_PATTERN.finditer(cleaned_title))
     if title_feat_matches:
+        base_parts = []
+        last_end = 0
         for i, match in enumerate(title_feat_matches):
+            base_parts.append(cleaned_title[last_end:match.start()])
             start = match.end()
             if i + 1 < len(title_feat_matches):
                 end = title_feat_matches[i + 1].start()
             else:
                 end = len(cleaned_title)
             guest_part = cleaned_title[start:end].strip()
-            for g in re.split(r'\s*[&,]\s*', guest_part):
-                g = g.strip()
-                if g and g not in title_guests:
-                    title_guests.append(g)
-        
-        # Удаляем feat из title
-        base = cleaned_title
-        for i, match in enumerate(title_feat_matches):
-            if i + 1 < len(title_feat_matches):
-                end = title_feat_matches[i + 1].start()
+            
+            # ПРОВЕРКА: есть ли тире в гостевой части?
+            # Если "feat. X - Y", то Y — это реальное название
+            dash_match = re.search(r'\s+[-–—]\s+', guest_part)
+            if dash_match:
+                guest_only = guest_part[:dash_match.start()].strip()
+                title_part = guest_part[dash_match.end():].strip()
+                if title_part:
+                    real_title_part = title_part
+                
+                for g in re.split(r'\s*[&,]\s*', guest_only):
+                    g = g.strip()
+                    if g and g not in title_guests:
+                        title_guests.append(g)
             else:
-                end = len(cleaned_title)
-            base = base[:match.start()] + base[end:]
-        cleaned_title = re.sub(r'\s+', ' ', base).strip()
+                for g in re.split(r'\s*[&,]\s*', guest_part):
+                    g = g.strip()
+                    if g and g not in title_guests:
+                        title_guests.append(g)
+            
+            last_end = end
+        
+        base_parts.append(cleaned_title[last_end:])
+        cleaned_title = ''.join(base_parts)
+        cleaned_title = re.sub(r'\s+', ' ', cleaned_title).strip()
+        
+        # Если нашли реальное название после тире — используем его
+        if real_title_part:
+            cleaned_title = real_title_part
     
-    # 3. Объединяем гостей (artist_guests + title_guests)
+    # 3. Объединяем гостей
     all_guests = []
     for g in artist_guests + title_guests:
         if g not in all_guests:
@@ -426,6 +445,7 @@ def normalize_feat_pair(artist: str, title: str) -> tuple[str, str]:
         final_title = cleaned_title
     
     return cleaned_artist, final_title
+
 
 def is_track_number(text: str) -> bool:
     """Проверяет, является ли строка номером трека (01, 1., Track 5)."""
