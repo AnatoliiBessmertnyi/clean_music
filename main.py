@@ -469,6 +469,40 @@ def normalize_artist_separators(artist: str) -> str:
     return result
 
 
+def remove_feat_guests_from_artist(artist: str, title: str) -> str:
+    """Удаляет гостей из Artist, если они уже указаны в Title через (feat.).
+    
+    По стандарту отрасли гости должны быть только в Title,
+    а в Artist — только основные исполнители.
+    """
+    # Извлекаем гостей из Title: (feat. X, Y, Z)
+    feat_pattern = re.compile(
+        r'\(feat\.\s*([^\)]+)\)',
+        re.IGNORECASE
+    )
+    match = feat_pattern.search(title)
+    if not match:
+        return artist
+    
+    guests_str = match.group(1)
+    guests = [g.strip() for g in re.split(r'\s*,\s*', guests_str)]
+    
+    # Разделяем Artist на исполнителей (по запятой или точке с запятой)
+    artists = [a.strip() for a in re.split(r'\s*[,;]\s*', artist)]
+    
+    # Удаляем гостей из Artist (сравнение без учёта регистра)
+    guests_lower = {g.lower() for g in guests}
+    filtered_artists = [
+        a for a in artists 
+        if a.lower() not in guests_lower
+    ]
+    
+    if not filtered_artists:
+        return artist  # Если все удалены, возвращаем оригинал
+    
+    return ', '.join(filtered_artists)
+
+
 def is_track_number(text: str) -> bool:
     """Проверяет, является ли строка номером трека (01, 1., Track 5)."""
     return bool(TRACK_NUMBER_PATTERN.match(text.strip()))
@@ -1150,6 +1184,10 @@ def main() -> None:
             str(artist), str(title)
         )
         
+        # Дополнительно: удаляем гостей из Artist, 
+        # если они уже указаны в Title через (feat.)
+        new_artist = remove_feat_guests_from_artist(new_artist, new_title)
+        
         if new_artist != artist or new_title != title:
             # Формируем новое имя файла для показа
             raw_name = f"{new_artist} - {new_title}"
@@ -1300,9 +1338,9 @@ def main() -> None:
         print("\nКакие категории удалить из тегов?")
         print("  Полные названия: remaster, soundtrack, version, other")
         print("  Сокращения:      r,        s,          v,       o")
-        print("  (y - все, n - оставить все) [n]: ", end='')
-        
-        choice = input().strip().lower()
+        choice = get_choice_with_default(
+            "  (y - все, n - оставить все) [y]: ", default='y'
+        )
         
         # Маппинг сокращений на полные имена
         shortcuts = {
