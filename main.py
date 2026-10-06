@@ -285,7 +285,8 @@ def remove_junk(text: str) -> str:
 def find_tag_annotations(
     files: list[Path],
 ) -> dict[str, list[Path]]:
-    """Находит уникальные скобки в тегах названий (кроме известного мусора)."""
+    """Находит уникальные скобки в тегах названий 
+    (кроме известного мусора и feat)."""
     annotations = {}
     bracket_pattern = re.compile(r'[\(\[]([^\)\]]+)[\)\]]')
     
@@ -302,6 +303,10 @@ def find_tag_annotations(
                     continue
                 # Пропускаем известный мусор (уже обработан)
                 if JUNK_PATTERN.search(f"({match})"):
+                    continue
+                # Пропускаем feat — они уже нормализованы 
+                # и остаются по отраслевому стандарту
+                if FEAT_VARIANTS_PATTERN.match(match):
                     continue
                 if match not in annotations:
                     annotations[match] = []
@@ -983,11 +988,7 @@ def categorize_annotations(annotations: dict[str, list[Path]]) -> dict[str, dict
             'pattern': re.compile(r'(?:edit|version|mix|single|album|radio)', re.I),
             'items': {},
         },
-        'feat': {
-            'name': 'Участники (feat./Feat.)',
-            'pattern': re.compile(r'(?:feat\.?|featuring)', re.I),
-            'items': {},
-        },
+        # feat исключены на уровне find_tag_annotations
         'other': {
             'name': 'Прочее',
             'pattern': None,
@@ -1007,7 +1008,6 @@ def categorize_annotations(annotations: dict[str, list[Path]]) -> dict[str, dict
         if not categorized:
             categories['other']['items'][ann] = files
     
-    # Удаляем пустые категории
     return {k: v for k, v in categories.items() if v['items']}
 
 
@@ -1198,10 +1198,8 @@ def main() -> None:
                 print(f"    {i}. ({ann}) — {len(file_list)} файлов")
         
         print("\nКакие категории удалить из тегов?")
-        print("  Полные названия: remaster, soundtrack, version, feat, other")
-        print("  Сокращения:      r,        s,          v,       f,    o")
-        print("  ⚠ feat — уже нормализованы. Удаление "
-              "сотрёт информацию об участниках.")
+        print("  Полные названия: remaster, soundtrack, version, other")
+        print("  Сокращения:      r,        s,          v,       o")
         print("  (y - все, n - оставить все) [n]: ", end='')
         
         choice = input().strip().lower()
@@ -1211,7 +1209,6 @@ def main() -> None:
             'r': 'remaster',
             's': 'soundtrack',
             'v': 'version',
-            'f': 'feat',
             'o': 'other',
         }
         
