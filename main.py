@@ -38,6 +38,10 @@ LEADING_TRACK_PATTERN = re.compile(
     re.IGNORECASE
 )
 INVALID_FILENAME_CHARS = re.compile(r'[\\:*?"<>|/]')
+FEAT_VARIANTS_PATTERN = re.compile(
+    r'\b(?:feat(?:uring)?|ft)\b\.?\s*',
+    re.IGNORECASE
+)
 SUPPORTED_EXTENSIONS = {'.mp3', '.m4a', '.mp4', '.flac', '.ogg', '.wma'}
 
 TOTAL_STAGES = 8
@@ -319,6 +323,82 @@ def remove_annotation_from_text(text: str, annotation: str) -> str:
 def normalize_dash(text: str) -> str:
     """Заменяет все виды тире на стандартный дефис."""
     return re.sub(r'[–—]', '-', text)
+
+
+def normalize_feat_in_text(text: str) -> str:
+    """Нормализует формат (feat. X) в тексте по отраслевому стандарту.
+    
+    Правила:
+    - Все вариации (feat, ft, featuring) → 'feat.'
+    - Амперсанд внутри скобок → запятая
+    - Множественные 'feat.' → объединение в один блок
+    - Пробелы нормализуются: (feat. X, Y)
+    """
+    if not FEAT_VARIANTS_PATTERN.search(text):
+        return text
+    
+    # Случай 1: "feat" в скобках — нормализуем содержимое
+    bracket_feat_pattern = re.compile(
+        r'[\(\[]\s*(?:feat(?:uring)?|ft)\b\.?\s*([^\)\]]+)[\)\]]',
+        re.IGNORECASE
+    )
+    
+    matches = list(bracket_feat_pattern.finditer(text))
+    if matches:
+        all_guests = []
+        result_parts = []
+        last_end = 0
+        
+        for match in matches:
+            result_parts.append(text[last_end:match.start()])
+            guests_str = match.group(1)
+            # Разделяем по запятым и амперсандам
+            for guest in re.split(r'\s*[&,]\s*', guests_str):
+                guest = guest.strip()
+                if guest and guest not in all_guests:
+                    all_guests.append(guest)
+            last_end = match.end()
+        
+        result_parts.append(text[last_end:])
+        base = ''.join(result_parts)
+        base = re.sub(r'\s+', ' ', base).strip()
+        
+        if all_guests:
+            guests_str = ', '.join(all_guests)
+            return f"{base} (feat. {guests_str})"
+        return base
+    
+    # Случай 2: "feat" вне скобок — переносим в скобки
+    guests = []
+    feat_matches = list(FEAT_VARIANTS_PATTERN.finditer(text))
+    
+    for i, match in enumerate(feat_matches):
+        start = match.end()
+        if i + 1 < len(feat_matches):
+            end = feat_matches[i + 1].start()
+        else:
+            end = len(text)
+        guest_part = text[start:end].strip()
+        for g in re.split(r'\s*[&,]\s*', guest_part):
+            g = g.strip()
+            if g and g not in guests:
+                guests.append(g)
+    
+    if not guests:
+        return text
+    
+    # Удаляем "feat. ..." из базовой части
+    base = text
+    for i, match in enumerate(feat_matches):
+        if i + 1 < len(feat_matches):
+            end = feat_matches[i + 1].start()
+        else:
+            end = len(text)
+        base = base[:match.start()] + base[end:]
+    
+    base = re.sub(r'\s+', ' ', base).strip()
+    guests_str = ', '.join(guests)
+    return f"{base} (feat. {guests_str})"
 
 
 def is_track_number(text: str) -> bool:
@@ -954,7 +1034,7 @@ def main() -> None:
 
     # --- Шаг 5: Переименование по тегам с проверкой ---
     stage(5, "Переименование по тегам")
-    
+
     # --- Подэтап 5.1: Анализ уточнений в скобках ---
     annotations = find_tag_annotations(files)
     if annotations:
@@ -993,7 +1073,7 @@ def main() -> None:
         categories = categorize_annotations(annotations)
         
         print(f"\nНайдено {len(annotations)} уникальных "
-              f"уточнений в {sum(len(cat['items']) for cat in categories.values())} категориях:")
+              f"уточнений в {len(categories)} категориях:")
         
         for cat_key, cat_data in categories.items():
             total_files = sum(len(files) for files in cat_data['items'].values())
@@ -1005,10 +1085,20 @@ def main() -> None:
                 print(f"    {i}. ({ann}) — {len(file_list)} файлов")
         
         print("\nКакие категории удалить из тегов?")
-        print("  (буквы через запятую: remaster, soundtrack, version, feat, other)")
+        print("  Полные названия: remaster, soundtrack, version, feat, other")
+        print("  Сокращения:      r,        s,          v,       f,    o")
         print("  (y - все, n - оставить все) [n]: ", end='')
         
         choice = input().strip().lower()
+        
+        # Маппинг сокращений на полные имена
+        shortcuts = {
+            'r': 'remaster',
+            's': 'soundtrack',
+            'v': 'version',
+            'f': 'feat',
+            'o': 'other',
+        }
         
         to_remove = set()
         if choice in ('y', 'yes', 'д', 'да'):
@@ -1016,11 +1106,13 @@ def main() -> None:
                 to_remove.update(cat_data['items'].keys())
         elif choice not in ('n', 'no', 'н', 'нет', ''):
             selected_cats = [c.strip() for c in choice.split(',')]
-            for cat_key in selected_cats:
+            for cat_input in selected_cats:
+                # Пробуем сокращение
+                cat_key = shortcuts.get(cat_input, cat_input)
                 if cat_key in categories:
                     to_remove.update(categories[cat_key]['items'].keys())
                 else:
-                    print(f"  Неизвестная категория: {cat_key}")
+                    print(f"  Неизвестная категория: {cat_input}")
         
         if to_remove:
             removed_count = 0
@@ -1042,7 +1134,59 @@ def main() -> None:
                                     f"из {f.name}")
                                 removed_count += 1
             print(f"  Удалено уточнений из тегов: {removed_count}")
+
+    # --- Подэтап 5.2: Нормализация (feat. X) в тегах ---
+    dbg("Подэтап 5.2: нормализация (feat. X)")
+    feat_candidates = []
     
+    for f in files:
+        if not f.exists():
+            continue
+        tags = read_audio_tags(f)
+        if not tags:
+            continue
+        
+        artist, title = tags
+        new_title = normalize_feat_in_text(str(title))
+        new_artist = normalize_feat_in_text(str(artist))
+        
+        if new_title != title or new_artist != artist:
+            feat_candidates.append(
+                (f, artist, title, new_artist, new_title)
+            )
+    
+    if feat_candidates:
+        print(f"\nНайдено {len(feat_candidates)} файлов "
+              f"для нормализации (feat.):")
+        for i, (f, artist, title, new_artist, new_title) in enumerate(
+            feat_candidates, 1
+        ):
+            print(f"  {i}. {f.name}")
+            if new_artist != artist:
+                print(f"      Исполнитель: {artist!r} → {new_artist!r}")
+            if new_title != title:
+                print(f"      Название:    {title!r} → {new_title!r}")
+        
+        idx = select_indices(
+            [f.name for f, *_ in feat_candidates],
+            "Какие файлы нормализовать?",
+        )
+        
+        normalized_count = 0
+        for i in idx:
+            f, _, _, new_artist, new_title = feat_candidates[i]
+            if DRY_RUN:
+                dbg(f"[DRY RUN] Нормализовал бы (feat.): {f.name}")
+                normalized_count += 1
+            elif write_audio_tags(f, new_artist, new_title):
+                print(f"  Нормализован: {f.name}")
+                normalized_count += 1
+        
+        if normalized_count:
+            print(f"  Нормализовано (feat.): {normalized_count}")
+    else:
+        dbg("Файлов для нормализации (feat.) не найдено.")
+
     safe_candidates = []
     mismatch_candidates = []
     missing = []
