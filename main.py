@@ -44,7 +44,7 @@ FEAT_VARIANTS_PATTERN = re.compile(
 )
 SUPPORTED_EXTENSIONS = {'.mp3', '.m4a', '.mp4', '.flac', '.ogg', '.wma'}
 ARTIST_NAME_EXCEPTIONS = ['AC/DC',]
-TOTAL_STAGES = 8
+TOTAL_STAGES = 7
 _remembered_sanitize_choices: dict[frozenset, int] = {}
 
 
@@ -52,6 +52,20 @@ def dbg(msg: str) -> None:
     """Выводит отладочное сообщение, если включён DEBUG."""
     if DEBUG:
         print(f"  [DEBUG] {msg}")
+
+
+def show_progress(current: int, total: int, prefix: str = "") -> None:
+    """Показывает прогресс-бар для больших коллекций."""
+    if total <= 50:  # Не показываем для маленьких коллекций
+        return
+    percent = (current / total) * 100
+    bar_length = 30
+    filled = int(bar_length * current / total)
+    bar = '█' * filled + '░' * (bar_length - filled)
+    print(f"\r{prefix}{current}/{total} [{bar}] {percent:.0f}%", 
+          end='', flush=True)
+    if current == total:
+        print()
 
 
 def get_choice_with_default(prompt: str, default: str = '1') -> str:
@@ -205,6 +219,21 @@ def sanitize_filename_interactive(
         pass
     
     return "SKIP"
+
+
+def clean_filename_safely(
+    raw_name: str, 
+    current_filename: str
+) -> str | None:
+    """Очищает имя файла с проверкой недопустимых символов.
+    
+    Если недопустимых символов нет — возвращает имя как есть.
+    Если есть — запускает интерактивный выбор.
+    """
+    if not INVALID_FILENAME_CHARS.search(raw_name):
+        return raw_name
+    
+    return sanitize_filename_interactive(raw_name, current_filename)
 
 
 def stage(number: int, name: str) -> None:
@@ -1167,38 +1196,29 @@ def main() -> None:
     dbg("Подэтап 1.2: очистка мусора из тегов")
     process_tag_junk_cleaning(files, processed_stats)
 
-    # --- Шаг 2: Нормализация тире ---
-    stage(2, "Нормализация тире")
-    dash = [f for f in files if '–' in f.stem or '—' in f.stem]
+    # --- Шаг 2: Нормализация тире и пробелов ---
+    stage(2, "Нормализация тире и пробелов")
+    
+    def normalize_text(text: str) -> str:
+        """Объединяет нормализацию тире и пробелов."""
+        text = normalize_dash(text)
+        text = normalize_filename_stem(text)
+        return text
+    
+    candidates = [f for f in files if normalize_text(f.stem) != f.stem]
     files = process_rename_batch(
-        files, dash, normalize_dash,
-        "файлов с нестандартными тире",
+        files, candidates, normalize_text,
+        "файлов с нестандартными тире или лишними пробелами",
         processed_stats, 'dash_normalized',
     )
 
-    # --- Шаг 3: Нормализация пробелов ---
-    stage(3, "Нормализация пробелов")
-    spaces = [
-        f for f in files
-        if normalize_filename_stem(f.stem) != f.stem
-    ]
-    files = process_rename_batch(
-        files, spaces, normalize_filename_stem,
-        "файлов с лишними пробелами",
-        processed_stats, 'spaces_normalized',
-    )
+    # --- Шаг 4: Переименование по тегам с проверкой ---
+    stage(3, "Переименование по тегам")
 
-    # --- Шаг 4: Поиск дубликатов ---
-    stage(4, "Поиск и объединение дубликатов")
-    files = process_duplicates(files, processed_stats)
-
-    # --- Шаг 5: Переименование по тегам с проверкой ---
-    stage(5, "Переименование по тегам")
-
-    # --- Подэтап 5.1: Нормализация (feat. X) в тегах ---
-    print("\n  [Подэтап 5.1] Нормализация участников (feat./ft./featuring)")
+    # --- Подэтап 4.1: Нормализация (feat. X) в тегах ---
+    print("\n  [Подэтап 4.1] Нормализация участников (feat./ft./featuring)")
     print("  Приводим все вариации к единому формату: (feat. Guest)")
-    dbg("Подэтап 5.1: нормализация (feat. X)")
+    dbg("Подэтап 4.1: нормализация (feat. X)")
     feat_candidates = []
     
     for f in files:
@@ -1268,10 +1288,10 @@ def main() -> None:
     else:
         dbg("Файлов для нормализации (feat.) не найдено.")
 
-    # --- Подэтап 5.2: Нормализация разделителей исполнителей ---
-    print("\n  [Подэтап 5.2] Нормализация разделителей исполнителей")
+    # --- Подэтап 4.2: Нормализация разделителей исполнителей ---
+    print("\n  [Подэтап 4.2] Нормализация разделителей исполнителей")
     print("  Приводим все разделители к запятой с пробелом: 'Artist1, Artist2'")
-    dbg("Подэтап 5.2: нормализация разделителей исполнителей")
+    dbg("Подэтап 4.2: нормализация разделителей исполнителей")
     
     sep_candidates = []
     for f in files:
@@ -1317,8 +1337,8 @@ def main() -> None:
     else:
         dbg("Файлов для нормализации разделителей не найдено.")
 
-    # --- Подэтап 5.3: Анализ уточнений в скобках ---
-    print("\n  [Подэтап 5.3] Анализ уточнений в скобках")
+    # --- Подэтап 4.3: Анализ уточнений в скобках ---
+    print("\n  [Подэтап 4.3] Анализ уточнений в скобках")
     print("  Находим уточнения (ремастеринг, версии, саундтреки)")
     print("  и предлагаем удалить лишние из тегов.")
     annotations = find_tag_annotations(files)
@@ -1419,15 +1439,19 @@ def main() -> None:
                                 removed_count += 1
             print(f"  Удалено уточнений из тегов: {removed_count}")
 
-    # --- Подэтап 5.4: Формирование новых имён файлов по тегам ---
-    print("\n  [Подэтап 5.4] Формирование новых имён файлов по тегам")
-    dbg("Подэтап 5.4: формирование имён из тегов")
+    # --- Подэтап 4.4: Формирование новых имён файлов по тегам ---
+    print("\n  [Подэтап 4.4] Формирование новых имён файлов по тегам")
+    dbg("Подэтап 4.4: формирование имён из тегов")
     
     safe_candidates = []
     mismatch_candidates = []
     missing = []
 
-    for f in files:
+    total_files = len(files)
+    print(f"\n  Анализ {total_files} файлов...")
+
+    for idx, f in enumerate(files, 1):
+        show_progress(idx, total_files, "  ")
         if not f.exists():
             continue
 
@@ -1454,7 +1478,7 @@ def main() -> None:
                     continue
                 
                 # Иначе — интерактивный выбор
-                base_name = sanitize_filename_interactive(
+                base_name = clean_filename_safely(
                     raw_name, f.name
                 )
                 if base_name == "SKIP":
@@ -1544,7 +1568,7 @@ def main() -> None:
                 }
             except ValueError:
                 print("Некорректный ввод, пропускаю обновление тегов.")
-        
+
         # Переименование по тегам
         for i, (old_path, file_title, new_name) in enumerate(
             mismatch_candidates, 1
@@ -1584,8 +1608,17 @@ def main() -> None:
         if skipped > 0:
             print(f"  Оставлено без изменений: {skipped}")
 
-    # --- Шаг 6: Запись тегов из имени файла ---
-    stage(6, "Запись тегов из имени файла")
+    print("\n" + "="*60)
+    print("  Этап нормализации тегов и имён завершён.")
+    print("  Переход к поиску дубликатов.")
+    print("="*60)
+
+    # --- Шаг 4: Поиск дубликатов ---
+    stage(4, "Поиск и объединение дубликатов")
+    files = process_duplicates(files, processed_stats)
+
+    # --- Шаг 5: Запись тегов из имени файла ---
+    stage(5, "Запись тегов из имени файла")
     tags_to_write = []
     for f in files:
         if not f.exists():
@@ -1615,8 +1648,8 @@ def main() -> None:
                 print(f"  Записаны теги: {f.name}")
                 processed_stats['tags_written'] += 1
 
-    # --- Шаг 7: Нормализация имён исполнителей ---
-    stage(7, "Нормализация имён исполнителей")
+    # --- Шаг 6: Нормализация имён исполнителей ---
+    stage(6, "Нормализация имён исполнителей")
     artist_variations = find_artist_variations(files)
     if artist_variations:
         print(
@@ -1686,7 +1719,7 @@ def main() -> None:
                         raw_name = f"{canonical} - {parsed[1]}"
                         
                         if INVALID_FILENAME_CHARS.search(raw_name):
-                            base_name = sanitize_filename_interactive(raw_name, f.name)
+                            base_name = clean_filename_safely(raw_name, f.name)
                             if base_name == "SKIP":
                                 dbg(
                                     f"Пропущен из-за недопустимых "
@@ -1705,7 +1738,7 @@ def main() -> None:
                         )
 
     # --- Шаг 8: Ручной ввод для файлов без метаданных ---
-    stage(8, "Ручной ввод для файлов без метаданных")
+    stage(7, "Ручной ввод для файлов без метаданных")
     still_missing = []
     
     # После Этапа 6 у некоторых файлов могли появиться теги —
@@ -1741,7 +1774,7 @@ def main() -> None:
             raw_name = f"{artist} - {title}"
             
             if INVALID_FILENAME_CHARS.search(raw_name):
-                base_name = sanitize_filename_interactive(
+                base_name = clean_filename_safely(
                     raw_name, f.name
                 )
                 if base_name == "SKIP":
@@ -1767,11 +1800,8 @@ def main() -> None:
           f"{processed_stats['junk_removed']}")
     print(f"Очистка от мусора (теги): "
           f"{processed_stats['tags_cleaned']}")
-    print(f"Нормализация тире: {processed_stats['dash_normalized']}")
-    print(
-        f"Нормализация пробелов: "
-        f"{processed_stats['spaces_normalized']}"
-    )
+    print(f"Нормализация тире и пробелов: "
+          f"{processed_stats['dash_normalized']}")
     print(
         f"Удалено дубликатов: "
         f"{processed_stats['duplicates_removed']}"
