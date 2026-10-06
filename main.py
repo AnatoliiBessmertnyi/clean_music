@@ -657,7 +657,7 @@ def find_artist_variations(
             if key not in artist_map:
                 artist_map[key] = []
             artist_map[key].append((f, artist))
-    
+
     variations = {}
     for key, entries in artist_map.items():
         unique_artists = set(artist for _, artist in entries)
@@ -695,6 +695,57 @@ def process_rename_batch(
         else:
             new_files.append(f)
     return new_files
+
+
+def process_tag_junk_cleaning(
+    files: list[Path], stats: dict[str, int]
+) -> None:
+    """Очищает мусор из тегов исполнителя и названия."""
+    candidates = []
+    for f in files:
+        if not f.exists():
+            continue
+        tags = read_audio_tags(f)
+        if not tags:
+            continue
+        artist, title = tags
+        new_artist = remove_junk(str(artist))
+        new_title = remove_junk(str(title))
+        if new_artist != artist or new_title != title:
+            candidates.append((f, artist, title, new_artist, new_title))
+    
+    if not candidates:
+        dbg("Файлов с мусором в тегах не найдено.")
+        return
+    
+    print(f"\nНайдено {len(candidates)} файлов с мусором в тегах:")
+    for i, (f, artist, title, new_artist, new_title) in enumerate(
+        candidates, 1
+    ):
+        print(f"  {i}. {f.name}")
+        if new_artist != artist:
+            print(f"      Исполнитель: {artist!r} → {new_artist!r}")
+        if new_title != title:
+            print(f"      Название:    {title!r} → {new_title!r}")
+    
+    idx = select_indices(
+        [f.name for f, *_ in candidates],
+        "Какие файлы очистить?",
+    )
+    
+    cleaned_count = 0
+    for i in idx:
+        f, _, _, new_artist, new_title = candidates[i]
+        if DRY_RUN:
+            dbg(f"[DRY RUN] Очистил бы теги: {f.name}")
+            cleaned_count += 1
+        elif write_audio_tags(f, new_artist, new_title):
+            print(f"  Теги очищены: {f.name}")
+            cleaned_count += 1
+    
+    if cleaned_count:
+        stats['tags_cleaned'] = cleaned_count
+        print(f"  Очищено тегов: {cleaned_count}")
 
 
 def process_duplicates(
@@ -792,6 +843,7 @@ def main() -> None:
 
     processed_stats = {
         'junk_removed': 0,
+        'tags_cleaned': 0,
         'dash_normalized': 0,
         'spaces_normalized': 0,
         'duplicates_removed': 0,
@@ -809,6 +861,10 @@ def main() -> None:
         "файлов с мусором (vksaver)",
         processed_stats, 'junk_removed',
     )
+    
+    # Подэтап 1.2: Очистка мусора из тегов
+    dbg("Подэтап 1.2: очистка мусора из тегов")
+    process_tag_junk_cleaning(files, processed_stats)
 
     # --- Шаг 2: Нормализация тире ---
     stage(2, "Нормализация тире")
@@ -1229,7 +1285,10 @@ def main() -> None:
     print("\n" + "="*60)
     print("=== Статистика обработки ===")
     print("="*60)
-    print(f"Очистка от мусора: {processed_stats['junk_removed']}")
+    print(f"Очистка от мусора (имена): "
+          f"{processed_stats['junk_removed']}")
+    print(f"Очистка от мусора (теги): "
+          f"{processed_stats['tags_cleaned']}")
     print(f"Нормализация тире: {processed_stats['dash_normalized']}")
     print(
         f"Нормализация пробелов: "
