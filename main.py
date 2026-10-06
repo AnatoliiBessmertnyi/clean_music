@@ -1426,10 +1426,6 @@ def main() -> None:
     safe_candidates = []
     mismatch_candidates = []
     missing = []
-    
-    safe_candidates = []
-    mismatch_candidates = []
-    missing = []
 
     for f in files:
         if not f.exists():
