@@ -325,81 +325,107 @@ def normalize_dash(text: str) -> str:
     return re.sub(r'[–—]', '-', text)
 
 
-def normalize_feat_in_text(text: str) -> str:
-    """Нормализует формат (feat. X) в тексте по отраслевому стандарту.
+def normalize_feat_pair(artist: str, title: str) -> tuple[str, str]:
+    """Нормализует пару тегов: переносит feat из artist в title.
     
     Правила:
-    - Все вариации (feat, ft, featuring) → 'feat.'
-    - Амперсанд внутри скобок → запятая
-    - Множественные 'feat.' → объединение в один блок
-    - Пробелы нормализуются: (feat. X, Y)
+    - feat должен быть ТОЛЬКО в title
+    - Из artist feat удаляется
+    - Все гости объединяются в один блок (feat. X, Y, Z)
     """
-    if not FEAT_VARIANTS_PATTERN.search(text):
-        return text
+    # 1. Извлекаем всех feat-гостей из artist
+    artist_guests = []
+    cleaned_artist = artist
     
-    # Случай 1: "feat" в скобках — нормализуем содержимое
+    # Ищем "feat X" вне скобок в artist
+    feat_matches = list(FEAT_VARIANTS_PATTERN.finditer(artist))
+    if feat_matches:
+        for i, match in enumerate(feat_matches):
+            start = match.end()
+            if i + 1 < len(feat_matches):
+                end = feat_matches[i + 1].start()
+            else:
+                end = len(artist)
+            guest_part = artist[start:end].strip()
+            for g in re.split(r'\s*[&,]\s*', guest_part):
+                g = g.strip()
+                if g and g not in artist_guests:
+                    artist_guests.append(g)
+        
+        # Удаляем "feat. ..." из artist
+        base = artist
+        for i, match in enumerate(feat_matches):
+            if i + 1 < len(feat_matches):
+                end = feat_matches[i + 1].start()
+            else:
+                end = len(artist)
+            base = base[:match.start()] + base[end:]
+        cleaned_artist = re.sub(r'\s+', ' ', base).strip()
+    
+    # 2. Извлекаем feat-гостей из title (как было)
+    title_guests = []
+    cleaned_title = title
+    
+    # Ищем feat в скобках
     bracket_feat_pattern = re.compile(
         r'[\(\[]\s*(?:feat(?:uring)?|ft)\b\.?\s*([^\)\]]+)[\)\]]',
         re.IGNORECASE
     )
-    
-    matches = list(bracket_feat_pattern.finditer(text))
+    matches = list(bracket_feat_pattern.finditer(title))
     if matches:
-        all_guests = []
         result_parts = []
         last_end = 0
-        
         for match in matches:
-            result_parts.append(text[last_end:match.start()])
+            result_parts.append(title[last_end:match.start()])
             guests_str = match.group(1)
-            # Разделяем по запятым и амперсандам
             for guest in re.split(r'\s*[&,]\s*', guests_str):
                 guest = guest.strip()
-                if guest and guest not in all_guests:
-                    all_guests.append(guest)
+                if guest and guest not in title_guests:
+                    title_guests.append(guest)
             last_end = match.end()
+        result_parts.append(title[last_end:])
+        cleaned_title = ''.join(result_parts)
+        cleaned_title = re.sub(r'\s+', ' ', cleaned_title).strip()
+    
+    # Ищем feat вне скобок в title
+    title_feat_matches = list(FEAT_VARIANTS_PATTERN.finditer(cleaned_title))
+    if title_feat_matches:
+        for i, match in enumerate(title_feat_matches):
+            start = match.end()
+            if i + 1 < len(title_feat_matches):
+                end = title_feat_matches[i + 1].start()
+            else:
+                end = len(cleaned_title)
+            guest_part = cleaned_title[start:end].strip()
+            for g in re.split(r'\s*[&,]\s*', guest_part):
+                g = g.strip()
+                if g and g not in title_guests:
+                    title_guests.append(g)
         
-        result_parts.append(text[last_end:])
-        base = ''.join(result_parts)
-        base = re.sub(r'\s+', ' ', base).strip()
-        
-        if all_guests:
-            guests_str = ', '.join(all_guests)
-            return f"{base} (feat. {guests_str})"
-        return base
+        # Удаляем feat из title
+        base = cleaned_title
+        for i, match in enumerate(title_feat_matches):
+            if i + 1 < len(title_feat_matches):
+                end = title_feat_matches[i + 1].start()
+            else:
+                end = len(cleaned_title)
+            base = base[:match.start()] + base[end:]
+        cleaned_title = re.sub(r'\s+', ' ', base).strip()
     
-    # Случай 2: "feat" вне скобок — переносим в скобки
-    guests = []
-    feat_matches = list(FEAT_VARIANTS_PATTERN.finditer(text))
+    # 3. Объединяем гостей (artist_guests + title_guests)
+    all_guests = []
+    for g in artist_guests + title_guests:
+        if g not in all_guests:
+            all_guests.append(g)
     
-    for i, match in enumerate(feat_matches):
-        start = match.end()
-        if i + 1 < len(feat_matches):
-            end = feat_matches[i + 1].start()
-        else:
-            end = len(text)
-        guest_part = text[start:end].strip()
-        for g in re.split(r'\s*[&,]\s*', guest_part):
-            g = g.strip()
-            if g and g not in guests:
-                guests.append(g)
+    # 4. Формируем финальный title с feat
+    if all_guests:
+        guests_str = ', '.join(all_guests)
+        final_title = f"{cleaned_title} (feat. {guests_str})"
+    else:
+        final_title = cleaned_title
     
-    if not guests:
-        return text
-    
-    # Удаляем "feat. ..." из базовой части
-    base = text
-    for i, match in enumerate(feat_matches):
-        if i + 1 < len(feat_matches):
-            end = feat_matches[i + 1].start()
-        else:
-            end = len(text)
-        base = base[:match.start()] + base[end:]
-    
-    base = re.sub(r'\s+', ' ', base).strip()
-    guests_str = ', '.join(guests)
-    return f"{base} (feat. {guests_str})"
-
+    return cleaned_artist, final_title
 
 def is_track_number(text: str) -> bool:
     """Проверяет, является ли строка номером трека (01, 1., Track 5)."""
@@ -1047,34 +1073,49 @@ def main() -> None:
             continue
         
         artist, title = tags
-        new_title = normalize_feat_in_text(str(title))
-        new_artist = normalize_feat_in_text(str(artist))
+        # Проверяем, есть ли feat в любом из тегов
+        if not (FEAT_VARIANTS_PATTERN.search(artist) or 
+                FEAT_VARIANTS_PATTERN.search(title)):
+            continue
         
-        if new_title != title or new_artist != artist:
+        new_artist, new_title = normalize_feat_pair(
+            str(artist), str(title)
+        )
+        
+        if new_artist != artist or new_title != title:
+            # Формируем новое имя файла для показа
+            raw_name = f"{new_artist} - {new_title}"
+            cleaned = INVALID_FILENAME_CHARS.sub('', raw_name)
+            cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+            new_filename = f"{cleaned}{f.suffix}"
+            
             feat_candidates.append(
-                (f, artist, title, new_artist, new_title)
+                (f, artist, title, new_artist, new_title, new_filename)
             )
     
     if feat_candidates:
         print(f"\nНайдено {len(feat_candidates)} файлов "
               f"для нормализации (feat.):")
-        for i, (f, artist, title, new_artist, new_title) in enumerate(
-            feat_candidates, 1
-        ):
-            print(f"  {i}. {f.name}")
-            if new_artist != artist:
-                print(f"      Исполнитель: {artist!r} → {new_artist!r}")
-            if new_title != title:
-                print(f"      Название:    {title!r} → {new_title!r}")
+        for i, (f, artist, title, new_artist, new_title, 
+                new_filename) in enumerate(feat_candidates, 1):
+            print(f"\n  {i}. {f.name}")
+            print(f"      БЫЛО:")
+            print(f"        Исполнитель: {artist!r}")
+            print(f"        Название:    {title!r}")
+            print(f"      СТАНЕТ:")
+            print(f"        Исполнитель: {new_artist!r}")
+            print(f"        Название:    {new_title!r}")
+            if new_filename != f.name:
+                print(f"        Файл:        {new_filename}")
         
         idx = select_indices(
             [f.name for f, *_ in feat_candidates],
-            "Какие файлы нормализовать?",
+            "\nКакие файлы нормализовать?",
         )
         
         normalized_count = 0
         for i in idx:
-            f, _, _, new_artist, new_title = feat_candidates[i]
+            f, _, _, new_artist, new_title, _ = feat_candidates[i]
             if DRY_RUN:
                 dbg(f"[DRY RUN] Нормализовал бы (feat.): {f.name}")
                 normalized_count += 1
