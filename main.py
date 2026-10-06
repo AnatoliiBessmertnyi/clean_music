@@ -73,10 +73,7 @@ def has_encoding_issues(text: str) -> bool:
 def sanitize_filename_interactive(
     name: str, current_filename: str
 ) -> str | None:
-    """Интерактивно очищает имя файла от недопустимых символов.
-    
-    Запоминает выбор пользователя для каждого набора символов.
-    """
+    """Интерактивно очищает имя файла от недопустимых символов."""
     invalid_chars = set(INVALID_FILENAME_CHARS.findall(name))
     if not invalid_chars:
         return name
@@ -84,9 +81,9 @@ def sanitize_filename_interactive(
     chars_key = frozenset(invalid_chars)
     chars_str = ''.join(sorted(invalid_chars))
     
-    # Формируем опции (как раньше)
     options = []
     
+    # Существующие опции
     opt1 = name
     for c in invalid_chars:
         opt1 = opt1.replace(c, '')
@@ -105,6 +102,28 @@ def sanitize_filename_interactive(
             opt3 = opt3.replace(c, '')
         opt3 = re.sub(r'\s+', ' ', opt3).strip()
         options.append((f"Заменить '/' на '; ' → {opt3}", opt3))
+    
+    if '/' in invalid_chars:
+        # Пытаемся найти паттерн "Artist - Name1 / Name2"
+        slash_match = re.search(r'^(.*?\s+-\s+)([^/]+)\s*/\s*(.+)$', name)
+        if slash_match:
+            prefix = slash_match.group(1)  # "Artist - "
+            first_title = slash_match.group(2).strip()  # "Name1"
+            second_title = slash_match.group(3).strip()  # "Name2"
+            
+            # Опция: оставить первое название
+            opt4 = f"{prefix}{first_title}"
+            options.append((
+                f"Оставить первое название → {opt4}",
+                opt4
+            ))
+            
+            # Опция: оставить второе название
+            opt5 = f"{prefix}{second_title}"
+            options.append((
+                f"Оставить второе название → {opt5}",
+                opt5
+            ))
     
     options.append(("Ввести имя вручную", "manual"))
     options.append((f"Оставить как есть: {current_filename}", "SKIP"))
