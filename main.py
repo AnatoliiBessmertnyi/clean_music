@@ -1226,6 +1226,174 @@ def categorize_annotations(annotations: dict[str, list[Path]]) -> dict[str, dict
     return {k: v for k, v in categories.items() if v['items']}
 
 
+def collect_invalid_filename_files(files: list[Path]) -> dict[frozenset, list[tuple[Path, str, str]]]:
+    """Собирает файлы с недопустимыми символами и группирует их по набору символов.
+    
+    Возвращает словарь: {набор_символов: [(файл, текущее_имя, предлагаемое_имя), ...]}
+    """
+    problems = {}
+    
+    for f in files:
+        if not f.exists():
+            continue
+        
+        tags = read_audio_tags(f)
+        if not tags:
+            continue
+        
+        artist = remove_junk(str(tags[0]))
+        title = remove_junk(str(tags[1]))
+        raw_name = f"{artist} - {title}"
+        raw_name = normalize_title_spacing(raw_name)
+        
+        invalid_chars = set(INVALID_FILENAME_CHARS.findall(raw_name))
+        if not invalid_chars:
+            continue
+        
+        # Быстрая проверка: если после очистки получается текущее имя - пропускаем
+        cleaned = INVALID_FILENAME_CHARS.sub('', raw_name)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        if f"{cleaned}{f.suffix}" == f.name:
+            continue
+        
+        chars_key = frozenset(invalid_chars)
+        if chars_key not in problems:
+            problems[chars_key] = []
+        
+        problems[chars_key].append((f, f.name, raw_name))
+    
+    return problems
+
+
+def choose_strategy_for_group(
+    chars_key: frozenset,
+    examples: list[tuple[Path, str, str]]
+) -> tuple[str, dict]:
+    """Запрашивает у пользователя стратегию обработки для группы файлов.
+    
+    Возвращает: (стратегия, параметры)
+    Стратегии:
+    - 'remove' - удалить символы
+    - 'replace' - заменить на '-'
+    - 'semicolon' - заменить '/' на '; '
+    - 'first_title' - оставить первое название (для '/')
+    - 'second_title' - оставить второе название (для '/')
+    - 'skip' - пропустить
+    """
+    chars_str = ''.join(sorted(chars_key))
+    
+    print(f"\n{'='*60}")
+    print(f"Найдено {len(examples)} файлов с недопустимыми символами: {chars_str}")
+    print(f"{'='*60}")
+    
+    # Показываем до 3 примеров
+    for i, (f, current_name, proposed_name) in enumerate(examples[:3], 1):
+        print(f"\n  Пример {i}:")
+        print(f"    Текущий файл: {current_name}")
+        print(f"    Предлагаемое: {proposed_name}")
+    
+    if len(examples) > 3:
+        print(f"\n  ... и ещё {len(examples) - 3} файлов")
+    
+    # Формируем опции
+    print(f"\n  Как обработать все {len(examples)} файлов?")
+    print(f"  1. Удалить символы '{chars_str}'")
+    print(f"  2. Заменить '{chars_str}' на '-'")
+    
+    option_num = 3
+    if '/' in chars_key:
+        print(f"  {option_num}. Заменить '/' на '; '")
+        option_num += 1
+        print(f"  {option_num}. Оставить первое название (до '/')")
+        option_num += 1
+        print(f"  {option_num}. Оставить второе название (после '/')")
+        option_num += 1
+    
+    print(f"  {option_num}. Пропустить все файлы")
+    
+    choice = get_choice_with_default(
+        f"  Выберите вариант [1]: ", default='1'
+    )
+    
+    try:
+        idx = int(choice)
+    except ValueError:
+        idx = 1
+    
+    # Возвращаем стратегию
+    if idx == 1:
+        return ('remove', {})
+    elif idx == 2:
+        return ('replace', {'char': '-'})
+    elif '/' in chars_key:
+        if idx == 3:
+            return ('semicolon', {})
+        elif idx == 4:
+            return ('first_title', {})
+        elif idx == 5:
+            return ('second_title', {})
+        else:
+            return ('skip', {})
+    else:
+        return ('skip', {})
+
+
+def apply_strategy_to_file(
+    f: Path,
+    raw_name: str,
+    strategy: str,
+    params: dict
+) -> str | None:
+    """Применяет выбранную стратегию к файлу и возвращает очищенное имя."""
+    invalid_chars = set(INVALID_FILENAME_CHARS.findall(raw_name))
+    
+    if strategy == 'remove':
+        result = raw_name
+        for c in invalid_chars:
+            result = result.replace(c, '')
+        return re.sub(r'\s+', ' ', result).strip()
+    
+    elif strategy == 'replace':
+        result = raw_name
+        for c in invalid_chars:
+            result = result.replace(c, params['char'])
+        return re.sub(r'\s+', ' ', result).strip()
+    
+    elif strategy == 'semicolon':
+        result = raw_name.replace('/', '; ')
+        for c in invalid_chars - {'/'}:
+            result = result.replace(c, '')
+        return re.sub(r'\s+', ' ', result).strip()
+    
+    elif strategy in ('first_title', 'second_title'):
+        # Извлекаем (feat. ...) отдельно
+        feat_suffix = ""
+        feat_match = re.search(r'\s*\(feat\.\s*[^)]+\)\s*$', raw_name)
+        if feat_match:
+            feat_suffix = feat_match.group(0)
+            name_without_feat = raw_name[:feat_match.start()]
+        else:
+            name_without_feat = raw_name
+        
+        # Ищем паттерн "Artist - Name1 / Name2"
+        slash_match = re.search(r'^(.*?\s+-\s+)([^/]+)\s*/\s*(.+)$', name_without_feat)
+        if slash_match:
+            prefix = slash_match.group(1)
+            first_title = slash_match.group(2).strip()
+            second_title = slash_match.group(3).strip()
+            
+            if strategy == 'first_title':
+                return f"{prefix}{first_title}{feat_suffix}"
+            else:
+                return f"{prefix}{second_title}{feat_suffix}"
+        
+        # Если паттерн не найден, просто удаляем '/'
+        result = raw_name.replace('/', '')
+        return re.sub(r'\s+', ' ', result).strip()
+    
+    return None
+
+
 def main() -> None:
     """Запускает основной цикл обработки и переименования файлов."""
     print("=== Обработчик аудиофайлов ===")
@@ -1516,23 +1684,38 @@ def main() -> None:
     print("\n  [Подэтап 4.4] Формирование новых имён файлов по тегам")
     dbg("Подэтап 4.4: формирование имён из тегов")
     
+    # Предварительный сбор файлов с недопустимыми символами
+    print("  Поиск файлов с недопустимыми символами...")
+    invalid_files = collect_invalid_filename_files(files)
+    
+    # Запрашиваем стратегии для каждой группы
+    strategies = {}
+    if invalid_files:
+        print(f"\n  Найдено {sum(len(v) for v in invalid_files.values())} файлов "
+              f"с недопустимыми символами в {len(invalid_files)} группах")
+        
+        for chars_key, examples in invalid_files.items():
+            strategy, params = choose_strategy_for_group(chars_key, examples)
+            strategies[chars_key] = (strategy, params)
+    
+    # Основной цикл обработки
     safe_candidates = []
     mismatch_candidates = []
     missing = []
-
+    
     total_files = len(files)
     print(f"\n  Анализ {total_files} файлов...")
-
+    
     for idx, f in enumerate(files, 1):
         show_progress(idx, total_files, "  ")
         if not f.exists():
             continue
-
+        
         file_title = extract_title_from_filename(f.stem)
         tags = read_audio_tags(f)
         dbg(f"Анализ: {f.name}, теги: {tags}, "
             f"извлечённое название: {file_title!r}")
-
+        
         if tags:
             artist = remove_junk(str(tags[0]))
             title = remove_junk(str(tags[1]))
@@ -1540,46 +1723,47 @@ def main() -> None:
             raw_name = normalize_title_spacing(raw_name)
             user_already_chose = False
             
-            if INVALID_FILENAME_CHARS.search(raw_name):
-                # Быстрая проверка: если после очистки получается
-                # текущее имя файла — пропускаем без диалога
-                cleaned = INVALID_FILENAME_CHARS.sub('', raw_name)
-                cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-                if f"{cleaned}{f.suffix}" == f.name:
-                    dbg(
-                        f"Пропущен (имя уже корректно "
-                        f"после очистки): {f.name}"
-                    )
-                    continue
+            invalid_chars = set(INVALID_FILENAME_CHARS.findall(raw_name))
+            if invalid_chars:
+                chars_key = frozenset(invalid_chars)
                 
-                # Иначе — интерактивный выбор
-                base_name = clean_filename_safely(
-                    raw_name, f.name
-                )
-                if base_name == "SKIP":
-                    print(f"  Оставлен без изменений: {f.name}")
+                # Проверяем, есть ли стратегия для этой группы
+                if chars_key in strategies:
+                    strategy, params = strategies[chars_key]
+                    
+                    if strategy != 'skip':
+                        base_name = apply_strategy_to_file(f, raw_name, strategy, params)
+                        if base_name:
+                            user_already_chose = True
+                        else:
+                            base_name = raw_name
+                    else:
+                        dbg(f"Пропущен (стратегия skip): {f.name}")
+                        continue
+                else:
+                    # Файл не был в предварительном сборе, пропускаем
+                    dbg(f"Пропущен (нет стратегии): {f.name}")
                     continue
-                # Пользователь принял решение — не нужно спрашивать снова
-                user_already_chose = True
             else:
                 base_name = raw_name
             
             new_name = f"{base_name}{f.suffix}"
-
+            
             if new_name == f.name:
                 continue
-
+            
             if f.name == new_name:
                 dbg(f"Пропущен (имя уже целевое): {f.name}")
                 continue
-
+            
             if user_already_chose or titles_match(file_title, title):
-                # Пользователь уже подтвердил выбор ИЛИ названия совпадают
                 safe_candidates.append((f, new_name))
             else:
                 mismatch_candidates.append((f, file_title, new_name))
         else:
             missing.append(f)
+    
+    print()  # Новая строка после прогресс-бара
 
     if safe_candidates:
         labels = [f"{c[0].name}  ->  {c[1]}" for c in safe_candidates]
