@@ -837,7 +837,7 @@ def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
         old_path.rename(new_path)
         return 'renamed', new_path
 
-    # Дубликат обнаружен
+    # Дубликат обнаружен — решаем автоматически
     old_tags = read_audio_tags(old_path)
     existing_tags = read_audio_tags(new_path)
     
@@ -850,11 +850,15 @@ def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
     old_info = file_info_line(old_path)
     existing_info = file_info_line(new_path)
     
-    # Автоматически определяем лучший файл по размеру
-    if old_path.stat().st_size >= new_path.stat().st_size:
-        print(f"\n  Обнаружен дубликат: {new_path.name}")
-        if tags_match:
-            print(f"      Теги совпадают — одна и та же песня.")
+    # Определяем лучший файл по размеру и качеству имени
+    old_score = (old_path.stat().st_size, name_quality_score(old_path))
+    new_score = (new_path.stat().st_size, name_quality_score(new_path))
+    
+    print(f"\n  Обнаружен дубликат: {new_path.name}")
+    if tags_match:
+        print("      Теги совпадают — одна и та же песня.")
+    
+    if old_score >= new_score:
         print(f"      Оставляю: {old_path.name} ({old_info})")
         print(f"      Удаляю:   {new_path.name} ({existing_info})")
         
@@ -867,9 +871,6 @@ def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
         old_path.rename(new_path)
         return 'renamed', new_path
     else:
-        print(f"\n  Обнаружен дубликат: {new_path.name}")
-        if tags_match:
-            print(f"      Теги совпадают — одна и та же песня.")
         print(f"      Оставляю: {new_path.name} ({existing_info})")
         print(f"      Удаляю:   {old_path.name} ({old_info})")
         
@@ -1884,7 +1885,7 @@ def main() -> None:
                 status, old_path, result_path,
                 processed_stats, 'renamed_by_tags',
             )
-            if status == 'renamed':
+            if status in ('renamed', 'kept_existing'):
                 renamed_count += 1
         
         if renamed_count:
