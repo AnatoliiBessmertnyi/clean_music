@@ -1300,7 +1300,13 @@ def choose_strategy_for_group(
     else:
         default_strategy = 'remove'
     
-    # Показываем все файлы с итоговыми именами
+    # Определяем строку символов для вывода
+    if problem_key.startswith('other:'):
+        chars_str = problem_key[6:]  # Убираем префикс 'other:'
+    else:
+        chars_str = '/'
+    
+    # Показываем, что будет применено по умолчанию
     print(f"\n  Будет применено по умолчанию: ", end='')
     
     if problem_key == 'bilingual_title':
@@ -1310,6 +1316,7 @@ def choose_strategy_for_group(
     else:
         print(f"удалить '{chars_str}'")
     
+    # Показываем все файлы с итоговыми именами (только один раз!)
     print()
     for i, (f, current_name, proposed_name) in enumerate(examples, 1):
         # Применяем стратегию по умолчанию для предпросмотра
@@ -1320,11 +1327,6 @@ def choose_strategy_for_group(
             print(f"  {i}. {current_name} → {preview_result}")
         else:
             print(f"  {i}. {current_name} → {proposed_name}")
-    
-    # Показываем все файлы компактно
-    for i, (f, current_name, proposed_name) in enumerate(examples, 1):
-        print(f"  {i}. {current_name}")
-        print(f"     → {proposed_name}")
     
     # Формируем опции в зависимости от типа
     print(f"\n  Как обработать все {len(examples)} файлов?")
@@ -1398,7 +1400,6 @@ def choose_strategy_for_group(
             return ('manual', {})
         else:
             return ('skip', {})
-
 
 def apply_strategy_to_file(
     f: Path,
