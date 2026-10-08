@@ -1323,10 +1323,13 @@ def choose_strategy_for_group(
         preview_result = apply_strategy_to_file(
             f, proposed_name, default_strategy, {}
         )
+        
+        print(f"  {i}. {current_name}")
+        print(f"     {proposed_name}")
         if preview_result:
-            print(f"  {i}. {current_name} → {preview_result}")
+            print(f"     → {preview_result}")
         else:
-            print(f"  {i}. {current_name} → {proposed_name}")
+            print(f"     → {proposed_name}")
     
     # Формируем опции в зависимости от типа
     print(f"\n  Как обработать все {len(examples)} файлов?")
