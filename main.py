@@ -837,16 +837,9 @@ def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
         old_path.rename(new_path)
         return 'renamed', new_path
 
+    # Дубликат обнаружен
     old_tags = read_audio_tags(old_path)
     existing_tags = read_audio_tags(new_path)
-    
-    old_tags_str = (
-        f"{old_tags[0]} - {old_tags[1]}" if old_tags else "(нет тегов)"
-    )
-    existing_tags_str = (
-        f"{existing_tags[0]} - {existing_tags[1]}"
-        if existing_tags else "(нет тегов)"
-    )
     
     tags_match = (
         old_tags and existing_tags
@@ -854,43 +847,39 @@ def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
         and old_tags[1].lower().strip() == existing_tags[1].lower().strip()
     )
     
-    print(f"\n  Обнаружен дубликат на диске: {new_path.name}")
-    if tags_match:
-        print("  Теги обеих композиций совпадают — одна и та же песня.")
-    
     old_info = file_info_line(old_path)
     existing_info = file_info_line(new_path)
     
-    print(f"  1. {old_path.name} ({old_info}) [переименовываемый]")
-    print(f"     Теги: {old_tags_str}")
-    print(f"  2. {new_path.name} ({existing_info}) [уже есть на диске]")
-    print(f"     Теги: {existing_tags_str}")
-
-    if DRY_RUN:
-        print("  [DRY RUN] Пропускаю выбор дубликата")
-        return 'skipped', None
-
-    choice = get_choice_with_default(
-        "Какой файл оставить? (1/2/n - пропустить) [1]: "
-    )
-
-    if choice in ('n', 'no', 'н', 'нет'):
-        return 'skipped', None
-    if choice in ('', '1'):
+    # Автоматически определяем лучший файл по размеру
+    if old_path.stat().st_size >= new_path.stat().st_size:
+        print(f"\n  Обнаружен дубликат: {new_path.name}")
+        if tags_match:
+            print(f"      Теги совпадают — одна и та же песня.")
+        print(f"      Оставляю: {old_path.name} ({old_info})")
+        print(f"      Удаляю:   {new_path.name} ({existing_info})")
+        
+        if DRY_RUN:
+            dbg("[DRY RUN] Удалил бы дубликат")
+            return 'skipped', None
+        
         if not safe_unlink(new_path):
             return 'skipped', None
         old_path.rename(new_path)
         return 'renamed', new_path
-    if choice == '2':
+    else:
+        print(f"\n  Обнаружен дубликат: {new_path.name}")
+        if tags_match:
+            print(f"      Теги совпадают — одна и та же песня.")
+        print(f"      Оставляю: {new_path.name} ({existing_info})")
+        print(f"      Удаляю:   {old_path.name} ({old_info})")
+        
+        if DRY_RUN:
+            dbg("[DRY RUN] Удалил бы старый файл")
+            return 'skipped', None
+        
         if not safe_unlink(old_path):
             return 'skipped', None
         return 'kept_existing', new_path
-    
-    print("  Некорректный ввод, выбираю вариант 1.")
-    if not safe_unlink(new_path):
-        return 'skipped', None
-    old_path.rename(new_path)
-    return 'renamed', new_path
 
 
 def handle_rename_result(
@@ -1122,11 +1111,11 @@ def process_duplicates(
     for i, plan in enumerate(plans, 1):
         keep_info = file_info_line(plan['keep'])
         print(f"\n  {i}. Группа из {len(plan['group'])} файлов:")
-        print(f"      Оставить: {plan['keep'].name} ({keep_info})")
         
-        for f in plan['delete']:
-            del_info = file_info_line(f)
-            print(f"      Удалить:  {f.name} ({del_info})")
+        for f in plan['group']:
+            info = file_info_line(f)
+            marker = " [оставить]" if files_are_same(f, plan['keep']) else " [удалить]"
+            print(f"      {f.name} ({info}){marker}")
         
         if plan['needs_rename']:
             final_name = plan['best_name_file'].name
@@ -1879,106 +1868,27 @@ def main() -> None:
             missing.append(f)
     
     if safe_candidates:
-        # Разделяем на обычные переименования и дубликаты
-        duplicates_in_rename = []
-        normal_renames = []
+        labels = [f"{f.name}  ->  {new_name}" for f, new_name in safe_candidates]
+        idx = select_indices(
+            labels,
+            f"Найдено {len(safe_candidates)} файлов "
+            f"для переименования по тегам (названия совпадают)",
+        )
         
-        for f, new_name in safe_candidates:
-            new_path = f.with_name(new_name)
-            if new_path.exists() and not files_are_same(f, new_path):
-                duplicates_in_rename.append((f, new_name, new_path))
-            else:
-                normal_renames.append((f, new_name))
-        
-        # Пакетная обработка дубликатов
-        if duplicates_in_rename:
-            print(f"\n  Обнаружено {len(duplicates_in_rename)} дубликатов "
-                  f"при переименовании:")
-            
-            for i, (f, new_name, new_path) in enumerate(
-                duplicates_in_rename, 1
-            ):
-                old_info = file_info_line(f)
-                new_info = file_info_line(new_path)
-                
-                # Определяем лучший файл по размеру
-                if f.stat().st_size >= new_path.stat().st_size:
-                    keep_file = f
-                    delete_file = new_path
-                else:
-                    keep_file = new_path
-                    delete_file = f
-                
-                # Определяем лучшее имя
-                best_name_file = get_best_name_from_group([f, new_path])
-                best_name = best_name_file.name
-                
-                marker = " [лучшее имя]" if new_name == best_name else ""
-                
-                print(f"\n  {i}. {new_name}{marker}")
-                print(f"      Переименовываемый: {f.name} ({old_info})")
-                print(f"      Уже на диске:      {new_path.name} ({new_info})")
-                print(f"      Итог: оставить {keep_file.name} ({format_file_size(keep_file.stat().st_size)})")
-                if keep_file.name != best_name:
-                    print(f"             переименовать в {best_name}")
-            
-            idx = select_indices(
-                [f"{f.name} → {new_name}" 
-                 for f, new_name, _ in duplicates_in_rename],
-                "\nКакие дубликаты обработать?",
+        renamed_count = 0
+        for i in idx:
+            old_path, new_name = safe_candidates[i]
+            new_path = old_path.with_name(new_name)
+            status, result_path = safe_rename(old_path, new_path)
+            handle_rename_result(
+                status, old_path, result_path,
+                processed_stats, 'renamed_by_tags',
             )
-            
-            for i in idx:
-                f, new_name, new_path = duplicates_in_rename[i]
-                
-                # Определяем лучший файл по размеру
-                if f.stat().st_size >= new_path.stat().st_size:
-                    keep_file = f
-                    delete_file = new_path
-                else:
-                    keep_file = new_path
-                    delete_file = f
-                
-                # Определяем лучшее имя
-                best_name_file = get_best_name_from_group([f, new_path])
-                best_name = best_name_file.name
-                
-                if DRY_RUN:
-                    dbg(f"[DRY RUN] Обработал бы дубликат: {f.name}")
-                    continue
-                
-                # Удаляем худший файл
-                if safe_unlink(delete_file):
-                    dbg(f"Удалён дубликат: {delete_file.name}")
-                    processed_stats['duplicates_removed'] += 1
-                
-                # Переименовываем лучший файл в лучшее имя, если нужно
-                if keep_file.name != best_name:
-                    final_path = keep_file.with_name(best_name)
-                    if not final_path.exists():
-                        keep_file.rename(final_path)
-                        dbg(f"Переименован: {keep_file.name} → {best_name}")
-                
-                processed_stats['renamed_by_tags'] += 1
+            if status == 'renamed':
+                renamed_count += 1
         
-        # Обычные переименования (без дубликатов)
-        if normal_renames:
-            labels = [
-                f"{c[0].name}  ->  {c[1]}" for c in normal_renames
-            ]
-            idx = select_indices(
-                labels,
-                f"Найдено {len(normal_renames)} файлов "
-                f"для переименования по тегам (названия совпадают)",
-            )
-            for i in idx:
-                old_path, new_name = normal_renames[i]
-                new_path = old_path.with_name(new_name)
-                status, result_path = safe_rename(old_path, new_path)
-                handle_rename_result(
-                    status, old_path, result_path,
-                    processed_stats, 'renamed_by_tags',
-                )
+        if renamed_count:
+            print(f"  Переименовано файлов: {renamed_count}")
 
     if mismatch_candidates:
         print(f"\nНайдено {len(mismatch_candidates)} файлов "
