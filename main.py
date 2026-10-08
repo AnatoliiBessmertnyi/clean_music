@@ -902,18 +902,17 @@ def handle_rename_result(
 ) -> Path | None:
     """Обрабатывает результат safe_rename и обновляет статистику."""
     if status == 'renamed':
-        print(f"  Переименован: {old_path.name} -> {result_path.name}")
+        dbg(f"Переименован: {old_path.name} -> {result_path.name}")
         stats[stat_key] += 1
         return result_path
     if status == 'kept_existing':
-        print(
-            f"  Текущий файл удалён как дубликат: {old_path.name} "
-            f"(файл {result_path.name} уже существовал на диске "
-            f"и оставлен без изменений)"
+        dbg(
+            f"Текущий файл удалён как дубликат: {old_path.name} "
+            f"(файл {result_path.name} оставлен без изменений)"
         )
         stats[stat_key] += 1
         return result_path
-    print(f"  Пропущен: {old_path.name}")
+    dbg(f"Пропущен: {old_path.name}")
     return old_path
 
 
@@ -1023,6 +1022,10 @@ def process_rename_batch(
             new_files.append(result)
         else:
             new_files.append(f)
+    
+    if stats[stat_key] > 0:
+        print(f"  Обработано файлов: {stats[stat_key]}")
+    
     return new_files
 
 
@@ -1044,7 +1047,7 @@ def process_tag_junk_cleaning(
             candidates.append((f, artist, title, new_artist, new_title))
     
     if not candidates:
-        dbg("Файлов с мусором в тегах не найдено.")
+        print("  Файлов с мусором в тегах не найдено.")
         return
     
     print(f"\nНайдено {len(candidates)} файлов с мусором в тегах:")
@@ -1262,6 +1265,7 @@ def main() -> None:
     )
     
     # Подэтап 1.2: Очистка мусора из тегов
+    print("\n  [Подэтап 1.2] Очистка мусора из тегов")
     dbg("Подэтап 1.2: очистка мусора из тегов")
     process_tag_junk_cleaning(files, processed_stats)
 
@@ -1355,7 +1359,7 @@ def main() -> None:
         if normalized_count:
             print(f"  Нормализовано (feat.): {normalized_count}")
     else:
-        dbg("Файлов для нормализации (feat.) не найдено.")
+        print("  Файлов для нормализации (feat.) не найдено.")
 
     # --- Подэтап 4.2: Нормализация разделителей исполнителей ---
     print("\n  [Подэтап 4.2] Нормализация разделителей исполнителей")
@@ -1404,7 +1408,7 @@ def main() -> None:
         if normalized_count:
             print(f"  Нормализовано разделителей: {normalized_count}")
     else:
-        dbg("Файлов для нормализации разделителей не найдено.")
+        print("  Файлов для нормализации разделителей не найдено.")
 
     # --- Подэтап 4.3: Анализ уточнений в скобках ---
     print("\n  [Подэтап 4.3] Анализ уточнений в скобках")
