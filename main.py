@@ -1292,23 +1292,34 @@ def choose_strategy_for_group(
     
     Возвращает: (стратегия, параметры)
     """
-    # Определяем заголовок и символы для вывода
+    # Определяем стратегию по умолчанию для предпросмотра
     if problem_key == 'bilingual_title':
-        title = "билингвальные названия с '/'"
-        chars_str = '/'
+        default_strategy = 'first_title'
     elif problem_key == 'artist_name':
-        title = "имена исполнителей с '/'"
-        chars_str = '/'
-    elif problem_key.startswith('other:'):
-        chars_str = problem_key[6:]  # Убираем префикс 'other:'
-        title = f"недопустимые символы: {chars_str}"
+        default_strategy = 'remove'
     else:
-        chars_str = '/'
-        title = "недопустимые символы"
+        default_strategy = 'remove'
     
-    print(f"\n{'='*60}")
-    print(f"Найдено {len(examples)} файлов: {title}")
-    print(f"{'='*60}")
+    # Показываем все файлы с итоговыми именами
+    print(f"\n  Будет применено по умолчанию: ", end='')
+    
+    if problem_key == 'bilingual_title':
+        print("оставить первое название")
+    elif problem_key == 'artist_name':
+        print("удалить '/'")
+    else:
+        print(f"удалить '{chars_str}'")
+    
+    print()
+    for i, (f, current_name, proposed_name) in enumerate(examples, 1):
+        # Применяем стратегию по умолчанию для предпросмотра
+        preview_result = apply_strategy_to_file(
+            f, proposed_name, default_strategy, {}
+        )
+        if preview_result:
+            print(f"  {i}. {current_name} → {preview_result}")
+        else:
+            print(f"  {i}. {current_name} → {proposed_name}")
     
     # Показываем все файлы компактно
     for i, (f, current_name, proposed_name) in enumerate(examples, 1):
@@ -1796,11 +1807,7 @@ def main() -> None:
     mismatch_candidates = []
     missing = []
     
-    total_files = len(files)
-    print(f"\n  Анализ {total_files} файлов...")
-    
     for idx, f in enumerate(files, 1):
-        show_progress(idx, total_files, "  ")
         if not f.exists():
             continue
         
@@ -1867,27 +1874,107 @@ def main() -> None:
         else:
             missing.append(f)
     
-    print()  # Новая строка после прогресс-бара
-
     if safe_candidates:
-        labels = [f"{c[0].name}  ->  {c[1]}" for c in safe_candidates]
-        idx = select_indices(
-            labels,
-            f"Найдено {len(safe_candidates)} файлов "
-            f"для переименования по тегам (названия совпадают)",
-        )
-        renamed_before = processed_stats['renamed_by_tags']
-        for i in idx:
-            old_path, new_name = safe_candidates[i]
-            new_path = old_path.with_name(new_name)
-            status, result_path = safe_rename(old_path, new_path)
-            handle_rename_result(
-                status, old_path, result_path,
-                processed_stats, 'renamed_by_tags',
+        # Разделяем на обычные переименования и дубликаты
+        duplicates_in_rename = []
+        normal_renames = []
+        
+        for f, new_name in safe_candidates:
+            new_path = f.with_name(new_name)
+            if new_path.exists() and not files_are_same(f, new_path):
+                duplicates_in_rename.append((f, new_name, new_path))
+            else:
+                normal_renames.append((f, new_name))
+        
+        # Пакетная обработка дубликатов
+        if duplicates_in_rename:
+            print(f"\n  Обнаружено {len(duplicates_in_rename)} дубликатов "
+                  f"при переименовании:")
+            
+            for i, (f, new_name, new_path) in enumerate(
+                duplicates_in_rename, 1
+            ):
+                old_info = file_info_line(f)
+                new_info = file_info_line(new_path)
+                
+                # Определяем лучший файл по размеру
+                if f.stat().st_size >= new_path.stat().st_size:
+                    keep_file = f
+                    delete_file = new_path
+                else:
+                    keep_file = new_path
+                    delete_file = f
+                
+                # Определяем лучшее имя
+                best_name_file = get_best_name_from_group([f, new_path])
+                best_name = best_name_file.name
+                
+                marker = " [лучшее имя]" if new_name == best_name else ""
+                
+                print(f"\n  {i}. {new_name}{marker}")
+                print(f"      Переименовываемый: {f.name} ({old_info})")
+                print(f"      Уже на диске:      {new_path.name} ({new_info})")
+                print(f"      Итог: оставить {keep_file.name} ({format_file_size(keep_file.stat().st_size)})")
+                if keep_file.name != best_name:
+                    print(f"             переименовать в {best_name}")
+            
+            idx = select_indices(
+                [f"{f.name} → {new_name}" 
+                 for f, new_name, _ in duplicates_in_rename],
+                "\nКакие дубликаты обработать?",
             )
-        renamed_after = processed_stats['renamed_by_tags']
-        if renamed_after > renamed_before:
-            print(f"  Переименовано файлов: {renamed_after - renamed_before}")
+            
+            for i in idx:
+                f, new_name, new_path = duplicates_in_rename[i]
+                
+                # Определяем лучший файл по размеру
+                if f.stat().st_size >= new_path.stat().st_size:
+                    keep_file = f
+                    delete_file = new_path
+                else:
+                    keep_file = new_path
+                    delete_file = f
+                
+                # Определяем лучшее имя
+                best_name_file = get_best_name_from_group([f, new_path])
+                best_name = best_name_file.name
+                
+                if DRY_RUN:
+                    dbg(f"[DRY RUN] Обработал бы дубликат: {f.name}")
+                    continue
+                
+                # Удаляем худший файл
+                if safe_unlink(delete_file):
+                    dbg(f"Удалён дубликат: {delete_file.name}")
+                    processed_stats['duplicates_removed'] += 1
+                
+                # Переименовываем лучший файл в лучшее имя, если нужно
+                if keep_file.name != best_name:
+                    final_path = keep_file.with_name(best_name)
+                    if not final_path.exists():
+                        keep_file.rename(final_path)
+                        dbg(f"Переименован: {keep_file.name} → {best_name}")
+                
+                processed_stats['renamed_by_tags'] += 1
+        
+        # Обычные переименования (без дубликатов)
+        if normal_renames:
+            labels = [
+                f"{c[0].name}  ->  {c[1]}" for c in normal_renames
+            ]
+            idx = select_indices(
+                labels,
+                f"Найдено {len(normal_renames)} файлов "
+                f"для переименования по тегам (названия совпадают)",
+            )
+            for i in idx:
+                old_path, new_name = normal_renames[i]
+                new_path = old_path.with_name(new_name)
+                status, result_path = safe_rename(old_path, new_path)
+                handle_rename_result(
+                    status, old_path, result_path,
+                    processed_stats, 'renamed_by_tags',
+                )
 
     if mismatch_candidates:
         print(f"\nНайдено {len(mismatch_candidates)} файлов "
