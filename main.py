@@ -1725,6 +1725,9 @@ def main() -> None:
                 print("  t - обновить тег из имени")
                 print("  n - пропустить")
                 
+                # Запоминаем последнее действие для использования по умолчанию
+                last_action = 'n'
+                
                 for i, (f, file_title, new_name, tag_artist, tag_title) in enumerate(
                     categorized[cat_key], 1
                 ):
@@ -1733,7 +1736,17 @@ def main() -> None:
                     print(f"      Теги: {tag_artist} - {tag_title}")
                     print(f"      Новое имя (если r): {new_name}")
                     
-                    choice = input("      Действие [r/t/n] (n): ").strip().lower()
+                    choice = input(
+                        f"      Действие [r/t/n] ({last_action}): "
+                    ).strip().lower()
+                    
+                    # Если пользователь ничего не ввёл, используем последнее действие
+                    if not choice:
+                        choice = last_action
+                        print(f"      [Использовано предыдущее действие: {choice}]")
+                    else:
+                        # Обновляем последнее действие
+                        last_action = choice
                     
                     if choice == 'r':
                         new_path = f.with_name(new_name)
