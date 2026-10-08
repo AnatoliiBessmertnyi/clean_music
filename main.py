@@ -1353,7 +1353,7 @@ def main() -> None:
                 dbg(f"[DRY RUN] Нормализовал бы (feat.): {f.name}")
                 normalized_count += 1
             elif write_audio_tags(f, new_artist, new_title):
-                print(f"  Нормализован: {f.name}")
+                dbg(f"Нормализован (feat.): {f.name}")
                 normalized_count += 1
         
         if normalized_count:
@@ -1402,7 +1402,7 @@ def main() -> None:
                 dbg(f"[DRY RUN] Нормализовал бы разделители: {f.name}")
                 normalized_count += 1
             elif write_audio_tags(f, new_artist, sep_candidates[i][2]):
-                print(f"  Нормализован: {f.name}")
+                dbg(f"Нормализован (разделители): {f.name}")
                 normalized_count += 1
         
         if normalized_count:
@@ -1588,6 +1588,7 @@ def main() -> None:
             f"Найдено {len(safe_candidates)} файлов "
             f"для переименования по тегам (названия совпадают)",
         )
+        renamed_before = processed_stats['renamed_by_tags']
         for i in idx:
             old_path, new_name = safe_candidates[i]
             new_path = old_path.with_name(new_name)
@@ -1596,6 +1597,9 @@ def main() -> None:
                 status, old_path, result_path,
                 processed_stats, 'renamed_by_tags',
             )
+        renamed_after = processed_stats['renamed_by_tags']
+        if renamed_after > renamed_before:
+            print(f"  Переименовано файлов: {renamed_after - renamed_before}")
 
     if mismatch_candidates:
         print(f"\nНайдено {len(mismatch_candidates)} файлов "
@@ -1717,7 +1721,7 @@ def main() -> None:
                                 if DRY_RUN:
                                     dbg(f"[DRY RUN] Обновил бы теги из имени: {f.name}")
                                 elif write_audio_tags(f, parsed[0], parsed[1]):
-                                    print(f"  Теги обновлены из имени: {f.name}")
+                                    dbg(f"Теги обновлены из имени: {f.name}")
                                     processed_stats['tags_written'] += 1
                 else:
                     print(f"  Группа {cat_key} пропущена.")
@@ -1765,7 +1769,7 @@ def main() -> None:
                             if DRY_RUN:
                                 dbg(f"[DRY RUN] Обновил бы теги из имени: {f.name}")
                             elif write_audio_tags(f, parsed[0], parsed[1]):
-                                print(f"      Теги обновлены из имени: {f.name}")
+                                dbg(f"Теги обновлены из имени: {f.name}")
                                 processed_stats['tags_written'] += 1
                     else:
                         print(f"      Пропущен: {f.name}")
@@ -1807,7 +1811,7 @@ def main() -> None:
                 print(f"  [DRY RUN] Записал бы теги: {f.name}")
                 continue
             if write_audio_tags(f, artist, title):
-                print(f"  Записаны теги: {f.name}")
+                dbg(f"Записаны теги: {f.name}")
                 processed_stats['tags_written'] += 1
 
     # --- Шаг 6: Нормализация имён исполнителей ---
@@ -1870,10 +1874,7 @@ def main() -> None:
                                 f"({artist} -> {canonical})"
                             )
                         elif write_audio_tags(f, canonical, tags[1]):
-                            print(
-                                f"  Обновлено: {f.name} "
-                                f"({artist} -> {canonical})"
-                            )
+                            dbg(f"Обновлено: {f.name} ({artist} -> {canonical})")
                             processed_stats['artists_normalized'] += 1
                     
                     parsed = parse_artist_title(f.stem)
