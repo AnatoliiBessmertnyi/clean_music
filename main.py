@@ -1226,10 +1226,16 @@ def categorize_annotations(annotations: dict[str, list[Path]]) -> dict[str, dict
     return {k: v for k, v in categories.items() if v['items']}
 
 
-def collect_invalid_filename_files(files: list[Path]) -> dict[frozenset, list[tuple[Path, str, str]]]:
-    """Собирает файлы с недопустимыми символами и группирует их по набору символов.
+def collect_invalid_filename_files(
+    files: list[Path],
+) -> dict[str, list[tuple[Path, str, str]]]:
+    """Собирает файлы с недопустимыми символами и группирует их.
     
-    Возвращает словарь: {набор_символов: [(файл, текущее_имя, предлагаемое_имя), ...]}
+    Возвращает словарь: {тип_проблемы: [(файл, текущее_имя, предлагаемое_имя), ...]}
+    Типы проблем:
+    - 'bilingual_title' - '/' в названии
+    - 'artist_name' - '/' в имени исполнителя
+    - 'other:символы' - другие недопустимые символы
     """
     problems = {}
     
@@ -1256,86 +1262,131 @@ def collect_invalid_filename_files(files: list[Path]) -> dict[frozenset, list[tu
         if f"{cleaned}{f.suffix}" == f.name:
             continue
         
-        chars_key = frozenset(invalid_chars)
-        if chars_key not in problems:
-            problems[chars_key] = []
+        # Определяем тип проблемы
+        if '/' in invalid_chars:
+            slash_type = categorize_slash_usage(raw_name)
+            if slash_type == 'bilingual_title':
+                problem_key = 'bilingual_title'
+            elif slash_type == 'artist_name':
+                problem_key = 'artist_name'
+            else:
+                problem_key = 'other'
+        else:
+            # Для других символов группируем по набору символов
+            chars_str = ''.join(sorted(invalid_chars))
+            problem_key = f'other:{chars_str}'
         
-        problems[chars_key].append((f, f.name, raw_name))
+        if problem_key not in problems:
+            problems[problem_key] = []
+        
+        problems[problem_key].append((f, f.name, raw_name))
     
     return problems
 
 
 def choose_strategy_for_group(
-    chars_key: frozenset,
+    problem_key: str,
     examples: list[tuple[Path, str, str]]
 ) -> tuple[str, dict]:
     """Запрашивает у пользователя стратегию обработки для группы файлов.
     
     Возвращает: (стратегия, параметры)
-    Стратегии:
-    - 'remove' - удалить символы
-    - 'replace' - заменить на '-'
-    - 'semicolon' - заменить '/' на '; '
-    - 'first_title' - оставить первое название (для '/')
-    - 'second_title' - оставить второе название (для '/')
-    - 'skip' - пропустить
     """
-    chars_str = ''.join(sorted(chars_key))
+    # Определяем заголовок и символы для вывода
+    if problem_key == 'bilingual_title':
+        title = "билингвальные названия с '/'"
+        chars_str = '/'
+    elif problem_key == 'artist_name':
+        title = "имена исполнителей с '/'"
+        chars_str = '/'
+    elif problem_key.startswith('other:'):
+        chars_str = problem_key[6:]  # Убираем префикс 'other:'
+        title = f"недопустимые символы: {chars_str}"
+    else:
+        chars_str = '/'
+        title = "недопустимые символы"
     
     print(f"\n{'='*60}")
-    print(f"Найдено {len(examples)} файлов с недопустимыми символами: {chars_str}")
+    print(f"Найдено {len(examples)} файлов: {title}")
     print(f"{'='*60}")
     
-    # Показываем до 3 примеров
-    for i, (f, current_name, proposed_name) in enumerate(examples[:3], 1):
-        print(f"\n  Пример {i}:")
-        print(f"    Текущий файл: {current_name}")
-        print(f"    Предлагаемое: {proposed_name}")
+    # Показываем все файлы компактно
+    for i, (f, current_name, proposed_name) in enumerate(examples, 1):
+        print(f"  {i}. {current_name}")
+        print(f"     → {proposed_name}")
     
-    if len(examples) > 3:
-        print(f"\n  ... и ещё {len(examples) - 3} файлов")
-    
-    # Формируем опции
+    # Формируем опции в зависимости от типа
     print(f"\n  Как обработать все {len(examples)} файлов?")
-    print(f"  1. Удалить символы '{chars_str}'")
-    print(f"  2. Заменить '{chars_str}' на '-'")
     
-    option_num = 3
-    if '/' in chars_key:
-        print(f"  {option_num}. Заменить '/' на '; '")
-        option_num += 1
-        print(f"  {option_num}. Оставить первое название (до '/')")
-        option_num += 1
-        print(f"  {option_num}. Оставить второе название (после '/')")
-        option_num += 1
-    
-    print(f"  {option_num}. Пропустить все файлы")
-    
-    choice = get_choice_with_default(
-        f"  Выберите вариант [1]: ", default='1'
-    )
-    
-    try:
-        idx = int(choice)
-    except ValueError:
-        idx = 1
-    
-    # Возвращаем стратегию
-    if idx == 1:
-        return ('remove', {})
-    elif idx == 2:
-        return ('replace', {'char': '-'})
-    elif '/' in chars_key:
-        if idx == 3:
-            return ('semicolon', {})
-        elif idx == 4:
+    if problem_key == 'bilingual_title':
+        print(f"  1. Оставить первое название (до '/') [по умолчанию]")
+        print(f"  2. Оставить второе название (после '/')")
+        print(f"  3. Ввести имя вручную для каждого файла")
+        print(f"  4. Пропустить все файлы")
+        
+        choice = get_choice_with_default(
+            f"  Выберите вариант [1]: ", default='1'
+        )
+        
+        try:
+            idx = int(choice)
+        except ValueError:
+            idx = 1
+        
+        if idx == 1:
             return ('first_title', {})
-        elif idx == 5:
+        elif idx == 2:
             return ('second_title', {})
+        elif idx == 3:
+            return ('manual', {})
         else:
             return ('skip', {})
+    
+    elif problem_key == 'artist_name':
+        print(f"  1. Удалить '/' из имени [по умолчанию]")
+        print(f"  2. Ввести имя вручную для каждого файла")
+        print(f"  3. Пропустить все файлы")
+        
+        choice = get_choice_with_default(
+            f"  Выберите вариант [1]: ", default='1'
+        )
+        
+        try:
+            idx = int(choice)
+        except ValueError:
+            idx = 1
+        
+        if idx == 1:
+            return ('remove', {})
+        elif idx == 2:
+            return ('manual', {})
+        else:
+            return ('skip', {})
+    
     else:
-        return ('skip', {})
+        # Другие символы (? * : и т.д.)
+        print(f"  1. Удалить символы '{chars_str}' [по умолчанию]")
+        print(f"  2. Заменить '{chars_str}' на '-'")
+        print(f"  3. Ввести имя вручную для каждого файла")
+        print(f"  4. Пропустить все файлы")
+        
+        choice = get_choice_with_default(
+            f"  Выберите вариант [1]: ", default='1'
+        )
+        
+        try:
+            idx = int(choice)
+        except ValueError:
+            idx = 1
+        
+        if idx == 1:
+            return ('remove', {})
+        elif idx == 2:
+            return ('replace', {'char': '-'})
+        elif idx == 3:
+            return ('manual', {})
+        else:
+            return ('skip', {})
 
 
 def apply_strategy_to_file(
@@ -1357,12 +1408,6 @@ def apply_strategy_to_file(
         result = raw_name
         for c in invalid_chars:
             result = result.replace(c, params['char'])
-        return re.sub(r'\s+', ' ', result).strip()
-    
-    elif strategy == 'semicolon':
-        result = raw_name.replace('/', '; ')
-        for c in invalid_chars - {'/'}:
-            result = result.replace(c, '')
         return re.sub(r'\s+', ' ', result).strip()
     
     elif strategy in ('first_title', 'second_title'):
@@ -1391,7 +1436,47 @@ def apply_strategy_to_file(
         result = raw_name.replace('/', '')
         return re.sub(r'\s+', ' ', result).strip()
     
+    elif strategy == 'manual':
+        # Ручной ввод для конкретного файла
+        print(f"\n  Файл: {f.name}")
+        print(f"  Предлагаемое: {raw_name}")
+        custom = input("  Введите имя (без расширения, пустой ввод - пропустить): ").strip()
+        if not custom:
+            return None
+        if INVALID_FILENAME_CHARS.search(custom):
+            print("  Имя содержит недопустимые символы, пропускаю.")
+            return None
+        return custom
+    
     return None
+
+
+def categorize_slash_usage(raw_name: str) -> str:
+    """Определяет тип использования '/' в имени.
+    
+    Возвращает:
+        'bilingual_title' - '/' в названии (билингвальное название)
+        'artist_name' - '/' в имени исполнителя
+        'other' - другие недопустимые символы
+    """
+    # Проверяем, есть ли формат "Artist - Title"
+    match = re.match(r'^(.+?)\s+-\s+(.+)$', raw_name)
+    if match:
+        artist_part = match.group(1)
+        title_part = match.group(2)
+        
+        # Если '/' в имени исполнителя
+        if '/' in artist_part:
+            return 'artist_name'
+        # Если '/' в названии
+        if '/' in title_part:
+            return 'bilingual_title'
+    
+    # Если нет тире, но есть '/' - скорее всего имя исполнителя
+    if '/' in raw_name:
+        return 'artist_name'
+    
+    return 'other'
 
 
 def main() -> None:
@@ -1694,9 +1779,17 @@ def main() -> None:
         print(f"\n  Найдено {sum(len(v) for v in invalid_files.values())} файлов "
               f"с недопустимыми символами в {len(invalid_files)} группах")
         
-        for chars_key, examples in invalid_files.items():
-            strategy, params = choose_strategy_for_group(chars_key, examples)
-            strategies[chars_key] = (strategy, params)
+        # Обрабатываем группы в приоритетном порядке
+        priority_order = ['bilingual_title', 'artist_name']
+        other_keys = [k for k in invalid_files.keys() if k not in priority_order]
+        ordered_keys = priority_order + sorted(other_keys)
+        
+        for problem_key in ordered_keys:
+            if problem_key not in invalid_files:
+                continue
+            examples = invalid_files[problem_key]
+            strategy, params = choose_strategy_for_group(problem_key, examples)
+            strategies[problem_key] = (strategy, params)
     
     # Основной цикл обработки
     safe_candidates = []
@@ -1725,23 +1818,34 @@ def main() -> None:
             
             invalid_chars = set(INVALID_FILENAME_CHARS.findall(raw_name))
             if invalid_chars:
-                chars_key = frozenset(invalid_chars)
+                # Определяем тип проблемы
+                if '/' in invalid_chars:
+                    slash_type = categorize_slash_usage(raw_name)
+                    if slash_type == 'bilingual_title':
+                        problem_key = 'bilingual_title'
+                    elif slash_type == 'artist_name':
+                        problem_key = 'artist_name'
+                    else:
+                        problem_key = 'other'
+                else:
+                    chars_str = ''.join(sorted(invalid_chars))
+                    problem_key = f'other:{chars_str}'
                 
                 # Проверяем, есть ли стратегия для этой группы
-                if chars_key in strategies:
-                    strategy, params = strategies[chars_key]
+                if problem_key in strategies:
+                    strategy, params = strategies[problem_key]
                     
                     if strategy != 'skip':
                         base_name = apply_strategy_to_file(f, raw_name, strategy, params)
                         if base_name:
                             user_already_chose = True
                         else:
-                            base_name = raw_name
+                            dbg(f"Пропущен (стратегия вернула None): {f.name}")
+                            continue
                     else:
                         dbg(f"Пропущен (стратегия skip): {f.name}")
                         continue
                 else:
-                    # Файл не был в предварительном сборе, пропускаем
                     dbg(f"Пропущен (нет стратегии): {f.name}")
                     continue
             else:
