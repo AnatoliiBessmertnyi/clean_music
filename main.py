@@ -2383,6 +2383,8 @@ def main() -> None:
                 
                 if choice in ('', 'y', 'yes', 'д', 'да'):
                     cleaned_count = 0
+                    files_to_rename = []  # [(f, new_filename)]
+                    
                     for f, artist, title, matches in files_with_annotations:
                         new_title = title
                         for ann in matches:
@@ -2394,9 +2396,46 @@ def main() -> None:
                             elif write_audio_tags(f, artist, new_title):
                                 dbg(f"Очищены теги: {f.name}")
                                 cleaned_count += 1
+                                
+                                # Формируем новое имя файла из очищенных тегов
+                                raw_name = f"{artist} - {new_title}"
+                                raw_name = normalize_title_spacing(raw_name)
+                                cleaned_name = INVALID_FILENAME_CHARS.sub('', raw_name)
+                                cleaned_name = re.sub(r'\s+', ' ', cleaned_name).strip()
+                                new_filename = f"{cleaned_name}{f.suffix}"
+                                
+                                if new_filename != f.name:
+                                    files_to_rename.append((f, new_filename))
                     
                     if cleaned_count:
                         print(f"  Очищено уточнений: {cleaned_count}")
+                    
+                    # Переименовываем файлы в соответствии с очищенными тегами
+                    if files_to_rename:
+                        print(f"\n  Файлы для переименования в соответствии "
+                              f"с очищенными тегами:")
+                        for f, new_filename in files_to_rename:
+                            print(f"    {f.name}")
+                            print(f"      → {new_filename}")
+                        
+                        choice = input(
+                            f"\n  Переименовать {len(files_to_rename)} файлов? "
+                            f"(y/n) [y]: "
+                        ).strip().lower()
+                        
+                        if choice in ('', 'y', 'yes', 'д', 'да'):
+                            renamed = 0
+                            for f, new_filename in files_to_rename:
+                                new_path = f.with_name(new_filename)
+                                status, result_path = safe_rename(f, new_path)
+                                if status in ('renamed', 'kept_existing'):
+                                    renamed += 1
+                                    processed_stats['renamed_by_tags'] += 1
+                            
+                            if renamed:
+                                print(f"  Переименовано файлов: {renamed}")
+                        else:
+                            print("  Переименование пропущено.")
                 else:
                     print("  Уточнения оставлены.")
 
