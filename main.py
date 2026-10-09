@@ -2124,16 +2124,23 @@ def main() -> None:
                 # Запоминаем последнее действие для использования по умолчанию
                 last_action = 'n'
                 
-                for i, (f, file_title, new_name, tag_artist, tag_title) in enumerate(
+                for i, (f, file_title, old_new_name, tag_artist, tag_title) in enumerate(
                     categorized[cat_key], 1
                 ):
                     print(f"\n  {i}. {f.name}")
                     print(f"      Файл: {file_title or '(нет)'}")
                     print(f"      Теги: {tag_artist} - {tag_title}")
                     
+                    # Заново формируем new_name из текущих тегов
+                    raw_name = f"{tag_artist} - {tag_title}"
+                    raw_name = normalize_title_spacing(raw_name)
+                    cleaned = INVALID_FILENAME_CHARS.sub('', raw_name)
+                    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+                    current_new_name = f"{cleaned}{f.suffix}"
+                    
                     # Показываем, что произойдёт в зависимости от ожидаемого действия
                     if last_action == 't':
-                        print(f"      → Новое имя (t): {new_name}")
+                        print(f"      → Новое имя (t): {current_new_name}")
                     elif last_action == 'f':
                         parsed = parse_artist_title(f.stem)
                         if parsed:
@@ -2142,7 +2149,7 @@ def main() -> None:
                             print(f"      → Новые теги (f): {file_title or f.stem}")
                     else:
                         # last_action == 'n' - показываем оба варианта
-                        print(f"      → Если t: {new_name}")
+                        print(f"      → Если t: {current_new_name}")
                         parsed = parse_artist_title(f.stem)
                         if parsed:
                             print(f"      → Если f: {parsed[0]} - {parsed[1]}")
@@ -2160,7 +2167,7 @@ def main() -> None:
                         last_action = choice
                     
                     if choice == 't':
-                        new_path = f.with_name(new_name)
+                        new_path = f.with_name(current_new_name)
                         status, result_path = safe_rename(f, new_path)
                         handle_rename_result(
                             status, f, result_path,
