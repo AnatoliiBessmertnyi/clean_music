@@ -653,57 +653,62 @@ def parse_artist_title(filename: str) -> tuple[str, str] | None:
 
 
 def clean_extracted_tags(artist: str, title: str) -> tuple[str, str]:
-    """Очищает извлечённые из имени файла теги от артефактов.
-    
-    Удаляет:
-    - Одиночные скобки без пары
-    - Лишние пробелы
-    - Артефакты обрезки в начале/конце
-    """
     def clean_text(text: str) -> str:
-        # Удаляем одиночные открывающие скобки без закрывающей пары
-        # Проверяем баланс скобок
+        # Первый проход: удаляем непарные закрывающие скобки
         result = []
-        open_parens = []
-        open_brackets = []
+        paren_depth = 0
+        bracket_depth = 0
         
-        for i, ch in enumerate(text):
+        for ch in text:
             if ch == '(':
-                open_parens.append(i)
+                paren_depth += 1
                 result.append(ch)
             elif ch == ')':
-                if open_parens:
-                    open_parens.pop()
+                if paren_depth > 0:
+                    paren_depth -= 1
                     result.append(ch)
-                # else: одиночная закрывающая скобка, пропускаем
+                # else: пропускаем
             elif ch == '[':
-                open_brackets.append(i)
+                bracket_depth += 1
                 result.append(ch)
             elif ch == ']':
-                if open_brackets:
-                    open_brackets.pop()
+                if bracket_depth > 0:
+                    bracket_depth -= 1
                     result.append(ch)
             else:
                 result.append(ch)
         
-        # Удаляем одиночные открывающие скобки (без пары)
         text = ''.join(result)
         
-        # Удаляем одиночные скобки, оставшиеся без пары
-        # Удаляем '(' если нет соответствующей ')'
-        while '(' in text and ')' not in text.split('(')[-1]:
-            # Находим последнюю '(' без пары
-            last_open = text.rfind('(')
-            # Проверяем, есть ли ')' после неё
-            if ')' not in text[last_open:]:
-                text = text[:last_open] + text[last_open+1:]
+        # Второй проход: удаляем непарные открывающие скобки
+        # Идём справа налево
+        result = []
+        paren_depth = 0
+        bracket_depth = 0
+        
+        for ch in reversed(text):
+            if ch == ')':
+                paren_depth += 1
+                result.append(ch)
+            elif ch == '(':
+                if paren_depth > 0:
+                    paren_depth -= 1
+                    result.append(ch)
+                # else: пропускаем
+            elif ch == ']':
+                bracket_depth += 1
+                result.append(ch)
+            elif ch == '[':
+                if bracket_depth > 0:
+                    bracket_depth -= 1
+                    result.append(ch)
             else:
-                break
+                result.append(ch)
+        
+        text = ''.join(reversed(result))
         
         # Нормализуем пробелы
         text = re.sub(r'\s+', ' ', text).strip()
-        
-        # Удаляем пробелы перед/после тире
         text = re.sub(r'\s*[-–—]\s*', ' - ', text)
         
         return text
@@ -2309,6 +2314,9 @@ def main() -> None:
     # --- Шаг 4: Поиск дубликатов ---
     stage(4, "Поиск и объединение дубликатов")
     files = process_duplicates(files, processed_stats)
+    
+    # Пересканируем после удаления дубликатов
+    files = get_audio_files(target_dir)
 
     # --- Шаг 5: Запись тегов из имени файла ---
     stage(5, "Запись тегов из имени файла")
@@ -2342,16 +2350,20 @@ def main() -> None:
         )
         
         written_count = 0
+        successfully_written = []  # Список успешно записанных файлов
+        
         for i in idx:
             f, artist, title = tags_to_write[i]
             if DRY_RUN:
                 dbg(f"[DRY RUN] Записал бы теги: {f.name}")
                 written_count += 1
+                successfully_written.append(i)
                 continue
             if write_audio_tags(f, artist, title):
                 dbg(f"Записаны теги: {f.name}")
                 processed_stats['tags_written'] += 1
                 written_count += 1
+                successfully_written.append(i)
         
         if written_count:
             print(f"  Записано тегов: {written_count}")
@@ -2360,7 +2372,7 @@ def main() -> None:
             files_with_annotations = []
             bracket_pattern = re.compile(r'[\(\[]([^\)\]]+)[\)\]]')
             
-            for i in idx:
+            for i in successfully_written:  # ← используем только успешные
                 f, artist, title = tags_to_write[i]
                 matches = bracket_pattern.findall(title)
                 real_matches = [
@@ -2441,7 +2453,11 @@ def main() -> None:
 
     # --- Шаг 6: Нормализация имён исполнителей ---
     stage(6, "Нормализация имён исполнителей")
+    # Пересканируем директорию, чтобы учесть все изменения
+    files = get_audio_files(target_dir)
+    dbg(f"Пересканировано файлов перед этапом 6: {len(files)}")
     artist_variations = find_artist_variations(files)
+
     if artist_variations:
         print(
             f"\nНайдено {len(artist_variations)} исполнителей "
@@ -2525,8 +2541,12 @@ def main() -> None:
                             processed_stats, 'renamed_by_tags',
                         )
 
-    # --- Шаг 8: Ручной ввод для файлов без метаданных ---
+    # --- Шаг 7: Ручной ввод для файлов без метаданных ---
     stage(7, "Ручной ввод для файлов без метаданных")
+    
+    # Пересканируем директорию
+    files = get_audio_files(target_dir)
+    
     still_missing = []
     
     # После Этапа 6 у некоторых файлов могли появиться теги —
