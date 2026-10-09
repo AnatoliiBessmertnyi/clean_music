@@ -1988,10 +1988,50 @@ def main() -> None:
             else:
                 print(f"  Дубликаты пропущены.")
 
+    # Переформировываем mismatch_candidates с учётом изменений
+    if mismatch_candidates:
+        # Фильтруем файлы, которые больше не существуют
+        active_mismatch = []
+        for f, file_title, old_new_name in mismatch_candidates:
+            if not f.exists():
+                dbg(f"Файл {f.name} больше не существует, пропускаю")
+                continue
+            
+            # Перечитываем теги и заново формируем new_name
+            tags = read_audio_tags(f)
+            if not tags:
+                continue
+            
+            artist = remove_junk(str(tags[0]))
+            title = remove_junk(str(tags[1]))
+            raw_name = f"{artist} - {title}"
+            raw_name = normalize_title_spacing(raw_name)
+            cleaned = INVALID_FILENAME_CHARS.sub('', raw_name)
+            cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+            current_new_name = f"{cleaned}{f.suffix}"
+            
+            # Проверяем, всё ещё есть ли расхождение
+            if current_new_name == f.name:
+                dbg(f"Файл {f.name} уже имеет корректное имя, пропускаю")
+                continue
+            
+            # Заново проверяем, совпадают ли названия
+            file_title = extract_title_from_filename(f.stem)
+            if titles_match(file_title, title):
+                dbg(f"Файл {f.name} теперь совпадает с тегами, "
+                    f"переношу в обычную обработку")
+                # Добавляем в safe_candidates для обработки
+                safe_candidates.append((f, current_new_name))
+                continue
+            
+            active_mismatch.append((f, file_title, current_new_name))
+        
+        mismatch_candidates = active_mismatch
+    
     if mismatch_candidates:
         print("\n  [Подэтап 4.5] Обработка расхождений имён и тегов")
         print(f"\n  Найдено {len(mismatch_candidates)} файлов "
-            f"с расхождением названий (файл vs теги):")
+              f"с расхождением названий (файл vs теги):")
         
         # Категоризируем файлы
         categorized = {
