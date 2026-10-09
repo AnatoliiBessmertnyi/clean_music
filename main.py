@@ -10,6 +10,7 @@ from mutagen.flac import FLAC
 from mutagen.oggvorbis import OggVorbis
 from mutagen.asf import ASF
 from mutagen.id3 import ID3NoHeaderError, TIT2, TPE1
+import unicodedata
 
 DRY_RUN = '--dry-run' in sys.argv
 DEBUG = '--debug' in sys.argv
@@ -368,6 +369,21 @@ def file_info_line(filepath: Path) -> str:
 def normalize_filename_stem(stem: str) -> str:
     """Нормализует название файла, удаляя лишние пробелы."""
     return re.sub(r'\s+', ' ', stem).strip()
+
+
+def normalize_unicode(text: str) -> str:
+    """Нормализует Unicode: убирает диакритические знаки для сравнения.
+    
+    Примеры:
+    - 'Voilà' → 'Voila'
+    - 'Björk' → 'Bjork'
+    - 'Motörhead' → 'Motorhead'
+    - 'Mötley Crüe' → 'Motley Crue'
+    """
+    # NFKD decomposes characters: é → e + ´
+    normalized = unicodedata.normalize('NFKD', text)
+    # Убираем комбинирующие символы (акценты)
+    return ''.join(c for c in normalized if not unicodedata.combining(c))
 
 
 def remove_junk(text: str) -> str:
@@ -1041,20 +1057,25 @@ def select_indices(items: list[str], description: str) -> list[int]:
 
 
 def find_duplicates(files: list[Path]) -> list[list[Path]]:
-    """Находит дубликаты файлов по тегам и нормализованным именам."""
+    """Находит дубликаты файлов по тегам и нормализованным именам.
+    
+    Использует нормализацию Unicode для обнаружения "почти одинаковых" песен
+    (например, 'Voila' и 'Voilà').
+    """
     tag_map = {}
     for f in files:
         tags = read_audio_tags(f)
         normalized_name = normalize_filename_stem(f.stem).lower()
 
         if tags:
-            key = (
-                tags[0].lower().strip(),
-                tags[1].lower().strip(),
-                'tags',
-            )
+            # Нормализуем теги для сравнения (убираем диакритику)
+            artist_norm = normalize_unicode(tags[0]).lower().strip()
+            title_norm = normalize_unicode(tags[1]).lower().strip()
+            key = (artist_norm, title_norm, 'tags')
         else:
-            key = (normalized_name, '', 'name')
+            # Для файлов без тегов тоже нормализуем имя
+            name_norm = normalize_unicode(normalized_name)
+            key = (name_norm, '', 'name')
 
         if key not in tag_map:
             tag_map[key] = []
@@ -2349,8 +2370,45 @@ def main() -> None:
                 title = normalize_title_spacing(title)
                 tags_to_write.append((f, artist, title))
     
-    # Подэтап 5.2: Очистка уточнений из записанных тегов (опционально)
     if tags_to_write:
+        # СНАЧАЛА: проверяем уточнения и предлагаем их удалить
+        bracket_pattern = re.compile(r'[\(\[]([^\)\]]+)[\)\]]')
+        files_with_annotations = []
+        
+        for i, (f, artist, title) in enumerate(tags_to_write):
+            matches = bracket_pattern.findall(title)
+            real_matches = [
+                m for m in matches 
+                if not FEAT_VARIANTS_PATTERN.match(m)
+            ]
+            if real_matches:
+                files_with_annotations.append((i, f, artist, title, real_matches))
+        
+        # Удаляем уточнения ДО записи тегов
+        if files_with_annotations:
+            print(f"\n  Внимание: {len(files_with_annotations)} файлов "
+                  f"содержат уточнения в скобках:")
+            for i, f, artist, title, matches in files_with_annotations:
+                print(f"    {f.name}")
+                print(f"      Уточнения: {', '.join(f'({m})' for m in matches)}")
+            
+            choice = input(
+                f"\n  Удалить уточнения из тегов и имён? (y/n) [y]: "
+            ).strip().lower()
+            
+            if choice in ('', 'y', 'yes', 'д', 'да'):
+                # Модифицируем tags_to_write in-place
+                for i, f, artist, title, matches in files_with_annotations:
+                    new_title = title
+                    for ann in matches:
+                        new_title = remove_annotation_from_text(new_title, ann)
+                    # Обновляем в общем списке
+                    tags_to_write[i] = (f, artist, new_title)
+                print(f"  Уточнения будут удалены перед записью.")
+            else:
+                print("  Уточнения будут сохранены.")
+        
+        # ПОТОМ: показываем список с уже очищенными данными
         labels = [
             f"{c[0].name} (artist: {c[1]!r}, title: {c[2]!r})"
             for c in tags_to_write
@@ -2362,106 +2420,41 @@ def main() -> None:
         )
         
         written_count = 0
-        successfully_written = []  # Список успешно записанных файлов
+        renamed_count = 0
         
         for i in idx:
             f, artist, title = tags_to_write[i]
+            
             if DRY_RUN:
                 dbg(f"[DRY RUN] Записал бы теги: {f.name}")
                 written_count += 1
-                successfully_written.append(i)
                 continue
+            
+            # Записываем (возможно, уже очищенные) теги
             if write_audio_tags(f, artist, title):
                 dbg(f"Записаны теги: {f.name}")
                 processed_stats['tags_written'] += 1
                 written_count += 1
-                successfully_written.append(i)
+                
+                # Формируем новое имя файла из (возможно, очищенных) тегов
+                raw_name = f"{artist} - {title}"
+                raw_name = normalize_title_spacing(raw_name)
+                cleaned_name = INVALID_FILENAME_CHARS.sub('', raw_name)
+                cleaned_name = re.sub(r'\s+', ' ', cleaned_name).strip()
+                new_filename = f"{cleaned_name}{f.suffix}"
+                
+                # Переименовываем, если имя отличается
+                if new_filename != f.name:
+                    new_path = f.with_name(new_filename)
+                    status, result_path = safe_rename(f, new_path)
+                    if status in ('renamed', 'kept_existing'):
+                        renamed_count += 1
+                        processed_stats['renamed_by_tags'] += 1
         
         if written_count:
             print(f"  Записано тегов: {written_count}")
-            
-            # Подэтап 5.2: Очистка уточнений из записанных тегов
-            files_with_annotations = []
-            bracket_pattern = re.compile(r'[\(\[]([^\)\]]+)[\)\]]')
-            
-            for i in successfully_written:  # ← используем только успешные
-                f, artist, title = tags_to_write[i]
-                matches = bracket_pattern.findall(title)
-                real_matches = [
-                    m for m in matches 
-                    if not FEAT_VARIANTS_PATTERN.match(m)
-                ]
-                if real_matches:
-                    files_with_annotations.append((f, artist, title, real_matches))
-            
-            if files_with_annotations:
-                print(f"\n  Внимание: {len(files_with_annotations)} файлов "
-                      f"содержат уточнения в скобках:")
-                for f, artist, title, matches in files_with_annotations:
-                    print(f"    {f.name}")
-                    print(f"      Уточнения: {', '.join(f'({m})' for m in matches)}")
-                
-                choice = input(
-                    f"\n  Удалить уточнения из тегов? (y/n) [y]: "
-                ).strip().lower()
-                
-                if choice in ('', 'y', 'yes', 'д', 'да'):
-                    cleaned_count = 0
-                    files_to_rename = []  # [(f, new_filename)]
-                    
-                    for f, artist, title, matches in files_with_annotations:
-                        new_title = title
-                        for ann in matches:
-                            new_title = remove_annotation_from_text(new_title, ann)
-                        
-                        if new_title != title:
-                            if DRY_RUN:
-                                dbg(f"[DRY RUN] Очистил бы теги: {f.name}")
-                            elif write_audio_tags(f, artist, new_title):
-                                dbg(f"Очищены теги: {f.name}")
-                                cleaned_count += 1
-                                
-                                # Формируем новое имя файла из очищенных тегов
-                                raw_name = f"{artist} - {new_title}"
-                                raw_name = normalize_title_spacing(raw_name)
-                                cleaned_name = INVALID_FILENAME_CHARS.sub('', raw_name)
-                                cleaned_name = re.sub(r'\s+', ' ', cleaned_name).strip()
-                                new_filename = f"{cleaned_name}{f.suffix}"
-                                
-                                if new_filename != f.name:
-                                    files_to_rename.append((f, new_filename))
-                    
-                    if cleaned_count:
-                        print(f"  Очищено уточнений: {cleaned_count}")
-                    
-                    # Переименовываем файлы в соответствии с очищенными тегами
-                    if files_to_rename:
-                        print(f"\n  Файлы для переименования в соответствии "
-                              f"с очищенными тегами:")
-                        for f, new_filename in files_to_rename:
-                            print(f"    {f.name}")
-                            print(f"      → {new_filename}")
-                        
-                        choice = input(
-                            f"\n  Переименовать {len(files_to_rename)} файлов? "
-                            f"(y/n) [y]: "
-                        ).strip().lower()
-                        
-                        if choice in ('', 'y', 'yes', 'д', 'да'):
-                            renamed = 0
-                            for f, new_filename in files_to_rename:
-                                new_path = f.with_name(new_filename)
-                                status, result_path = safe_rename(f, new_path)
-                                if status in ('renamed', 'kept_existing'):
-                                    renamed += 1
-                                    processed_stats['renamed_by_tags'] += 1
-                            
-                            if renamed:
-                                print(f"  Переименовано файлов: {renamed}")
-                        else:
-                            print("  Переименование пропущено.")
-                else:
-                    print("  Уточнения оставлены.")
+        if renamed_count:
+            print(f"  Переименовано файлов: {renamed_count}")
 
     # --- Шаг 6: Нормализация имён исполнителей ---
     stage(6, "Нормализация имён исполнителей")
