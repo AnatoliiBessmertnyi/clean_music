@@ -1068,12 +1068,10 @@ def find_duplicates(files: list[Path]) -> list[list[Path]]:
         normalized_name = normalize_filename_stem(f.stem).lower()
 
         if tags:
-            # Нормализуем теги для сравнения (убираем диакритику)
             artist_norm = normalize_unicode(tags[0]).lower().strip()
             title_norm = normalize_unicode(tags[1]).lower().strip()
             key = (artist_norm, title_norm, 'tags')
         else:
-            # Для файлов без тегов тоже нормализуем имя
             name_norm = normalize_unicode(normalized_name)
             key = (name_norm, '', 'name')
 
@@ -1213,6 +1211,7 @@ def process_duplicates(
     """
     duplicates = find_duplicates(files)
     if not duplicates:
+        print("  Дубликатов не найдено.")
         return files
     
     # Собираем план действий для каждой группы
@@ -2344,15 +2343,8 @@ def main() -> None:
     print("  Переход к поиску дубликатов.")
     print("="*60)
 
-    # --- Шаг 4: Поиск дубликатов ---
-    stage(4, "Поиск и объединение дубликатов")
-    files = process_duplicates(files, processed_stats)
-    
-    # Пересканируем после удаления дубликатов
-    files = get_audio_files(target_dir)
-
-    # --- Шаг 5: Запись тегов из имени файла ---
-    stage(5, "Запись тегов из имени файла")
+    # --- Шаг 4: Запись тегов из имени файла ---
+    stage(4, "Запись тегов из имени файла")
     tags_to_write = []
     
     for f in files:
@@ -2455,6 +2447,13 @@ def main() -> None:
             print(f"  Записано тегов: {written_count}")
         if renamed_count:
             print(f"  Переименовано файлов: {renamed_count}")
+
+    # --- Шаг 5: Поиск дубликатов ---
+    stage(5, "Поиск и объединение дубликатов")
+    files = process_duplicates(files, processed_stats)
+
+    # Пересканируем после удаления дубликатов
+    files = get_audio_files(target_dir)
 
     # --- Шаг 6: Нормализация имён исполнителей ---
     stage(6, "Нормализация имён исполнителей")
