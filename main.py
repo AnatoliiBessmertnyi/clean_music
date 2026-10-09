@@ -1065,21 +1065,32 @@ def find_duplicates(files: list[Path]) -> list[list[Path]]:
 
 def find_artist_variations(
     files: list[Path],
-) -> dict[str, list[tuple[Path, str]]]:
-    """Находит разные варианты написания одного исполнителя."""
+) -> dict[str, list[tuple[Path, str, str]]]:
+    """Находит разные варианты написания одного исполнителя.
+    
+    Возвращает: {ключ: [(файл, полный_артист, индивидуальный_артист), ...]}
+    """
     artist_map = {}
     for f in files:
         tags = read_audio_tags(f)
         if tags:
-            artist = tags[0].strip()
-            key = artist.lower()
-            if key not in artist_map:
-                artist_map[key] = []
-            artist_map[key].append((f, artist))
+            full_artist = tags[0].strip()
+            # Разбиваем на отдельных артистов
+            individual_artists = [a.strip() for a in re.split(r'\s*[,;]\s*', full_artist)]
+            
+            for artist in individual_artists:
+                if not artist:
+                    continue
+                key = artist.lower()
+                if key not in artist_map:
+                    artist_map[key] = []
+                # Проверяем, что ещё не добавляли этот файл для этого артиста
+                if not any(files_are_same(existing_f, f) for existing_f, _, _ in artist_map[key]):
+                    artist_map[key].append((f, full_artist, artist))
 
     variations = {}
     for key, entries in artist_map.items():
-        unique_artists = set(artist for _, artist in entries)
+        unique_artists = set(individual_artist for _, _, individual_artist in entries)
         if len(unique_artists) > 1:
             variations[key] = entries
     return variations
@@ -1611,6 +1622,7 @@ def main() -> None:
         'renamed_by_tags': 0,
         'tags_written': 0,
         'artists_normalized': 0,
+        'artists_normalized_unique': 0,
         'manual_input': 0,
     }
 
@@ -2458,6 +2470,8 @@ def main() -> None:
     dbg(f"Пересканировано файлов перед этапом 6: {len(files)}")
     artist_variations = find_artist_variations(files)
 
+    unique_normalized = set()  # Для подсчёта уникальных исполнителей
+
     if artist_variations:
         print(
             f"\nНайдено {len(artist_variations)} исполнителей "
@@ -2465,8 +2479,8 @@ def main() -> None:
         )
         for key, entries in artist_variations.items():
             artist_counts = {}
-            for _, artist in entries:
-                artist_counts[artist] = artist_counts.get(artist, 0) + 1
+            for _, _, individual_artist in entries:
+                artist_counts[individual_artist] = artist_counts.get(individual_artist, 0) + 1
             
             sorted_artists = sorted(
                 artist_counts.items(),
@@ -2502,25 +2516,41 @@ def main() -> None:
             dbg(f"Обрабатываю исполнителя {key!r}, "
                 f"канонический вариант: {canonical!r}")
             
-            for f, artist in entries:
+            # Обрабатываем файлы
+            processed_files = set()  # Чтобы не обрабатывать один файл дважды
+            for f, full_artist, individual_artist in entries:
                 if not f.exists():
                     dbg(f"Файл {f.name} уже не существует, пропускаю")
                     continue
-                if artist != canonical:
+                if files_are_same(f, f) and f in processed_files:
+                    continue  # Уже обработали этот файл
+                
+                if individual_artist != canonical:
+                    # Заменяем individual_artist на canonical в full_artist
+                    # Используем word boundaries для точной замены
+                    new_full_artist = re.sub(
+                        r'\b' + re.escape(individual_artist) + r'\b',
+                        canonical,
+                        full_artist,
+                        flags=re.IGNORECASE
+                    )
+                    
                     tags = read_audio_tags(f)
                     if tags:
                         if DRY_RUN:
                             print(
                                 f"  [DRY RUN] Обновил бы тег: {f.name} "
-                                f"({artist} -> {canonical})"
+                                f"({full_artist} -> {new_full_artist})"
                             )
-                        elif write_audio_tags(f, canonical, tags[1]):
-                            dbg(f"Обновлено: {f.name} ({artist} -> {canonical})")
+                        elif write_audio_tags(f, new_full_artist, tags[1]):
+                            dbg(f"Обновлено: {f.name} ({full_artist} -> {new_full_artist})")
                             processed_stats['artists_normalized'] += 1
+                            unique_normalized.add(key)
                     
+                    # Обновляем имя файла
                     parsed = parse_artist_title(f.stem)
-                    if parsed and parsed[0] != canonical:
-                        raw_name = f"{canonical} - {parsed[1]}"
+                    if parsed and parsed[0] != new_full_artist:
+                        raw_name = f"{new_full_artist} - {parsed[1]}"
                         
                         if INVALID_FILENAME_CHARS.search(raw_name):
                             base_name = clean_filename_safely(raw_name, f.name)
@@ -2540,6 +2570,11 @@ def main() -> None:
                             status, f, result_path,
                             processed_stats, 'renamed_by_tags',
                         )
+                    
+                    processed_files.add(f)
+        
+        # Обновляем статистику уникальных исполнителей
+        processed_stats['artists_normalized_unique'] = len(unique_normalized)
 
     # --- Шаг 7: Ручной ввод для файлов без метаданных ---
     stage(7, "Ручной ввод для файлов без метаданных")
@@ -2621,7 +2656,8 @@ def main() -> None:
     print(f"Записано тегов: {processed_stats['tags_written']}")
     print(
         f"Нормализовано исполнителей: "
-        f"{processed_stats['artists_normalized']}"
+        f"{processed_stats['artists_normalized']} файлов "
+        f"({processed_stats['artists_normalized_unique']} уникальных)"
     )
     print(f"Ручной ввод: {processed_stats['manual_input']}")
 
