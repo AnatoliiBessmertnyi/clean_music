@@ -652,6 +652,65 @@ def parse_artist_title(filename: str) -> tuple[str, str] | None:
     return None
 
 
+def clean_extracted_tags(artist: str, title: str) -> tuple[str, str]:
+    """Очищает извлечённые из имени файла теги от артефактов.
+    
+    Удаляет:
+    - Одиночные скобки без пары
+    - Лишние пробелы
+    - Артефакты обрезки в начале/конце
+    """
+    def clean_text(text: str) -> str:
+        # Удаляем одиночные открывающие скобки без закрывающей пары
+        # Проверяем баланс скобок
+        result = []
+        open_parens = []
+        open_brackets = []
+        
+        for i, ch in enumerate(text):
+            if ch == '(':
+                open_parens.append(i)
+                result.append(ch)
+            elif ch == ')':
+                if open_parens:
+                    open_parens.pop()
+                    result.append(ch)
+                # else: одиночная закрывающая скобка, пропускаем
+            elif ch == '[':
+                open_brackets.append(i)
+                result.append(ch)
+            elif ch == ']':
+                if open_brackets:
+                    open_brackets.pop()
+                    result.append(ch)
+            else:
+                result.append(ch)
+        
+        # Удаляем одиночные открывающие скобки (без пары)
+        text = ''.join(result)
+        
+        # Удаляем одиночные скобки, оставшиеся без пары
+        # Удаляем '(' если нет соответствующей ')'
+        while '(' in text and ')' not in text.split('(')[-1]:
+            # Находим последнюю '(' без пары
+            last_open = text.rfind('(')
+            # Проверяем, есть ли ')' после неё
+            if ')' not in text[last_open:]:
+                text = text[:last_open] + text[last_open+1:]
+            else:
+                break
+        
+        # Нормализуем пробелы
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        # Удаляем пробелы перед/после тире
+        text = re.sub(r'\s*[-–—]\s*', ' - ', text)
+        
+        return text
+    
+    return clean_text(artist), clean_text(title)
+
+
 def extract_title_from_filename(filename: str) -> str:
     """Извлекает название из имени файла, отбрасывая номер трека."""
     match = LEADING_TRACK_PATTERN.match(filename)
@@ -2108,12 +2167,26 @@ def main() -> None:
                     # Для группы D показываем обновление тегов из имени
                     parsed = parse_artist_title(f.stem)
                     if parsed:
-                        new_tag_str = f"{parsed[0]} - {parsed[1]}"
+                        # Показываем очищенные теги
+                        cleaned_artist, cleaned_title = clean_extracted_tags(
+                            parsed[0], parsed[1]
+                        )
+                        new_tag_str = f"{cleaned_artist} - {cleaned_title}"
+                        # Если очистка изменила теги, показываем оригинал
+                        if (cleaned_artist, cleaned_title) != parsed:
+                            print(f"      Файл останется без изменений")
+                            print(f"      Теги: {tag_str}")
+                            print(f"      Из имени: {parsed[0]} - {parsed[1]}")
+                            print(f"         → {new_tag_str} (очищено)")
+                        else:
+                            print(f"      Файл останется без изменений")
+                            print(f"      Теги: {tag_str}")
+                            print(f"         → {new_tag_str}")
                     else:
                         new_tag_str = file_title or f.stem
-                    print(f"      Файл останется без изменений")
-                    print(f"      Теги: {tag_str}")
-                    print(f"         → {new_tag_str}")
+                        print(f"      Файл останется без изменений")
+                        print(f"      Теги: {tag_str}")
+                        print(f"         → {new_tag_str}")
                 elif cat_key == 'E':
                     print(f"      Файл: {file_title or '(нет)'}")
                     print(f"      Теги: {tag_str}")
@@ -2146,9 +2219,13 @@ def main() -> None:
                             # Обновить теги из имён
                             parsed = parse_artist_title(f.stem)
                             if parsed:
+                                # Очищаем извлечённые теги
+                                cleaned_artist, cleaned_title = clean_extracted_tags(
+                                    parsed[0], parsed[1]
+                                )
                                 if DRY_RUN:
                                     dbg(f"[DRY RUN] Обновил бы теги из имени: {f.name}")
-                                elif write_audio_tags(f, parsed[0], parsed[1]):
+                                elif write_audio_tags(f, cleaned_artist, cleaned_title):
                                     dbg(f"Теги обновлены из имени: {f.name}")
                                     processed_stats['tags_written'] += 1
                 else:
