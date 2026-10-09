@@ -2016,25 +2016,25 @@ def main() -> None:
                 'name': 'Файлы с номерами треков (нет исполнителя в имени)',
                 'hint': '💡 В имени нет исполнителя, но он есть в тегах',
                 'recommendation': 'Переименовать по тегам (добавит исполнителя)',
-                'default_action': 'r',
+                'default_action': 't',
             },
             'B': {
                 'name': 'Файлы без тире (неправильный формат)',
                 'hint': '💡 Имя не в формате "Artist - Title", но теги правильные',
                 'recommendation': 'Переименовать по тегам (исправит формат)',
-                'default_action': 'r',
+                'default_action': 't',
             },
             'C': {
                 'name': 'Файлы с feat в имени (нужна нормализация)',
                 'hint': '💡 В имени есть "feat" вне скобок',
                 'recommendation': 'Переименовать по тегам (нормализует feat)',
-                'default_action': 'r',
+                'default_action': 't',
             },
             'D': {
                 'name': 'Проблемы с кодировкой в тегах',
                 'hint': '💡 Теги содержат кракозябры, имя файла корректное',
                 'recommendation': 'Обновить теги из имён файлов',
-                'default_action': 't',
+                'default_action': 'f',
             },
             'E': {
                 'name': 'Спорные случаи (требуют ручного решения)',
@@ -2085,7 +2085,7 @@ def main() -> None:
             # Для категорий A-D предлагаем пакетное действие
             if cat_key != 'E':
                 default = info['default_action']
-                action_name = 'переименовать по тегам' if default == 'r' else 'обновить теги из имён'
+                action_name = 'переименовать по тегам' if default == 't' else 'обновить теги из имён'
                 
                 choice = input(
                     f"\nПрименить '{action_name}' ко всей группе? (y/n) [y]: "
@@ -2094,7 +2094,7 @@ def main() -> None:
                 if choice in ('', 'y', 'yes', 'д', 'да'):
                     # Применяем ко всем файлам в группе
                     for f, file_title, new_name, tag_artist, tag_title in categorized[cat_key]:
-                        if default == 'r':
+                        if default == 't':
                             # Переименовать по тегам
                             new_path = f.with_name(new_name)
                             status, result_path = safe_rename(f, new_path)
@@ -2117,8 +2117,8 @@ def main() -> None:
             # Для категории E спрашиваем по каждому файлу
             else:
                 print("\nДля каждого файла выберите действие:")
-                print("  r - переименовать по тегу")
-                print("  t - обновить тег из имени")
+                print("  t - использовать данные из тега (переименовать файл)")
+                print("  f - использовать данные из файла (обновить тег)")
                 print("  n - пропустить")
                 
                 # Запоминаем последнее действие для использования по умолчанию
@@ -2132,23 +2132,23 @@ def main() -> None:
                     print(f"      Теги: {tag_artist} - {tag_title}")
                     
                     # Показываем, что произойдёт в зависимости от ожидаемого действия
-                    if last_action == 'r':
-                        print(f"      → Новое имя (r): {new_name}")
-                    elif last_action == 't':
+                    if last_action == 't':
+                        print(f"      → Новое имя (t): {new_name}")
+                    elif last_action == 'f':
                         parsed = parse_artist_title(f.stem)
                         if parsed:
-                            print(f"      → Новые теги (t): {parsed[0]} - {parsed[1]}")
+                            print(f"      → Новые теги (f): {parsed[0]} - {parsed[1]}")
                         else:
-                            print(f"      → Новые теги (t): {file_title or f.stem}")
+                            print(f"      → Новые теги (f): {file_title or f.stem}")
                     else:
                         # last_action == 'n' - показываем оба варианта
-                        print(f"      → Если r: {new_name}")
+                        print(f"      → Если t: {new_name}")
                         parsed = parse_artist_title(f.stem)
                         if parsed:
-                            print(f"      → Если t: {parsed[0]} - {parsed[1]}")
+                            print(f"      → Если f: {parsed[0]} - {parsed[1]}")
                     
                     choice = input(
-                        f"      Действие [r/t/n] ({last_action}): "
+                        f"      Действие [t/f/n] ({last_action}): "
                     ).strip().lower()
                     
                     # Если пользователь ничего не ввёл, используем последнее действие
@@ -2159,14 +2159,14 @@ def main() -> None:
                         # Обновляем последнее действие
                         last_action = choice
                     
-                    if choice == 'r':
+                    if choice == 't':
                         new_path = f.with_name(new_name)
                         status, result_path = safe_rename(f, new_path)
                         handle_rename_result(
                             status, f, result_path,
                             processed_stats, 'renamed_by_tags',
                         )
-                    elif choice == 't':
+                    elif choice == 'f':
                         parsed = parse_artist_title(f.stem)
                         if parsed:
                             if DRY_RUN:
@@ -2189,6 +2189,7 @@ def main() -> None:
     # --- Шаг 5: Запись тегов из имени файла ---
     stage(5, "Запись тегов из имени файла")
     tags_to_write = []
+    
     for f in files:
         if not f.exists():
             continue
@@ -2196,11 +2197,18 @@ def main() -> None:
         if parsed:
             tags = read_audio_tags(f)
             if not tags:
-                tags_to_write.append((f, parsed[0], parsed[1]))
-
+                artist, title = parsed
+                artist = remove_junk(artist)
+                title = remove_junk(title)
+                artist, title = normalize_feat_pair(artist, title)
+                artist = remove_feat_guests_from_artist(artist, title)
+                title = normalize_title_spacing(title)
+                tags_to_write.append((f, artist, title))
+    
+    # Подэтап 5.2: Очистка уточнений из записанных тегов (опционально)
     if tags_to_write:
         labels = [
-            f"{c[0].name} (artist: {c[1]}, title: {c[2]})"
+            f"{c[0].name} (artist: {c[1]!r}, title: {c[2]!r})"
             for c in tags_to_write
         ]
         idx = select_indices(
@@ -2208,14 +2216,65 @@ def main() -> None:
             f"Найдено {len(tags_to_write)} файлов с корректным именем, "
             f"но без тегов. Записать теги?",
         )
+        
+        written_count = 0
         for i in idx:
             f, artist, title = tags_to_write[i]
             if DRY_RUN:
-                print(f"  [DRY RUN] Записал бы теги: {f.name}")
+                dbg(f"[DRY RUN] Записал бы теги: {f.name}")
+                written_count += 1
                 continue
             if write_audio_tags(f, artist, title):
                 dbg(f"Записаны теги: {f.name}")
                 processed_stats['tags_written'] += 1
+                written_count += 1
+        
+        if written_count:
+            print(f"  Записано тегов: {written_count}")
+            
+            # Подэтап 5.2: Очистка уточнений из записанных тегов
+            files_with_annotations = []
+            bracket_pattern = re.compile(r'[\(\[]([^\)\]]+)[\)\]]')
+            
+            for i in idx:
+                f, artist, title = tags_to_write[i]
+                matches = bracket_pattern.findall(title)
+                real_matches = [
+                    m for m in matches 
+                    if not FEAT_VARIANTS_PATTERN.match(m)
+                ]
+                if real_matches:
+                    files_with_annotations.append((f, artist, title, real_matches))
+            
+            if files_with_annotations:
+                print(f"\n  Внимание: {len(files_with_annotations)} файлов "
+                      f"содержат уточнения в скобках:")
+                for f, artist, title, matches in files_with_annotations:
+                    print(f"    {f.name}")
+                    print(f"      Уточнения: {', '.join(f'({m})' for m in matches)}")
+                
+                choice = input(
+                    f"\n  Удалить уточнения из тегов? (y/n) [y]: "
+                ).strip().lower()
+                
+                if choice in ('', 'y', 'yes', 'д', 'да'):
+                    cleaned_count = 0
+                    for f, artist, title, matches in files_with_annotations:
+                        new_title = title
+                        for ann in matches:
+                            new_title = remove_annotation_from_text(new_title, ann)
+                        
+                        if new_title != title:
+                            if DRY_RUN:
+                                dbg(f"[DRY RUN] Очистил бы теги: {f.name}")
+                            elif write_audio_tags(f, artist, new_title):
+                                dbg(f"Очищены теги: {f.name}")
+                                cleaned_count += 1
+                    
+                    if cleaned_count:
+                        print(f"  Очищено уточнений: {cleaned_count}")
+                else:
+                    print("  Уточнения оставлены.")
 
     # --- Шаг 6: Нормализация имён исполнителей ---
     stage(6, "Нормализация имён исполнителей")
