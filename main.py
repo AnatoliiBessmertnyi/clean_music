@@ -2401,10 +2401,26 @@ def main() -> None:
                 print("  Уточнения будут сохранены.")
         
         # ПОТОМ: показываем список с уже очищенными данными
-        labels = [
-            f"{c[0].name} (artist: {c[1]!r}, title: {c[2]!r})"
-            for c in tags_to_write
-        ]
+        labels = []
+        for c in tags_to_write:
+            f, artist, title = c
+            # Формируем новое имя файла из (возможно, очищенных) тегов
+            raw_name = f"{artist} - {title}"
+            raw_name = normalize_title_spacing(raw_name)
+            cleaned_name = INVALID_FILENAME_CHARS.sub('', raw_name)
+            cleaned_name = re.sub(r'\s+', ' ', cleaned_name).strip()
+            new_filename = f"{cleaned_name}{f.suffix}"
+            
+            if new_filename != f.name:
+                labels.append(
+                    f"{f.name} → {new_filename} "
+                    f"(artist: {artist!r}, title: {title!r})"
+                )
+            else:
+                labels.append(
+                    f"{f.name} (artist: {artist!r}, title: {title!r})"
+                )
+
         idx = select_indices(
             labels,
             f"Найдено {len(tags_to_write)} файлов с корректным именем, "
@@ -2450,10 +2466,8 @@ def main() -> None:
 
     # --- Шаг 5: Поиск дубликатов ---
     stage(5, "Поиск и объединение дубликатов")
-    files = process_duplicates(files, processed_stats)
-
-    # Пересканируем после удаления дубликатов
     files = get_audio_files(target_dir)
+    files = process_duplicates(files, processed_stats)
 
     # --- Шаг 6: Нормализация имён исполнителей ---
     stage(6, "Нормализация имён исполнителей")
