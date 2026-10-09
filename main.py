@@ -1989,8 +1989,9 @@ def main() -> None:
                 print(f"  Дубликаты пропущены.")
 
     if mismatch_candidates:
-        print(f"\nНайдено {len(mismatch_candidates)} файлов "
-              f"с расхождением названий (файл vs теги):")
+        print("\n  [Подэтап 4.5] Обработка расхождений имён и тегов")
+        print(f"\n  Найдено {len(mismatch_candidates)} файлов "
+            f"с расхождением названий (файл vs теги):")
         
         # Категоризируем файлы
         categorized = {
@@ -2129,7 +2130,22 @@ def main() -> None:
                     print(f"\n  {i}. {f.name}")
                     print(f"      Файл: {file_title or '(нет)'}")
                     print(f"      Теги: {tag_artist} - {tag_title}")
-                    print(f"      Новое имя (если r): {new_name}")
+                    
+                    # Показываем, что произойдёт в зависимости от ожидаемого действия
+                    if last_action == 'r':
+                        print(f"      → Новое имя (r): {new_name}")
+                    elif last_action == 't':
+                        parsed = parse_artist_title(f.stem)
+                        if parsed:
+                            print(f"      → Новые теги (t): {parsed[0]} - {parsed[1]}")
+                        else:
+                            print(f"      → Новые теги (t): {file_title or f.stem}")
+                    else:
+                        # last_action == 'n' - показываем оба варианта
+                        print(f"      → Если r: {new_name}")
+                        parsed = parse_artist_title(f.stem)
+                        if parsed:
+                            print(f"      → Если t: {parsed[0]} - {parsed[1]}")
                     
                     choice = input(
                         f"      Действие [r/t/n] ({last_action}): "
