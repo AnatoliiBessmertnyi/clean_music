@@ -17,7 +17,7 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["config", "naming", "parsing", "main"]
+py-modules = ["config", "naming", "parsing", "main", "context", "tag_repository"]
 
 [tool.ruff]
 line-length = 100

@@ -2,10 +2,10 @@ import re
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import Any, Callable
 
 from mutagen.asf import ASF
 from mutagen.flac import FLAC
-from mutagen.id3 import ID3, TIT2, TPE1, ID3NoHeaderError
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
 from mutagen.oggvorbis import OggVorbis
@@ -19,6 +19,7 @@ from config import (
     SUPPORTED_EXTENSIONS,
     TOTAL_STAGES,
 )
+from context import SessionContext
 from naming import (
     build_safe_filename,
     normalize_dash,
@@ -33,16 +34,7 @@ from parsing import (
     extract_title_from_filename,
     parse_artist_title,
 )
-
-DRY_RUN = '--dry-run' in sys.argv
-DEBUG = '--debug' in sys.argv
-_remembered_sanitize_choices: dict[frozenset, int] = {}
-
-
-def dbg(msg: str) -> None:
-    """Выводит отладочное сообщение, если включён DEBUG."""
-    if DEBUG:
-        print(f'  [DEBUG] {msg}')
+from tag_repository import AudioTags, TagRepository
 
 
 def show_progress(current: int, total: int, prefix: str = '') -> None:
@@ -105,7 +97,9 @@ def categorize_mismatch(filepath: Path, file_title: str, tag_title: str, tag_art
     return 'E'
 
 
-def sanitize_filename_interactive(name: str, current_filename: str) -> str | None:
+def sanitize_filename_interactive(
+    name: str, current_filename: str, ctx: SessionContext
+) -> str | None:
     """Интерактивно очищает имя файла от недопустимых символов."""
     invalid_chars = set(INVALID_FILENAME_CHARS.findall(name))
     if not invalid_chars:
@@ -165,11 +159,13 @@ def sanitize_filename_interactive(name: str, current_filename: str) -> str | Non
     options.append((f'Оставить как есть: {current_filename}', 'SKIP'))
 
     # Проверяем, есть ли запомненный выбор
-    if chars_key in _remembered_sanitize_choices:
-        remembered_idx = _remembered_sanitize_choices[chars_key]
+    if chars_key in ctx.remembered_choices:
+        remembered_idx = ctx.remembered_choices[chars_key]
         if 0 <= remembered_idx < len(options):
             _, value = options[remembered_idx]
-            dbg(f"Применяю запомненный выбор #{remembered_idx + 1} для символов '{chars_str}'")
+            ctx.log_debug(
+                f"Применяю запомненный выбор #{remembered_idx + 1} для символов '{chars_str}'"
+            )
             # Для "manual" и "SKIP" не применяем запомненный выбор
             if value not in ('manual', 'SKIP'):
                 return value
@@ -183,10 +179,7 @@ def sanitize_filename_interactive(name: str, current_filename: str) -> str | Non
         marker = ' [по умолчанию]' if i == 1 else ''
         remembered = (
             ' [запомнено]'
-            if (
-                chars_key in _remembered_sanitize_choices
-                and _remembered_sanitize_choices[chars_key] == i - 1
-            )
+            if (chars_key in ctx.remembered_choices and ctx.remembered_choices[chars_key] == i - 1)
             else ''
         )
         print(f'  {i}. {label}{marker}{remembered}')
@@ -194,16 +187,12 @@ def sanitize_filename_interactive(name: str, current_filename: str) -> str | Non
     print(f"  a. Запомнить и применить вариант 1 ко всем файлам с '{chars_str}'")
 
     # Проверяем, сколько раз уже выбирали этот символ
-    if chars_key not in _remembered_sanitize_choices:
-        # Считаем, сколько раз уже спрашивали про этот символ
-        if not hasattr(sanitize_filename_interactive, '_ask_count'):
-            sanitize_filename_interactive._ask_count = {}
+    if chars_key not in ctx.remembered_choices:
+        if chars_key not in ctx.ask_counts:
+            ctx.ask_counts[chars_key] = 0
+        ctx.ask_counts[chars_key] += 1
 
-        if chars_key not in sanitize_filename_interactive._ask_count:
-            sanitize_filename_interactive._ask_count[chars_key] = 0
-        sanitize_filename_interactive._ask_count[chars_key] += 1
-
-        count = sanitize_filename_interactive._ask_count[chars_key]
+        count = ctx.ask_counts[chars_key]
         if count >= 3:
             print(
                 f'  [Подсказка: вы уже {count} раз выбрали этот вариант. '
@@ -214,7 +203,7 @@ def sanitize_filename_interactive(name: str, current_filename: str) -> str | Non
 
     # Обработка "запомнить для всех"
     if choice == 'a':
-        _remembered_sanitize_choices[chars_key] = 0
+        ctx.remembered_choices[chars_key] = 0
         print(f"  Запомнено: применять 'Удалить символы' для всех '{chars_str}'")
         _, value = options[0]
         return value
@@ -241,24 +230,20 @@ def sanitize_filename_interactive(name: str, current_filename: str) -> str | Non
     return 'SKIP'
 
 
-def clean_filename_safely(raw_name: str, current_filename: str) -> str | None:
-    """Очищает имя файла с проверкой недопустимых символов.
-
-    Если недопустимых символов нет — возвращает имя как есть.
-    Если есть — запускает интерактивный выбор.
-    """
+def clean_filename_safely(raw_name: str, current_filename: str, ctx: SessionContext) -> str | None:
+    """Очищает имя файла с проверкой недопустимых символов."""
     if not INVALID_FILENAME_CHARS.search(raw_name):
         return raw_name
 
-    return sanitize_filename_interactive(raw_name, current_filename)
+    return sanitize_filename_interactive(raw_name, current_filename, ctx)
 
 
-def stage(number: int, name: str) -> None:
+def stage(number: int, name: str, ctx: SessionContext) -> None:
     """Печатает заголовок этапа обработки."""
     print(f'\n{"=" * 60}')
     print(f'[Этап {number}/{TOTAL_STAGES}] {name}')
     print(f'{"=" * 60}')
-    dbg(f'Начинаю этап {number}/{TOTAL_STAGES}: {name}')
+    ctx.log_debug(f'Начинаю этап {number}/{TOTAL_STAGES}: {name}')
 
 
 def get_valid_path() -> Path:
@@ -305,15 +290,15 @@ def get_audio_duration(filepath: Path) -> float | None:
     ext = filepath.suffix.lower()
     try:
         if ext == '.mp3':
-            return MP3(filepath).info.length
+            return float(MP3(filepath).info.length)  # type: ignore
         if ext in ('.m4a', '.mp4'):
-            return MP4(filepath).info.length
+            return float(MP4(filepath).info.length)  # type: ignore
         if ext == '.flac':
-            return FLAC(filepath).info.length
+            return float(FLAC(filepath).info.length)  # type: ignore
         if ext == '.ogg':
-            return OggVorbis(filepath).info.length
+            return float(OggVorbis(filepath).info.length)  # type: ignore
         if ext == '.wma':
-            return ASF(filepath).info.length
+            return float(ASF(filepath).info.length)  # type: ignore
     except Exception:
         pass
     return None
@@ -334,30 +319,24 @@ def file_info_line(filepath: Path) -> str:
     return f'{size}{dur_str}'
 
 
-def find_tag_annotations(
-    files: list[Path],
-) -> dict[str, list[Path]]:
-    """Находит уникальные скобки в тегах названий
-    (кроме известного мусора и feat)."""
-    annotations = {}
+def find_tag_annotations(files: list[Path], repo: TagRepository) -> dict[str, list[Path]]:
+    """Находит уникальные скобки в тегах названий."""
+    annotations: dict[str, list[Path]] = {}
     bracket_pattern = re.compile(r'[\(\[]([^\)\]]+)[\)\]]')
 
     for f in files:
         if not f.exists():
             continue
-        tags = read_audio_tags(f)
+        tags = repo.get_tags(f)
         if tags:
-            title = tags[1]
+            title = tags.title
             matches = bracket_pattern.findall(title)
             for match in matches:
                 match = match.strip()
                 if not match:
                     continue
-                # Пропускаем известный мусор (уже обработан)
                 if JUNK_PATTERN.search(f'({match})'):
                     continue
-                # Пропускаем feat — они уже нормализованы
-                # и остаются по отраслевому стандарту
                 if FEAT_VARIANTS_PATTERN.match(match):
                     continue
                 if match not in annotations:
@@ -565,87 +544,32 @@ def get_best_name_from_group(group: list[Path]) -> Path:
     return max(group, key=name_quality_score)
 
 
-def read_audio_tags(filepath: Path) -> tuple[str, str] | None:
-    """Читает теги из аудиофайла и возвращает (Исполнитель, Название)."""
-    ext = filepath.suffix.lower()
-    try:
-        if ext == '.mp3':
-            audio = MP3(filepath)
-            artist = audio.tags.get('TPE1')
-            title = audio.tags.get('TIT2')
-            if artist and title:
-                return str(artist), str(title)
-        elif ext in ('.m4a', '.mp4'):
-            audio = MP4(filepath)
-            artist = audio.tags.get('©ART')
-            title = audio.tags.get('©nam')
-            if artist and title:
-                return artist[0], title[0]
-        elif ext == '.flac':
-            audio = FLAC(filepath)
-            artist = audio.tags.get('artist')
-            title = audio.tags.get('title')
-            if artist and title:
-                return artist[0], title[0]
-        elif ext == '.ogg':
-            audio = OggVorbis(filepath)
-            artist = audio.tags.get('artist')
-            title = audio.tags.get('title')
-            if artist and title:
-                return artist[0], title[0]
-        elif ext == '.wma':
-            audio = ASF(filepath)
-            artist = audio.tags.get('Author')
-            title = audio.tags.get('Title')
-            if artist and title:
-                return artist[0], title[0]
-    except Exception:
-        pass
-    return None
+def read_audio_tags(filepath: Path, repo: TagRepository) -> AudioTags | None:
+    """Читает теги из аудиофайла через репозиторий.
+
+    Args:
+        filepath: Путь к аудиофайлу
+        repo: Репозиторий тегов
+
+    Returns:
+        AudioTags или None
+    """
+    return repo.get_tags(filepath)
 
 
-def write_audio_tags(filepath: Path, artist: str, title: str) -> bool:
-    """Записывает теги исполнителя и названия в аудиофайл."""
-    ext = filepath.suffix.lower()
-    try:
-        if ext == '.mp3':
-            try:
-                audio = MP3(filepath)
-            except ID3NoHeaderError:
-                audio = MP3(filepath, ID3=ID3)
-            if audio.tags is None:
-                audio.add_tags()
-            audio.tags['TPE1'] = TPE1(encoding=3, text=artist)
-            audio.tags['TIT2'] = TIT2(encoding=3, text=title)
-            audio.save()
-            return True
-        elif ext in ('.m4a', '.mp4'):
-            audio = MP4(filepath)
-            audio.tags['©ART'] = [artist]
-            audio.tags['©nam'] = [title]
-            audio.save()
-            return True
-        elif ext == '.flac':
-            audio = FLAC(filepath)
-            audio['artist'] = [artist]
-            audio['title'] = [title]
-            audio.save()
-            return True
-        elif ext == '.ogg':
-            audio = OggVorbis(filepath)
-            audio['artist'] = [artist]
-            audio['title'] = [title]
-            audio.save()
-            return True
-        elif ext == '.wma':
-            audio = ASF(filepath)
-            audio['Author'] = [artist]
-            audio['Title'] = [title]
-            audio.save()
-            return True
-    except Exception as e:
-        print(f'  Ошибка записи тегов: {e}')
-    return False
+def write_audio_tags(filepath: Path, artist: str, title: str, repo: TagRepository) -> bool:
+    """Записывает теги через репозиторий.
+
+    Args:
+        filepath: Путь к аудиофайлу
+        artist: Имя исполнителя
+        title: Название трека
+        repo: Репозиторий тегов
+
+    Returns:
+        True если запись успешна
+    """
+    return repo.update_tags(filepath, artist, title)
 
 
 def titles_match(file_title: str, tag_title: str) -> bool:
@@ -667,7 +591,7 @@ def files_are_same(old_path: Path, new_path: Path) -> bool:
         return False
 
 
-def rename_case_sensitive(old_path: Path, new_path: Path) -> bool:
+def rename_case_sensitive(old_path: Path, new_path: Path, ctx: SessionContext) -> bool:
     """Переименовывает файл с изменением только регистра (Windows)."""
     temp_name = new_path.stem + '__temp__' + new_path.suffix
     temp_path = old_path.with_name(temp_name)
@@ -676,7 +600,7 @@ def rename_case_sensitive(old_path: Path, new_path: Path) -> bool:
         temp_path.rename(new_path)
         return True
     except OSError as e:
-        dbg(f'Ошибка при case-sensitive rename: {e}')
+        ctx.log_debug(f'Ошибка при case-sensitive rename: {e}')
         if temp_path.exists():
             try:
                 temp_path.rename(old_path)
@@ -698,83 +622,77 @@ def safe_unlink(filepath: Path) -> bool:
         return False
 
 
-def simple_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
-    """Простое переименование без обработки дубликатов.
-
-    Возвращает:
-    - ('renamed', new_path) - успешно переименован
-    - ('duplicate_exists', new_path) - целевой файл уже существует
-    - ('skipped', None) - файл не найден
-    """
-    dbg(f'simple_rename: {old_path.name!r} -> {new_path.name!r}')
+def simple_rename(old_path: Path, new_path: Path, ctx: SessionContext) -> tuple[str, Path | None]:
+    """Простое переименование без обработки дубликатов."""
+    ctx.log_debug(f'simple_rename: {old_path.name!r} -> {new_path.name!r}')
 
     if not old_path.exists():
         print(f'  Файл не найден: {old_path.name}')
         return 'skipped', None
 
     if files_are_same(old_path, new_path):
-        dbg('Это один и тот же файл (samefile), меняем только регистр')
-        if DRY_RUN:
-            dbg('[DRY RUN] Пропускаю смену регистра')
+        ctx.log_debug('Это один и тот же файл (samefile), меняем только регистр')
+        if ctx.dry_run:
+            ctx.log_debug('[DRY RUN] Пропускаю смену регистра')
             return 'renamed', new_path
-        if rename_case_sensitive(old_path, new_path):
-            dbg(f'Регистр успешно изменён: {new_path.name}')
+        if rename_case_sensitive(old_path, new_path, ctx):
+            ctx.log_debug(f'Регистр успешно изменён: {new_path.name}')
             return 'renamed', new_path
-        dbg('Не удалось изменить регистр, пропускаю')
+        ctx.log_debug('Не удалось изменить регистр, пропускаю')
         return 'skipped', None
 
     if not new_path.exists():
-        if DRY_RUN:
-            dbg(f'[DRY RUN] Переименовал бы: {old_path.name} -> {new_path.name}')
+        if ctx.dry_run:
+            ctx.log_debug(f'[DRY RUN] Переименовал бы: {old_path.name} -> {new_path.name}')
             return 'renamed', new_path
         old_path.rename(new_path)
         return 'renamed', new_path
 
-    # Целевой файл уже существует — это дубликат
     return 'duplicate_exists', new_path
 
 
-def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
+def safe_rename(
+    old_path: Path, new_path: Path, ctx: SessionContext, repo: TagRepository
+) -> tuple[str, Path | None]:
     """Безопасно переименовывает файл, обрабатывая дубликаты."""
-    dbg(f'rename: {old_path.name!r} -> {new_path.name!r}')
+    ctx.log_debug(f'rename: {old_path.name!r} -> {new_path.name!r}')
 
     if not old_path.exists():
         print(f'  Файл не найден: {old_path.name}')
         return 'skipped', None
 
     if files_are_same(old_path, new_path):
-        dbg('Это один и тот же файл (samefile), меняем только регистр')
-        if DRY_RUN:
-            dbg('[DRY RUN] Пропускаю смену регистра')
+        ctx.log_debug('Это один и тот же файл (samefile), меняем только регистр')
+        if ctx.dry_run:
+            ctx.log_debug('[DRY RUN] Пропускаю смену регистра')
             return 'renamed', new_path
-        if rename_case_sensitive(old_path, new_path):
-            dbg(f'Регистр успешно изменён: {new_path.name}')
+        if rename_case_sensitive(old_path, new_path, ctx):
+            ctx.log_debug(f'Регистр успешно изменён: {new_path.name}')
             return 'renamed', new_path
-        dbg('Не удалось изменить регистр, пропускаю')
+        ctx.log_debug('Не удалось изменить регистр, пропускаю')
         return 'skipped', None
 
     if not new_path.exists():
-        if DRY_RUN:
-            dbg(f'[DRY RUN] Переименовал бы: {old_path.name} -> {new_path.name}')
+        if ctx.dry_run:
+            ctx.log_debug(f'[DRY RUN] Переименовал бы: {old_path.name} -> {new_path.name}')
             return 'renamed', new_path
         old_path.rename(new_path)
         return 'renamed', new_path
 
     # Дубликат обнаружен — решаем автоматически
-    old_tags = read_audio_tags(old_path)
-    existing_tags = read_audio_tags(new_path)
+    old_tags = repo.get_tags(old_path)
+    existing_tags = repo.get_tags(new_path)
 
     tags_match = (
         old_tags
         and existing_tags
-        and old_tags[0].lower().strip() == existing_tags[0].lower().strip()
-        and old_tags[1].lower().strip() == existing_tags[1].lower().strip()
+        and old_tags.artist.lower().strip() == existing_tags.artist.lower().strip()
+        and old_tags.title.lower().strip() == existing_tags.title.lower().strip()
     )
 
     old_info = file_info_line(old_path)
     existing_info = file_info_line(new_path)
 
-    # Определяем лучший файл по размеру и качеству имени
     old_score = (old_path.stat().st_size, name_quality_score(old_path))
     new_score = (new_path.stat().st_size, name_quality_score(new_path))
 
@@ -786,24 +704,26 @@ def safe_rename(old_path: Path, new_path: Path) -> tuple[str, Path | None]:
         print(f'      Оставляю: {old_path.name} ({old_info})')
         print(f'      Удаляю:   {new_path.name} ({existing_info})')
 
-        if DRY_RUN:
-            dbg('[DRY RUN] Удалил бы дубликат')
+        if ctx.dry_run:
+            ctx.log_debug('[DRY RUN] Удалил бы дубликат')
             return 'skipped', None
 
         if not safe_unlink(new_path):
             return 'skipped', None
         old_path.rename(new_path)
+        repo.invalidate(new_path)  # Инвалидируем кэш для нового пути
         return 'renamed', new_path
     else:
         print(f'      Оставляю: {new_path.name} ({existing_info})')
         print(f'      Удаляю:   {old_path.name} ({old_info})')
 
-        if DRY_RUN:
-            dbg('[DRY RUN] Удалил бы старый файл')
+        if ctx.dry_run:
+            ctx.log_debug('[DRY RUN] Удалил бы старый файл')
             return 'skipped', None
 
         if not safe_unlink(old_path):
             return 'skipped', None
+        repo.invalidate(old_path)
         return 'kept_existing', new_path
 
 
@@ -811,22 +731,22 @@ def handle_rename_result(
     status: str,
     old_path: Path,
     result_path: Path | None,
-    stats: dict[str, int],
+    ctx: SessionContext,
     stat_key: str,
 ) -> Path | None:
     """Обрабатывает результат safe_rename и обновляет статистику."""
     if status == 'renamed':
-        dbg(f'Переименован: {old_path.name} -> {result_path.name}')
-        stats[stat_key] += 1
+        ctx.log_debug(f'Переименован: {old_path.name} -> {result_path.name}')
+        ctx.increment_stat(stat_key)
         return result_path
     if status == 'kept_existing':
-        dbg(
+        ctx.log_debug(
             f'Текущий файл удалён как дубликат: {old_path.name} '
             f'(файл {result_path.name} оставлен без изменений)'
         )
-        stats[stat_key] += 1
+        ctx.increment_stat(stat_key)
         return result_path
-    dbg(f'Пропущен: {old_path.name}')
+    ctx.log_debug(f'Пропущен: {old_path.name}')
     return old_path
 
 
@@ -854,20 +774,16 @@ def select_indices(items: list[str], description: str) -> list[int]:
         return list(range(len(items)))
 
 
-def find_duplicates(files: list[Path]) -> list[list[Path]]:
-    """Находит дубликаты файлов по тегам и нормализованным именам.
-
-    Использует нормализацию Unicode для обнаружения "почти одинаковых" песен
-    (например, 'Voila' и 'Voilà').
-    """
-    tag_map = {}
+def find_duplicates(files: list[Path], repo: TagRepository) -> list[list[Path]]:
+    """Находит дубликаты файлов по тегам и нормализованным именам."""
+    tag_map: dict[tuple[str, str, str], list[Path]] = {}
     for f in files:
-        tags = read_audio_tags(f)
+        tags = repo.get_tags(f)
         normalized_name = normalize_filename_stem(f.stem).lower()
 
         if tags:
-            artist_norm = normalize_unicode(tags[0]).lower().strip()
-            title_norm = normalize_unicode(tags[1]).lower().strip()
+            artist_norm = normalize_unicode(tags.artist).lower().strip()
+            title_norm = normalize_unicode(tags.title).lower().strip()
             key = (artist_norm, title_norm, 'tags')
         else:
             name_norm = normalize_unicode(normalized_name)
@@ -881,18 +797,14 @@ def find_duplicates(files: list[Path]) -> list[list[Path]]:
 
 
 def find_artist_variations(
-    files: list[Path],
+    files: list[Path], repo: TagRepository
 ) -> dict[str, list[tuple[Path, str, str]]]:
-    """Находит разные варианты написания одного исполнителя.
-
-    Возвращает: {ключ: [(файл, полный_артист, индивидуальный_артист), ...]}
-    """
-    artist_map = {}
+    """Находит разные варианты написания одного исполнителя."""
+    artist_map: dict[str, list[tuple[Path, str, str]]] = {}
     for f in files:
-        tags = read_audio_tags(f)
+        tags = repo.get_tags(f)
         if tags:
-            full_artist = tags[0].strip()
-            # Разбиваем на отдельных артистов
+            full_artist = tags.artist.strip()
             individual_artists = [a.strip() for a in re.split(r'\s*[,;]\s*', full_artist)]
 
             for artist in individual_artists:
@@ -901,11 +813,10 @@ def find_artist_variations(
                 key = artist.lower()
                 if key not in artist_map:
                     artist_map[key] = []
-                # Проверяем, что ещё не добавляли этот файл для этого артиста
                 if not any(files_are_same(existing_f, f) for existing_f, _, _ in artist_map[key]):
                     artist_map[key].append((f, full_artist, artist))
 
-    variations = {}
+    variations: dict[str, list[tuple[Path, str, str]]] = {}
     for key, entries in artist_map.items():
         unique_artists = set(individual_artist for _, _, individual_artist in entries)
         if len(unique_artists) > 1:
@@ -916,9 +827,10 @@ def find_artist_variations(
 def process_rename_batch(
     files: list[Path],
     candidates: list[Path],
-    transform,
+    transform: Callable[[str], str],
     description: str,
-    stats: dict[str, int],
+    ctx: SessionContext,
+    repo: TagRepository,
     stat_key: str,
 ) -> list[Path]:
     """Универсальная обработка пакета переименований."""
@@ -931,28 +843,28 @@ def process_rename_batch(
     for f in files:
         if f in chosen:
             new_path = f.with_name(transform(f.stem) + f.suffix)
-            status, result_path = safe_rename(f, new_path)
-            result = handle_rename_result(status, f, result_path, stats, stat_key)
+            status, result_path = safe_rename(f, new_path, ctx, repo)
+            result = handle_rename_result(status, f, result_path, ctx, stat_key)
             new_files.append(result)
         else:
             new_files.append(f)
 
-    if stats[stat_key] > 0:
-        print(f'  Обработано файлов: {stats[stat_key]}')
+    if ctx.stats.get(stat_key, 0) > 0:
+        print(f'  Обработано файлов: {ctx.stats[stat_key]}')
 
     return new_files
 
 
-def process_tag_junk_cleaning(files: list[Path], stats: dict[str, int]) -> None:
+def process_tag_junk_cleaning(files: list[Path], ctx: SessionContext, repo: TagRepository) -> None:
     """Очищает мусор из тегов исполнителя и названия."""
     candidates = []
     for f in files:
         if not f.exists():
             continue
-        tags = read_audio_tags(f)
+        tags = repo.get_tags(f)
         if not tags:
             continue
-        artist, title = tags
+        artist, title = tags.artist, tags.title
         new_artist = remove_junk(str(artist))
         new_title = remove_junk(str(title))
         if new_artist != artist or new_title != title:
@@ -978,31 +890,31 @@ def process_tag_junk_cleaning(files: list[Path], stats: dict[str, int]) -> None:
     cleaned_count = 0
     for i in idx:
         f, _, _, new_artist, new_title = candidates[i]
-        if DRY_RUN:
-            dbg(f'[DRY RUN] Очистил бы теги: {f.name}')
+        if ctx.dry_run:
+            ctx.log_debug(f'[DRY RUN] Очистил бы теги: {f.name}')
             cleaned_count += 1
-        elif write_audio_tags(f, new_artist, new_title):
+        elif repo.update_tags(f, new_artist, new_title):
             print(f'  Теги очищены: {f.name}')
             cleaned_count += 1
 
     if cleaned_count:
-        stats['tags_cleaned'] = cleaned_count
+        ctx.stats['tags_cleaned'] = cleaned_count
         print(f'  Очищено тегов: {cleaned_count}')
 
 
-def process_duplicates(files: list[Path], stats: dict[str, int]) -> list[Path]:
+def process_duplicates(files: list[Path], ctx: SessionContext, repo: TagRepository) -> list[Path]:
     """Обрабатывает группы дубликатов с умным объединением имён.
 
     Сначала показывает все группы с планом действий,
     потом один раз спрашивает, какие обработать.
     """
-    duplicates = find_duplicates(files)
+    duplicates = find_duplicates(files, repo)
     if not duplicates:
         print('  Дубликатов не найдено.')
         return files
 
     # Собираем план действий для каждой группы
-    plans = []
+    plans: list[dict[str, Any]] = []
     for group in duplicates:
         sorted_group = sorted(group, key=lambda p: p.stat().st_size, reverse=True)
         best_name_file = get_best_name_from_group(group)
@@ -1061,8 +973,8 @@ def process_duplicates(files: list[Path], stats: dict[str, int]) -> list[Path]:
     for i in idx:
         plan = plans[i]
 
-        if DRY_RUN:
-            dbg(f'[DRY RUN] Обработал бы группу: {plan["keep"].name}')
+        if ctx.dry_run:
+            ctx.log_debug(f'[DRY RUN] Обработал бы группу: {plan["keep"].name}')
             processed_count += 1
             continue
 
@@ -1070,7 +982,7 @@ def process_duplicates(files: list[Path], stats: dict[str, int]) -> list[Path]:
         for f in plan['delete']:
             if safe_unlink(f):
                 print(f'  Удалён: {f.name}')
-                stats['duplicates_removed'] += 1
+                ctx.stats['duplicates_removed'] += 1
 
         # Переименовываем в лучшее имя, если нужно
         if plan['needs_rename']:
@@ -1091,7 +1003,7 @@ def process_duplicates(files: list[Path], stats: dict[str, int]) -> list[Path]:
 
 def categorize_annotations(annotations: dict[str, list[Path]]) -> dict[str, dict]:
     """Группирует уточнения по категориям."""
-    categories = {
+    categories: dict[str, dict[str, Any]] = {
         'remaster': {
             'name': 'Ремастеринг',
             'pattern': re.compile(r'(?:remaster|remastered|remix)', re.I),
@@ -1131,28 +1043,21 @@ def categorize_annotations(annotations: dict[str, list[Path]]) -> dict[str, dict
 
 
 def collect_invalid_filename_files(
-    files: list[Path],
+    files: list[Path], repo: TagRepository
 ) -> dict[str, list[tuple[Path, str, str]]]:
-    """Собирает файлы с недопустимыми символами и группирует их.
-
-    Возвращает словарь: {тип_проблемы: [(файл, текущее_имя, предлагаемое_имя), ...]}
-    Типы проблем:
-    - 'bilingual_title' - '/' в названии
-    - 'artist_name' - '/' в имени исполнителя
-    - 'other:символы' - другие недопустимые символы
-    """
-    problems = {}
+    """Собирает файлы с недопустимыми символами и группирует их."""
+    problems: dict[str, list[tuple[Path, str, str]]] = {}
 
     for f in files:
         if not f.exists():
             continue
 
-        tags = read_audio_tags(f)
+        tags = repo.get_tags(f)
         if not tags:
             continue
 
-        artist = remove_junk(str(tags[0]))
-        title = remove_junk(str(tags[1]))
+        artist = remove_junk(str(tags.artist))
+        title = remove_junk(str(tags.title))
         raw_name = f'{artist} - {title}'
         raw_name = normalize_title_spacing(raw_name)
 
@@ -1160,13 +1065,11 @@ def collect_invalid_filename_files(
         if not invalid_chars:
             continue
 
-        # Быстрая проверка: если после очистки получается текущее имя - пропускаем
         cleaned = INVALID_FILENAME_CHARS.sub('', raw_name)
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
         if f'{cleaned}{f.suffix}' == f.name:
             continue
 
-        # Определяем тип проблемы
         if '/' in invalid_chars:
             slash_type = categorize_slash_usage(raw_name)
             if slash_type == 'bilingual_title':
@@ -1176,7 +1079,6 @@ def collect_invalid_filename_files(
             else:
                 problem_key = 'other'
         else:
-            # Для других символов группируем по набору символов
             chars_str = ''.join(sorted(invalid_chars))
             problem_key = f'other:{chars_str}'
 
@@ -1387,8 +1289,14 @@ def categorize_slash_usage(raw_name: str) -> str:
 
 def main() -> None:
     """Запускает основной цикл обработки и переименования файлов."""
+    ctx = SessionContext(
+        dry_run='--dry-run' in sys.argv,
+        debug='--debug' in sys.argv,
+    )
+    repo = TagRepository()
+
     print('=== Обработчик аудиофайлов ===')
-    if DRY_RUN:
+    if ctx.dry_run:
         print('*** СУХОЙ РЕЖИМ: изменения не будут применены ***')
 
     target_dir = get_valid_path()
@@ -1402,41 +1310,27 @@ def main() -> None:
     if not files:
         return
 
-    processed_stats = {
-        'junk_removed': 0,
-        'tags_cleaned': 0,
-        'dash_normalized': 0,
-        'spaces_normalized': 0,
-        'duplicates_removed': 0,
-        'renamed_by_tags': 0,
-        'tags_written': 0,
-        'artists_normalized': 0,
-        'artists_normalized_unique': 0,
-        'manual_input': 0,
-    }
-
     # --- Шаг 1: Очистка от мусора ---
-    stage(1, 'Очистка от мусора')
+    stage(1, 'Очистка от мусора', ctx)
     junk = [f for f in files if JUNK_PATTERN.search(f.stem)]
     files = process_rename_batch(
         files,
         junk,
         remove_junk,
         'файлов с мусором (vksaver)',
-        processed_stats,
+        ctx,
+        repo,
         'junk_removed',
     )
 
-    # Подэтап 1.2: Очистка мусора из тегов
     print('\n  [Подэтап 1.2] Очистка мусора из тегов')
-    dbg('Подэтап 1.2: очистка мусора из тегов')
-    process_tag_junk_cleaning(files, processed_stats)
+    ctx.log_debug('Подэтап 1.2: очистка мусора из тегов')
+    process_tag_junk_cleaning(files, ctx, repo)
 
     # --- Шаг 2: Нормализация тире и пробелов ---
-    stage(2, 'Нормализация тире и пробелов')
+    stage(2, 'Нормализация тире и пробелов', ctx)
 
     def normalize_text(text: str) -> str:
-        """Объединяет нормализацию тире и пробелов."""
         text = normalize_dash(text)
         text = normalize_filename_stem(text)
         return text
@@ -1447,39 +1341,36 @@ def main() -> None:
         candidates,
         normalize_text,
         'файлов с нестандартными тире или лишними пробелами',
-        processed_stats,
+        ctx,
+        repo,
         'dash_normalized',
     )
 
-    # --- Шаг 4: Переименование по тегам с проверкой ---
-    stage(3, 'Переименование по тегам')
+    # --- Шаг 3: Переименование по тегам ---
+    stage(3, 'Переименование по тегам', ctx)
 
-    # --- Подэтап 4.1: Нормализация (feat. X) в тегах ---
-    print('\n  [Подэтап 4.1] Нормализация участников (feat./ft./featuring)')
+    # --- Подэтап 3.1: Нормализация (feat. X) ---
+    print('\n  [Подэтап 3.1] Нормализация участников (feat./ft./featuring)')
     print('  Приводим все вариации к единому формату: (feat. Guest)')
-    dbg('Подэтап 4.1: нормализация (feat. X)')
+    ctx.log_debug('Подэтап 3.1: нормализация (feat. X)')
     feat_candidates = []
 
     for f in files:
         if not f.exists():
             continue
-        tags = read_audio_tags(f)
+        tags = repo.get_tags(f)
         if not tags:
             continue
 
-        artist, title = tags
-        # Проверяем, есть ли feat в любом из тегов
+        artist, title = tags.artist, tags.title
         if not (FEAT_VARIANTS_PATTERN.search(artist) or FEAT_VARIANTS_PATTERN.search(title)):
             continue
 
         new_artist, new_title = normalize_feat_pair(str(artist), str(title))
-
-        # Дополнительно: удаляем гостей из Artist,
-        # если они уже указаны в Title через (feat.)
         new_artist = remove_feat_guests_from_artist(new_artist, new_title)
 
         if new_artist != artist or new_title != title:
-            new_filename = build_safe_filename(artist, title, f.suffix)
+            new_filename = build_safe_filename(new_artist, new_title, f.suffix)
             feat_candidates.append((f, artist, title, new_artist, new_title, new_filename))
 
     if feat_candidates:
@@ -1505,11 +1396,11 @@ def main() -> None:
         normalized_count = 0
         for i in idx:
             f, _, _, new_artist, new_title, _ = feat_candidates[i]
-            if DRY_RUN:
-                dbg(f'[DRY RUN] Нормализовал бы (feat.): {f.name}')
+            if ctx.dry_run:
+                ctx.log_debug(f'[DRY RUN] Нормализовал бы (feat.): {f.name}')
                 normalized_count += 1
-            elif write_audio_tags(f, new_artist, new_title):
-                dbg(f'Нормализован (feat.): {f.name}')
+            elif repo.update_tags(f, new_artist, new_title):
+                ctx.log_debug(f'Нормализован (feat.): {f.name}')
                 normalized_count += 1
 
         if normalized_count:
@@ -1517,19 +1408,19 @@ def main() -> None:
     else:
         print('  Файлов для нормализации (feat.) не найдено.')
 
-    # --- Подэтап 4.2: Нормализация разделителей исполнителей ---
-    print('\n  [Подэтап 4.2] Нормализация разделителей исполнителей')
+    # --- Подэтап 3.2: Нормализация разделителей исполнителей ---
+    print('\n  [Подэтап 3.2] Нормализация разделителей исполнителей')
     print("  Приводим все разделители к запятой с пробелом: 'Artist1, Artist2'")
-    dbg('Подэтап 4.2: нормализация разделителей исполнителей')
+    ctx.log_debug('Подэтап 3.2: нормализация разделителей исполнителей')
 
     sep_candidates = []
     for f in files:
         if not f.exists():
             continue
-        tags = read_audio_tags(f)
+        tags = repo.get_tags(f)
         if not tags:
             continue
-        artist, title = tags
+        artist, title = tags.artist, tags.title
         new_artist = normalize_artist_separators(str(artist))
         if new_artist != artist:
             sep_candidates.append((f, artist, title, new_artist))
@@ -1551,11 +1442,12 @@ def main() -> None:
         normalized_count = 0
         for i in idx:
             f, _, _, new_artist = sep_candidates[i]
-            if DRY_RUN:
-                dbg(f'[DRY RUN] Нормализовал бы разделители: {f.name}')
+            title = sep_candidates[i][2]
+            if ctx.dry_run:
+                ctx.log_debug(f'[DRY RUN] Нормализовал бы разделители: {f.name}')
                 normalized_count += 1
-            elif write_audio_tags(f, new_artist, sep_candidates[i][2]):
-                dbg(f'Нормализован (разделители): {f.name}')
+            elif repo.update_tags(f, new_artist, title):
+                ctx.log_debug(f'Нормализован (разделители): {f.name}')
                 normalized_count += 1
 
         if normalized_count:
@@ -1563,13 +1455,12 @@ def main() -> None:
     else:
         print('  Файлов для нормализации разделителей не найдено.')
 
-    # --- Подэтап 4.3: Анализ уточнений в скобках ---
-    print('\n  [Подэтап 4.3] Анализ уточнений в скобках')
+    # --- Подэтап 3.3: Анализ уточнений в скобках ---
+    print('\n  [Подэтап 3.3] Анализ уточнений в скобках')
     print('  Находим уточнения (ремастеринг, версии, саундтреки)')
     print('  и предлагаем удалить лишние из тегов.')
-    annotations = find_tag_annotations(files)
+    annotations = find_tag_annotations(files, repo)
     if annotations:
-        # Автоматически помечаем уточнения с недопустимыми символами
         problematic = [ann for ann in annotations if INVALID_FILENAME_CHARS.search(ann)]
         if problematic:
             print(
@@ -1578,28 +1469,26 @@ def main() -> None:
             )
             for ann in problematic:
                 print(f'    - ({ann})')
-            # Удаляем их без вопросов
             removed_count = 0
             for ann in problematic:
                 for f in annotations[ann]:
                     if not f.exists():
                         continue
-                    tags = read_audio_tags(f)
+                    tags = repo.get_tags(f)
                     if tags:
-                        new_title = remove_annotation_from_text(tags[1], ann)
-                        if new_title != tags[1]:
-                            if DRY_RUN:
-                                dbg(f'[DRY RUN] Автоудалил бы: ({ann}) из {f.name}')
-                            elif write_audio_tags(f, tags[0], new_title):
-                                dbg(f'Автоудалено: ({ann}) из {f.name}')
+                        new_title = remove_annotation_from_text(tags.title, ann)
+                        if new_title != tags.title:
+                            if ctx.dry_run:
+                                ctx.log_debug(f'[DRY RUN] Автоудалил бы: ({ann}) из {f.name}')
+                            elif repo.update_tags(f, tags.artist, new_title):
+                                ctx.log_debug(f'Автоудалено: ({ann}) из {f.name}')
                                 removed_count += 1
             if removed_count:
                 print(f'  Автоматически удалено: {removed_count}')
-                # Убираем их из списка для показа
                 for ann in problematic:
                     del annotations[ann]
 
-    if annotations:  # Показываем оставшиеся
+    if annotations:
         categories = categorize_annotations(annotations)
 
         print(f'\nНайдено {len(annotations)} уникальных уточнений в {len(categories)} категориях:')
@@ -1617,13 +1506,7 @@ def main() -> None:
         print('  Сокращения:      r,        s,          v,       o')
         choice = get_choice_with_default('  (y - все, n - оставить все) [y]: ', default='y')
 
-        # Маппинг сокращений на полные имена
-        shortcuts = {
-            'r': 'remaster',
-            's': 'soundtrack',
-            'v': 'version',
-            'o': 'other',
-        }
+        shortcuts = {'r': 'remaster', 's': 'soundtrack', 'v': 'version', 'o': 'other'}
 
         to_remove = set()
         if choice in ('y', 'yes', 'д', 'да'):
@@ -1632,7 +1515,6 @@ def main() -> None:
         elif choice not in ('n', 'no', 'н', 'нет', ''):
             selected_cats = [c.strip() for c in choice.split(',')]
             for cat_input in selected_cats:
-                # Пробуем сокращение
                 cat_key = shortcuts.get(cat_input, cat_input)
                 if cat_key in categories:
                     to_remove.update(categories[cat_key]['items'].keys())
@@ -1645,26 +1527,24 @@ def main() -> None:
                 for f in annotations[ann]:
                     if not f.exists():
                         continue
-                    tags = read_audio_tags(f)
+                    tags = repo.get_tags(f)
                     if tags:
-                        new_title = remove_annotation_from_text(tags[1], ann)
-                        if new_title != tags[1]:
-                            if DRY_RUN:
-                                dbg(f'[DRY RUN] Удалил бы из тега: ({ann}) из {f.name}')
-                            elif write_audio_tags(f, tags[0], new_title):
-                                dbg(f'Удалено из тега: ({ann}) из {f.name}')
+                        new_title = remove_annotation_from_text(tags.title, ann)
+                        if new_title != tags.title:
+                            if ctx.dry_run:
+                                ctx.log_debug(f'[DRY RUN] Удалил бы из тега: ({ann}) из {f.name}')
+                            elif repo.update_tags(f, tags.artist, new_title):
+                                ctx.log_debug(f'Удалено из тега: ({ann}) из {f.name}')
                                 removed_count += 1
             print(f'  Удалено уточнений из тегов: {removed_count}')
 
-    # --- Подэтап 4.4: Формирование новых имён файлов по тегам ---
-    print('\n  [Подэтап 4.4] Формирование новых имён файлов по тегам')
-    dbg('Подэтап 4.4: формирование имён из тегов')
+    # --- Подэтап 3.4: Формирование новых имён файлов по тегам ---
+    print('\n  [Подэтап 3.4] Формирование новых имён файлов по тегам')
+    ctx.log_debug('Подэтап 3.4: формирование имён из тегов')
 
-    # Предварительный сбор файлов с недопустимыми символами
     print('  Поиск файлов с недопустимыми символами...')
-    invalid_files = collect_invalid_filename_files(files)
+    invalid_files = collect_invalid_filename_files(files, repo)
 
-    # Запрашиваем стратегии для каждой группы
     strategies = {}
     if invalid_files:
         print(
@@ -1672,7 +1552,6 @@ def main() -> None:
             f'с недопустимыми символами в {len(invalid_files)} группах'
         )
 
-        # Обрабатываем группы в приоритетном порядке
         priority_order = ['bilingual_title', 'artist_name']
         other_keys = [k for k in invalid_files.keys() if k not in priority_order]
         ordered_keys = priority_order + sorted(other_keys)
@@ -1684,7 +1563,6 @@ def main() -> None:
             strategy, params = choose_strategy_for_group(problem_key, examples)
             strategies[problem_key] = (strategy, params)
 
-    # Основной цикл обработки
     safe_candidates = []
     mismatch_candidates = []
     missing = []
@@ -1694,19 +1572,18 @@ def main() -> None:
             continue
 
         file_title = extract_title_from_filename(f.stem)
-        tags = read_audio_tags(f)
-        dbg(f'Анализ: {f.name}, теги: {tags}, извлечённое название: {file_title!r}')
+        tags = repo.get_tags(f)
+        ctx.log_debug(f'Анализ: {f.name}, теги: {tags}, извлечённое название: {file_title!r}')
 
         if tags:
-            artist = remove_junk(str(tags[0]))
-            title = remove_junk(str(tags[1]))
+            artist = remove_junk(str(tags.artist))
+            title = remove_junk(str(tags.title))
             raw_name = f'{artist} - {title}'
             raw_name = normalize_title_spacing(raw_name)
             user_already_chose = False
 
             invalid_chars = set(INVALID_FILENAME_CHARS.findall(raw_name))
             if invalid_chars:
-                # Определяем тип проблемы
                 if '/' in invalid_chars:
                     slash_type = categorize_slash_usage(raw_name)
                     if slash_type == 'bilingual_title':
@@ -1719,7 +1596,6 @@ def main() -> None:
                     chars_str = ''.join(sorted(invalid_chars))
                     problem_key = f'other:{chars_str}'
 
-                # Проверяем, есть ли стратегия для этой группы
                 if problem_key in strategies:
                     strategy, params = strategies[problem_key]
 
@@ -1728,13 +1604,13 @@ def main() -> None:
                         if base_name:
                             user_already_chose = True
                         else:
-                            dbg(f'Пропущен (стратегия вернула None): {f.name}')
+                            ctx.log_debug(f'Пропущен (стратегия вернула None): {f.name}')
                             continue
                     else:
-                        dbg(f'Пропущен (стратегия skip): {f.name}')
+                        ctx.log_debug(f'Пропущен (стратегия skip): {f.name}')
                         continue
                 else:
-                    dbg(f'Пропущен (нет стратегии): {f.name}')
+                    ctx.log_debug(f'Пропущен (нет стратегии): {f.name}')
                     continue
             else:
                 base_name = raw_name
@@ -1742,10 +1618,6 @@ def main() -> None:
             new_name = f'{base_name}{f.suffix}'
 
             if new_name == f.name:
-                continue
-
-            if f.name == new_name:
-                dbg(f'Пропущен (имя уже целевое): {f.name}')
                 continue
 
             if user_already_chose or titles_match(file_title, title):
@@ -1759,23 +1631,21 @@ def main() -> None:
         labels = [f'{f.name}  ->  {new_name}' for f, new_name in safe_candidates]
         idx = select_indices(
             labels,
-            f'Найдено {len(safe_candidates)} файлов '
-            f'для переименования по тегам (названия совпадают)',
+            f'Найдено {len(safe_candidates)} файлов для переименования по тегам (названия совпадают)',
         )
 
         renamed_count = 0
-        duplicates_found = []  # [(old_path, new_path)]
+        duplicates_found = []
 
-        # Первый проход: переименовываем без обработки дубликатов
         for i in idx:
             old_path, new_name = safe_candidates[i]
             new_path = old_path.with_name(new_name)
 
-            status, result_path = simple_rename(old_path, new_path)
+            status, result_path = simple_rename(old_path, new_path, ctx)
 
             if status == 'renamed':
-                dbg(f'Переименован: {old_path.name} -> {new_path.name}')
-                processed_stats['renamed_by_tags'] += 1
+                ctx.log_debug(f'Переименован: {old_path.name} -> {new_path.name}')
+                ctx.increment_stat('renamed_by_tags')
                 renamed_count += 1
             elif status == 'duplicate_exists':
                 duplicates_found.append((old_path, new_path))
@@ -1783,7 +1653,6 @@ def main() -> None:
         if renamed_count:
             print(f'  Переименовано файлов: {renamed_count}')
 
-        # Второй проход: обрабатываем дубликаты
         if duplicates_found:
             print(f'\n  При переименовании обнаружено {len(duplicates_found)} дубликатов:')
 
@@ -1791,17 +1660,16 @@ def main() -> None:
                 old_info = file_info_line(old_path)
                 existing_info = file_info_line(new_path)
 
-                old_tags = read_audio_tags(old_path)
-                existing_tags = read_audio_tags(new_path)
+                old_tags = repo.get_tags(old_path)
+                existing_tags = repo.get_tags(new_path)
                 tags_match = (
                     old_tags
                     and existing_tags
-                    and old_tags[0].lower().strip() == existing_tags[0].lower().strip()
-                    and old_tags[1].lower().strip() == existing_tags[1].lower().strip()
+                    and old_tags.artist.lower().strip() == existing_tags.artist.lower().strip()
+                    and old_tags.title.lower().strip() == existing_tags.title.lower().strip()
                 )
                 tags_note = ' (теги совпадают)' if tags_match else ''
 
-                # Определяем лучший файл
                 old_score = (old_path.stat().st_size, name_quality_score(old_path))
                 new_score = (new_path.stat().st_size, name_quality_score(new_path))
                 best_is_old = old_score >= new_score
@@ -1830,15 +1698,8 @@ def main() -> None:
             if choice in ('', 'y', 'yes', 'д', 'да'):
                 merged_count = 0
                 for old_path, new_path in duplicates_found:
-                    # Используем safe_rename для автоматического решения
-                    status, result_path = safe_rename(old_path, new_path)
-                    handle_rename_result(
-                        status,
-                        old_path,
-                        result_path,
-                        processed_stats,
-                        'renamed_by_tags',
-                    )
+                    status, result_path = safe_rename(old_path, new_path, ctx, repo)
+                    handle_rename_result(status, old_path, result_path, ctx, 'renamed_by_tags')
                     if status in ('renamed', 'kept_existing'):
                         merged_count += 1
 
@@ -1846,34 +1707,30 @@ def main() -> None:
             else:
                 print('  Дубликаты пропущены.')
 
-    # Переформировываем mismatch_candidates с учётом изменений
     if mismatch_candidates:
-        # Фильтруем файлы, которые больше не существуют
         active_mismatch = []
         for f, file_title, old_new_name in mismatch_candidates:
             if not f.exists():
-                dbg(f'Файл {f.name} больше не существует, пропускаю')
+                ctx.log_debug(f'Файл {f.name} больше не существует, пропускаю')
                 continue
 
-            # Перечитываем теги и заново формируем new_name
-            tags = read_audio_tags(f)
+            tags = repo.get_tags(f)
             if not tags:
                 continue
 
-            artist = remove_junk(str(tags[0]))
-            title = remove_junk(str(tags[1]))
+            artist = remove_junk(str(tags.artist))
+            title = remove_junk(str(tags.title))
             current_new_name = build_safe_filename(artist, title, f.suffix)
 
-            # Проверяем, всё ещё есть ли расхождение
             if current_new_name == f.name:
-                dbg(f'Файл {f.name} уже имеет корректное имя, пропускаю')
+                ctx.log_debug(f'Файл {f.name} уже имеет корректное имя, пропускаю')
                 continue
 
-            # Заново проверяем, совпадают ли названия
             file_title = extract_title_from_filename(f.stem)
             if titles_match(file_title, title):
-                dbg(f'Файл {f.name} теперь совпадает с тегами, переношу в обычную обработку')
-                # Добавляем в safe_candidates для обработки
+                ctx.log_debug(
+                    f'Файл {f.name} теперь совпадает с тегами, переношу в обычную обработку'
+                )
                 safe_candidates.append((f, current_new_name))
                 continue
 
@@ -1882,63 +1739,60 @@ def main() -> None:
         mismatch_candidates = active_mismatch
 
     if mismatch_candidates:
-        print('\n  [Подэтап 4.5] Обработка расхождений имён и тегов')
+        print('\n  [Подэтап 3.5] Обработка расхождений имён и тегов')
         print(
             f'\n  Найдено {len(mismatch_candidates)} файлов с расхождением названий (файл vs теги):'
         )
 
-        # Категоризируем файлы
-        categorized = {
-            'A': [],  # Файлы с номерами треков
-            'B': [],  # Файлы без тире
-            'C': [],  # Файлы с feat в имени
-            'D': [],  # Проблемы с кодировкой
-            'E': [],  # Спорные случаи
+        categorized: dict[str, list] = {
+            'A': [],
+            'B': [],
+            'C': [],
+            'D': [],
+            'E': [],
         }
 
         for f, file_title, new_name in mismatch_candidates:
-            tags = read_audio_tags(f)
+            tags = repo.get_tags(f)
             if not tags:
                 continue
-            tag_artist, tag_title = tags
+            tag_artist, tag_title = tags.artist, tags.title
             category = categorize_mismatch(f, file_title, tag_title, tag_artist)
             categorized[category].append((f, file_title, new_name, tag_artist, tag_title))
 
-        # Описания категорий
         category_info = {
             'A': {
-                'name': 'Файлы с номерами треков (нет исполнителя в имени)',
-                'hint': '💡 В имени нет исполнителя, но он есть в тегах',
-                'recommendation': 'Переименовать по тегам (добавит исполнителя)',
+                'name': 'Файлы с номерами треков',
+                'hint': '💡 В имени нет исполнителя',
+                'recommendation': 'Переименовать по тегам',
                 'default_action': 't',
             },
             'B': {
-                'name': 'Файлы без тире (неправильный формат)',
-                'hint': '💡 Имя не в формате "Artist - Title", но теги правильные',
-                'recommendation': 'Переименовать по тегам (исправит формат)',
+                'name': 'Файлы без тире',
+                'hint': '💡 Имя не в формате Artist - Title',
+                'recommendation': 'Переименовать по тегам',
                 'default_action': 't',
             },
             'C': {
-                'name': 'Файлы с feat в имени (нужна нормализация)',
+                'name': 'Файлы с feat в имени',
                 'hint': '💡 В имени есть "feat" вне скобок',
-                'recommendation': 'Переименовать по тегам (нормализует feat)',
+                'recommendation': 'Переименовать по тегам',
                 'default_action': 't',
             },
             'D': {
-                'name': 'Проблемы с кодировкой в тегах',
-                'hint': '💡 Теги содержат кракозябры, имя файла корректное',
-                'recommendation': 'Обновить теги из имён файлов',
+                'name': 'Проблемы с кодировкой',
+                'hint': '💡 Теги содержат кракозябры',
+                'recommendation': 'Обновить теги из имён',
                 'default_action': 'f',
             },
             'E': {
-                'name': 'Спорные случаи (требуют ручного решения)',
-                'hint': '💡 Имя и теги существенно различаются',
-                'recommendation': 'Нужно ручное решение для каждого файла',
+                'name': 'Спорные случаи',
+                'hint': '💡 Имя и теги различаются',
+                'recommendation': 'Ручное решение',
                 'default_action': None,
             },
         }
 
-        # Обрабатываем каждую категорию
         for cat_key in ['A', 'B', 'C', 'D', 'E']:
             if not categorized[cat_key]:
                 continue
@@ -1951,7 +1805,6 @@ def main() -> None:
             print(f'→ Рекомендация: {info["recommendation"]}')
             print()
 
-            # Показываем файлы
             for i, (f, file_title, new_name, tag_artist, tag_title) in enumerate(
                 categorized[cat_key], 1
             ):
@@ -1959,22 +1812,13 @@ def main() -> None:
                 print(f'  {i}. {f.name}')
 
                 if cat_key == 'D':
-                    # Для группы D показываем обновление тегов из имени
                     parsed = parse_artist_title(f.stem)
                     if parsed:
-                        # Показываем очищенные теги
                         cleaned_artist, cleaned_title = clean_extracted_tags(parsed[0], parsed[1])
                         new_tag_str = f'{cleaned_artist} - {cleaned_title}'
-                        # Если очистка изменила теги, показываем оригинал
-                        if (cleaned_artist, cleaned_title) != parsed:
-                            print('      Файл останется без изменений')
-                            print(f'      Теги: {tag_str}')
-                            print(f'      Из имени: {parsed[0]} - {parsed[1]}')
-                            print(f'         → {new_tag_str} (очищено)')
-                        else:
-                            print('      Файл останется без изменений')
-                            print(f'      Теги: {tag_str}')
-                            print(f'         → {new_tag_str}')
+                        print('      Файл останется без изменений')
+                        print(f'      Теги: {tag_str}')
+                        print(f'         → {new_tag_str}')
                     else:
                         new_tag_str = file_title or f.stem
                         print('      Файл останется без изменений')
@@ -1985,10 +1829,8 @@ def main() -> None:
                     print(f'      Теги: {tag_str}')
                     print(f'      → {new_name}')
                 else:
-                    # Для остальных групп показываем переименование
                     print(f'      → {new_name}')
 
-            # Для категорий A-D предлагаем пакетное действие
             if cat_key != 'E':
                 default = info['default_action']
                 action_name = (
@@ -2002,43 +1844,31 @@ def main() -> None:
                 )
 
                 if choice in ('', 'y', 'yes', 'д', 'да'):
-                    # Применяем ко всем файлам в группе
                     for f, file_title, new_name, tag_artist, tag_title in categorized[cat_key]:
                         if default == 't':
-                            # Переименовать по тегам
                             new_path = f.with_name(new_name)
-                            status, result_path = safe_rename(f, new_path)
-                            handle_rename_result(
-                                status,
-                                f,
-                                result_path,
-                                processed_stats,
-                                'renamed_by_tags',
-                            )
+                            status, result_path = safe_rename(f, new_path, ctx, repo)
+                            handle_rename_result(status, f, result_path, ctx, 'renamed_by_tags')
                         else:
-                            # Обновить теги из имён
                             parsed = parse_artist_title(f.stem)
                             if parsed:
-                                # Очищаем извлечённые теги
                                 cleaned_artist, cleaned_title = clean_extracted_tags(
                                     parsed[0], parsed[1]
                                 )
-                                if DRY_RUN:
-                                    dbg(f'[DRY RUN] Обновил бы теги из имени: {f.name}')
-                                elif write_audio_tags(f, cleaned_artist, cleaned_title):
-                                    dbg(f'Теги обновлены из имени: {f.name}')
-                                    processed_stats['tags_written'] += 1
+                                if ctx.dry_run:
+                                    ctx.log_debug(f'[DRY RUN] Обновил бы теги из имени: {f.name}')
+                                elif repo.update_tags(f, cleaned_artist, cleaned_title):
+                                    ctx.log_debug(f'Теги обновлены из имени: {f.name}')
+                                    ctx.increment_stat('tags_written')
                 else:
                     print(f'  Группа {cat_key} пропущена.')
 
-            # Для категории E спрашиваем по каждому файлу
             else:
                 print('\nДля каждого файла выберите действие:')
                 print('  t - использовать данные из тега (переименовать файл)')
                 print('  f - использовать данные из файла (обновить тег)')
                 print('  n - пропустить')
 
-                # Запоминаем последнее действие для использования по умолчанию
                 last_action = 'n'
 
                 for i, (f, file_title, old_new_name, tag_artist, tag_title) in enumerate(
@@ -2048,14 +1878,12 @@ def main() -> None:
                     print(f'      Файл: {file_title or "(нет)"}')
                     print(f'      Теги: {tag_artist} - {tag_title}')
 
-                    # Заново формируем new_name из текущих тегов
                     raw_name = f'{tag_artist} - {tag_title}'
                     raw_name = normalize_title_spacing(raw_name)
                     cleaned = INVALID_FILENAME_CHARS.sub('', raw_name)
                     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
                     current_new_name = f'{cleaned}{f.suffix}'
 
-                    # Показываем, что произойдёт в зависимости от ожидаемого действия
                     if last_action == 't':
                         print(f'      → Новое имя (t): {current_new_name}')
                     elif last_action == 'f':
@@ -2065,7 +1893,6 @@ def main() -> None:
                         else:
                             print(f'      → Новые теги (f): {file_title or f.stem}')
                     else:
-                        # last_action == 'n' - показываем оба варианта
                         print(f'      → Если t: {current_new_name}')
                         parsed = parse_artist_title(f.stem)
                         if parsed:
@@ -2073,32 +1900,24 @@ def main() -> None:
 
                     choice = input(f'      Действие [t/f/n] ({last_action}): ').strip().lower()
 
-                    # Если пользователь ничего не ввёл, используем последнее действие
                     if not choice:
                         choice = last_action
                         print(f'      [Использовано предыдущее действие: {choice}]')
                     else:
-                        # Обновляем последнее действие
                         last_action = choice
 
                     if choice == 't':
                         new_path = f.with_name(current_new_name)
-                        status, result_path = safe_rename(f, new_path)
-                        handle_rename_result(
-                            status,
-                            f,
-                            result_path,
-                            processed_stats,
-                            'renamed_by_tags',
-                        )
+                        status, result_path = safe_rename(f, new_path, ctx, repo)
+                        handle_rename_result(status, f, result_path, ctx, 'renamed_by_tags')
                     elif choice == 'f':
                         parsed = parse_artist_title(f.stem)
                         if parsed:
-                            if DRY_RUN:
-                                dbg(f'[DRY RUN] Обновил бы теги из имени: {f.name}')
-                            elif write_audio_tags(f, parsed[0], parsed[1]):
-                                dbg(f'Теги обновлены из имени: {f.name}')
-                                processed_stats['tags_written'] += 1
+                            if ctx.dry_run:
+                                ctx.log_debug(f'[DRY RUN] Обновил бы теги из имени: {f.name}')
+                            elif repo.update_tags(f, parsed[0], parsed[1]):
+                                ctx.log_debug(f'Теги обновлены из имени: {f.name}')
+                                ctx.increment_stat('tags_written')
                     else:
                         print(f'      Пропущен: {f.name}')
 
@@ -2108,7 +1927,7 @@ def main() -> None:
     print('=' * 60)
 
     # --- Шаг 4: Запись тегов из имени файла ---
-    stage(4, 'Запись тегов из имени файла')
+    stage(4, 'Запись тегов из имени файла', ctx)
     tags_to_write = []
 
     for f in files:
@@ -2116,7 +1935,7 @@ def main() -> None:
             continue
         parsed = parse_artist_title(f.stem)
         if parsed:
-            tags = read_audio_tags(f)
+            tags = repo.get_tags(f)
             if not tags:
                 artist, title = parsed
                 artist = remove_junk(artist)
@@ -2127,7 +1946,6 @@ def main() -> None:
                 tags_to_write.append((f, artist, title))
 
     if tags_to_write:
-        # СНАЧАЛА: проверяем уточнения и предлагаем их удалить
         bracket_pattern = re.compile(r'[\(\[]([^\)\]]+)[\)\]]')
         files_with_annotations = []
 
@@ -2137,7 +1955,6 @@ def main() -> None:
             if real_matches:
                 files_with_annotations.append((i, f, artist, title, real_matches))
 
-        # Удаляем уточнения ДО записи тегов
         if files_with_annotations:
             print(
                 f'\n  Внимание: {len(files_with_annotations)} файлов содержат уточнения в скобках:'
@@ -2149,18 +1966,15 @@ def main() -> None:
             choice = input('\n  Удалить уточнения из тегов и имён? (y/n) [y]: ').strip().lower()
 
             if choice in ('', 'y', 'yes', 'д', 'да'):
-                # Модифицируем tags_to_write in-place
                 for i, f, artist, title, matches in files_with_annotations:
                     new_title = title
                     for ann in matches:
                         new_title = remove_annotation_from_text(new_title, ann)
-                    # Обновляем в общем списке
                     tags_to_write[i] = (f, artist, new_title)
                 print('  Уточнения будут удалены перед записью.')
             else:
                 print('  Уточнения будут сохранены.')
 
-        # ПОТОМ: показываем список с уже очищенными данными
         labels = []
         for c in tags_to_write:
             f, artist, title = c
@@ -2173,8 +1987,7 @@ def main() -> None:
 
         idx = select_indices(
             labels,
-            f'Найдено {len(tags_to_write)} файлов с корректным именем, '
-            f'но без тегов. Записать теги?',
+            f'Найдено {len(tags_to_write)} файлов с корректным именем, но без тегов. Записать теги?',
         )
 
         written_count = 0
@@ -2183,25 +1996,23 @@ def main() -> None:
         for i in idx:
             f, artist, title = tags_to_write[i]
 
-            if DRY_RUN:
-                dbg(f'[DRY RUN] Записал бы теги: {f.name}')
+            if ctx.dry_run:
+                ctx.log_debug(f'[DRY RUN] Записал бы теги: {f.name}')
+                repo._cache[f] = AudioTags(artist, title)
                 written_count += 1
-                continue
+            else:
+                if repo.update_tags(f, artist, title):
+                    ctx.log_debug(f'Записаны теги: {f.name}')
+                    ctx.increment_stat('tags_written')
+                    written_count += 1
+                    new_filename = build_safe_filename(artist, title, f.suffix)
 
-            # Записываем (возможно, уже очищенные) теги
-            if write_audio_tags(f, artist, title):
-                dbg(f'Записаны теги: {f.name}')
-                processed_stats['tags_written'] += 1
-                written_count += 1
-                new_filename = build_safe_filename(artist, title, f.suffix)
-
-                # Переименовываем, если имя отличается
-                if new_filename != f.name:
-                    new_path = f.with_name(new_filename)
-                    status, result_path = safe_rename(f, new_path)
-                    if status in ('renamed', 'kept_existing'):
-                        renamed_count += 1
-                        processed_stats['renamed_by_tags'] += 1
+                    if new_filename != f.name:
+                        new_path = f.with_name(new_filename)
+                        status, result_path = safe_rename(f, new_path, ctx, repo)
+                        if status in ('renamed', 'kept_existing'):
+                            renamed_count += 1
+                            ctx.increment_stat('renamed_by_tags')
 
         if written_count:
             print(f'  Записано тегов: {written_count}')
@@ -2209,23 +2020,22 @@ def main() -> None:
             print(f'  Переименовано файлов: {renamed_count}')
 
     # --- Шаг 5: Поиск дубликатов ---
-    stage(5, 'Поиск и объединение дубликатов')
+    stage(5, 'Поиск и объединение дубликатов', ctx)
     files = get_audio_files(target_dir)
-    files = process_duplicates(files, processed_stats)
+    files = process_duplicates(files, ctx, repo)
 
     # --- Шаг 6: Нормализация имён исполнителей ---
-    stage(6, 'Нормализация имён исполнителей')
-    # Пересканируем директорию, чтобы учесть все изменения
+    stage(6, 'Нормализация имён исполнителей', ctx)
     files = get_audio_files(target_dir)
-    dbg(f'Пересканировано файлов перед этапом 6: {len(files)}')
-    artist_variations = find_artist_variations(files)
+    ctx.log_debug(f'Пересканировано файлов перед этапом 6: {len(files)}')
+    artist_variations = find_artist_variations(files, repo)
 
-    unique_normalized = set()  # Для подсчёта уникальных исполнителей
+    unique_normalized = set()
 
     if artist_variations:
         print(f'\nНайдено {len(artist_variations)} исполнителей с разными вариантами написания.')
         for key, entries in artist_variations.items():
-            artist_counts = {}
+            artist_counts: dict[str, int] = {}
             for _, _, individual_artist in entries:
                 artist_counts[individual_artist] = artist_counts.get(individual_artist, 0) + 1
 
@@ -2254,20 +2064,17 @@ def main() -> None:
                     selected_idx = 0
 
             canonical = sorted_artists[selected_idx][0]
-            dbg(f'Обрабатываю исполнителя {key!r}, канонический вариант: {canonical!r}')
+            ctx.log_debug(f'Обрабатываю исполнителя {key!r}, канонический вариант: {canonical!r}')
 
-            # Обрабатываем файлы
-            processed_files = set()  # Чтобы не обрабатывать один файл дважды
+            processed_files: set[Path] = set()
             for f, full_artist, individual_artist in entries:
                 if not f.exists():
-                    dbg(f'Файл {f.name} уже не существует, пропускаю')
+                    ctx.log_debug(f'Файл {f.name} уже не существует, пропускаю')
                     continue
-                if files_are_same(f, f) and f in processed_files:
-                    continue  # Уже обработали этот файл
+                if f in processed_files:
+                    continue
 
                 if individual_artist != canonical:
-                    # Заменяем individual_artist на canonical в full_artist
-                    # Используем word boundaries для точной замены
                     new_full_artist = re.sub(
                         r'\b' + re.escape(individual_artist) + r'\b',
                         canonical,
@@ -2275,66 +2082,54 @@ def main() -> None:
                         flags=re.IGNORECASE,
                     )
 
-                    tags = read_audio_tags(f)
+                    tags = repo.get_tags(f)
                     if tags:
-                        if DRY_RUN:
+                        if ctx.dry_run:
                             print(
-                                f'  [DRY RUN] Обновил бы тег: {f.name} '
-                                f'({full_artist} -> {new_full_artist})'
+                                f'  [DRY RUN] Обновил бы тег: {f.name} ({full_artist} -> {new_full_artist})'
                             )
-                        elif write_audio_tags(f, new_full_artist, tags[1]):
-                            dbg(f'Обновлено: {f.name} ({full_artist} -> {new_full_artist})')
-                            processed_stats['artists_normalized'] += 1
+                        elif repo.update_tags(f, new_full_artist, tags.title):
+                            ctx.log_debug(
+                                f'Обновлено: {f.name} ({full_artist} -> {new_full_artist})'
+                            )
+                            ctx.increment_stat('artists_normalized')
                             unique_normalized.add(key)
 
-                    # Обновляем имя файла
                     parsed = parse_artist_title(f.stem)
                     if parsed and parsed[0] != new_full_artist:
                         raw_name = f'{new_full_artist} - {parsed[1]}'
 
                         if INVALID_FILENAME_CHARS.search(raw_name):
-                            base_name = clean_filename_safely(raw_name, f.name)
+                            base_name = clean_filename_safely(raw_name, f.name, ctx)
                             if base_name == 'SKIP':
-                                dbg(f'Пропущен из-за недопустимых символов: {f.name}')
+                                ctx.log_debug(f'Пропущен из-за недопустимых символов: {f.name}')
                                 continue
                         else:
                             base_name = raw_name
 
                         new_name = f'{base_name}{f.suffix}'
                         new_path = f.with_name(new_name)
-                        status, result_path = safe_rename(f, new_path)
-                        handle_rename_result(
-                            status,
-                            f,
-                            result_path,
-                            processed_stats,
-                            'renamed_by_tags',
-                        )
+                        status, result_path = safe_rename(f, new_path, ctx, repo)
+                        handle_rename_result(status, f, result_path, ctx, 'renamed_by_tags')
 
                     processed_files.add(f)
 
-        # Обновляем статистику уникальных исполнителей
-        processed_stats['artists_normalized_unique'] = len(unique_normalized)
+        ctx.stats['artists_normalized_unique'] = len(unique_normalized)
 
     # --- Шаг 7: Ручной ввод для файлов без метаданных ---
-    stage(7, 'Ручной ввод для файлов без метаданных')
+    stage(7, 'Ручной ввод для файлов без метаданных', ctx)
 
-    # Пересканируем директорию
     files = get_audio_files(target_dir)
-
     still_missing = []
 
-    # После Этапа 6 у некоторых файлов могли появиться теги —
-    # их не нужно обрабатывать вручную
-    actually_missing = [f for f in missing if f.exists() and read_audio_tags(f) is None]
-    dbg(f'Файлов без тегов после Этапа 6: {len(actually_missing)} (было {len(missing)})')
+    actually_missing = [f for f in missing if f.exists() and repo.get_tags(f) is None]
+    ctx.log_debug(f'Файлов без тегов после Этапа 6: {len(actually_missing)} (было {len(missing)})')
 
     if actually_missing:
         labels = [f.name for f in actually_missing]
         idx = select_indices(
             labels,
-            f'Найдено {len(actually_missing)} файлов без тегов и формата. '
-            f'Ввести исполнителя вручную?',
+            f'Найдено {len(actually_missing)} файлов без тегов и формата. Ввести исполнителя вручную?',
         )
         for i in idx:
             f = actually_missing[i]
@@ -2351,41 +2146,34 @@ def main() -> None:
             raw_name = f'{artist} - {title}'
 
             if INVALID_FILENAME_CHARS.search(raw_name):
-                base_name = clean_filename_safely(raw_name, f.name)
+                base_name = clean_filename_safely(raw_name, f.name, ctx)
                 if base_name == 'SKIP':
                     print(f'  Оставлен без изменений: {f.name}')
-                    # Не добавляем в still_missing, файл просто пропускается
                     continue
             else:
                 base_name = raw_name
 
             new_name = f'{base_name}{f.suffix}'
             new_path = f.with_name(new_name)
-            status, result_path = safe_rename(f, new_path)
-            handle_rename_result(
-                status,
-                f,
-                result_path,
-                processed_stats,
-                'manual_input',
-            )
+            status, result_path = safe_rename(f, new_path, ctx, repo)
+            handle_rename_result(status, f, result_path, ctx, 'manual_input')
 
     # --- Финальная статистика ---
     print('\n' + '=' * 60)
     print('=== Статистика обработки ===')
     print('=' * 60)
-    print(f'Очистка от мусора (имена): {processed_stats["junk_removed"]}')
-    print(f'Очистка от мусора (теги): {processed_stats["tags_cleaned"]}')
-    print(f'Нормализация тире и пробелов: {processed_stats["dash_normalized"]}')
-    print(f'Удалено дубликатов: {processed_stats["duplicates_removed"]}')
-    print(f'Переименовано по тегам: {processed_stats["renamed_by_tags"]}')
-    print(f'Записано тегов: {processed_stats["tags_written"]}')
+    print(f'Очистка от мусора (имена): {ctx.stats["junk_removed"]}')
+    print(f'Очистка от мусора (теги): {ctx.stats["tags_cleaned"]}')
+    print(f'Нормализация тире и пробелов: {ctx.stats["dash_normalized"]}')
+    print(f'Удалено дубликатов: {ctx.stats["duplicates_removed"]}')
+    print(f'Переименовано по тегам: {ctx.stats["renamed_by_tags"]}')
+    print(f'Записано тегов: {ctx.stats["tags_written"]}')
     print(
         f'Нормализовано исполнителей: '
-        f'{processed_stats["artists_normalized"]} файлов '
-        f'({processed_stats["artists_normalized_unique"]} уникальных)'
+        f'{ctx.stats["artists_normalized"]} файлов '
+        f'({ctx.stats.get("artists_normalized_unique", 0)} уникальных)'
     )
-    print(f'Ручной ввод: {processed_stats["manual_input"]}')
+    print(f'Ручной ввод: {ctx.stats["manual_input"]}')
 
     if still_missing:
         print(f'\nВнимание! {len(still_missing)} файлов осталось без метаданных:')
