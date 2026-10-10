@@ -170,3 +170,38 @@ class TagRepository:
         except (MutagenError, OSError, ValueError) as e:
             print(f'  Ошибка записи тегов: {e}')
         return False
+
+    def simulate_update_tags(self, filepath: Path, artist: str, title: str) -> None:
+        """Имитирует обновление тегов для dry-run режима.
+
+        Обновляет кэш без записи на диск, чтобы следующие этапы
+        видели "новые" теги при сухом прогоне.
+
+        Args:
+            filepath: Путь к файлу
+            artist: Новое имя исполнителя
+            title: Новое название трека
+        """
+        self._cache[filepath] = AudioTags(artist, title)
+
+    def simulate_rename(self, old_path: Path, new_path: Path) -> None:
+        """Имитирует переименование файла для dry-run режима.
+
+        Переносит кэшированные теги со старого пути на новый.
+
+        Args:
+            old_path: Старый путь к файлу
+            new_path: Новый путь к файлу
+        """
+        if old_path in self._cache:
+            self._cache[new_path] = self._cache.pop(old_path)
+
+    def simulate_unlink(self, filepath: Path) -> None:
+        """Имитирует удаление файла для dry-run режима.
+
+        Удаляет файл из кэша.
+
+        Args:
+            filepath: Путь к удаляемому файлу
+        """
+        self._cache.pop(filepath, None)

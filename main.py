@@ -622,7 +622,9 @@ def safe_unlink(filepath: Path) -> bool:
         return False
 
 
-def simple_rename(old_path: Path, new_path: Path, ctx: SessionContext) -> tuple[str, Path | None]:
+def simple_rename(
+    old_path: Path, new_path: Path, ctx: SessionContext, repo: TagRepository
+) -> tuple[str, Path | None]:
     """Простое переименование без обработки дубликатов."""
     ctx.log_debug(f'simple_rename: {old_path.name!r} -> {new_path.name!r}')
 
@@ -637,6 +639,7 @@ def simple_rename(old_path: Path, new_path: Path, ctx: SessionContext) -> tuple[
             return 'renamed', new_path
         if rename_case_sensitive(old_path, new_path, ctx):
             ctx.log_debug(f'Регистр успешно изменён: {new_path.name}')
+            repo.simulate_rename(old_path, new_path)
             return 'renamed', new_path
         ctx.log_debug('Не удалось изменить регистр, пропускаю')
         return 'skipped', None
@@ -644,8 +647,10 @@ def simple_rename(old_path: Path, new_path: Path, ctx: SessionContext) -> tuple[
     if not new_path.exists():
         if ctx.dry_run:
             ctx.log_debug(f'[DRY RUN] Переименовал бы: {old_path.name} -> {new_path.name}')
+            repo.simulate_rename(old_path, new_path)
             return 'renamed', new_path
         old_path.rename(new_path)
+        repo.simulate_rename(old_path, new_path)
         return 'renamed', new_path
 
     return 'duplicate_exists', new_path
@@ -675,8 +680,10 @@ def safe_rename(
     if not new_path.exists():
         if ctx.dry_run:
             ctx.log_debug(f'[DRY RUN] Переименовал бы: {old_path.name} -> {new_path.name}')
+            repo.simulate_rename(old_path, new_path)
             return 'renamed', new_path
         old_path.rename(new_path)
+        repo.simulate_rename(old_path, new_path)
         return 'renamed', new_path
 
     # Дубликат обнаружен — решаем автоматически
@@ -706,12 +713,15 @@ def safe_rename(
 
         if ctx.dry_run:
             ctx.log_debug('[DRY RUN] Удалил бы дубликат')
+            repo.simulate_unlink(new_path)
             return 'skipped', None
 
         if not safe_unlink(new_path):
             return 'skipped', None
+
         old_path.rename(new_path)
-        repo.invalidate(new_path)  # Инвалидируем кэш для нового пути
+        repo.simulate_unlink(new_path)
+        repo.simulate_rename(old_path, new_path)
         return 'renamed', new_path
     else:
         print(f'      Оставляю: {new_path.name} ({existing_info})')
@@ -719,11 +729,12 @@ def safe_rename(
 
         if ctx.dry_run:
             ctx.log_debug('[DRY RUN] Удалил бы старый файл')
+            repo.simulate_unlink(old_path)
             return 'skipped', None
 
         if not safe_unlink(old_path):
             return 'skipped', None
-        repo.invalidate(old_path)
+        repo.simulate_unlink(old_path)
         return 'kept_existing', new_path
 
 
@@ -892,6 +903,7 @@ def process_tag_junk_cleaning(files: list[Path], ctx: SessionContext, repo: TagR
         f, _, _, new_artist, new_title = candidates[i]
         if ctx.dry_run:
             ctx.log_debug(f'[DRY RUN] Очистил бы теги: {f.name}')
+            repo.simulate_update_tags(f, new_artist, new_title)
             cleaned_count += 1
         elif repo.update_tags(f, new_artist, new_title):
             print(f'  Теги очищены: {f.name}')
@@ -975,6 +987,15 @@ def process_duplicates(files: list[Path], ctx: SessionContext, repo: TagReposito
 
         if ctx.dry_run:
             ctx.log_debug(f'[DRY RUN] Обработал бы группу: {plan["keep"].name}')
+            for f in plan['delete']:
+                repo.simulate_unlink(f)
+                ctx.stats['duplicates_removed'] += 1
+
+            if plan['needs_rename']:
+                new_name = plan['best_name_file'].name
+                new_path = plan['keep'].with_name(new_name)
+                repo.simulate_rename(plan['keep'], new_path)
+
             processed_count += 1
             continue
 
@@ -982,13 +1003,14 @@ def process_duplicates(files: list[Path], ctx: SessionContext, repo: TagReposito
         for f in plan['delete']:
             if safe_unlink(f):
                 print(f'  Удалён: {f.name}')
+                repo.simulate_unlink(f)
                 ctx.stats['duplicates_removed'] += 1
 
         # Переименовываем в лучшее имя, если нужно
         if plan['needs_rename']:
             new_name = plan['best_name_file'].name
             new_path = plan['keep'].with_name(new_name)
-            status, result_path = safe_rename(plan['keep'], new_path)
+            status, result_path = safe_rename(plan['keep'], new_path, ctx, repo)
             if status == 'renamed':
                 print(f'  Переименован в лучшее имя: {plan["keep"].name} → {result_path.name}')
             elif status == 'kept_existing':
@@ -1398,6 +1420,7 @@ def main() -> None:
             f, _, _, new_artist, new_title, _ = feat_candidates[i]
             if ctx.dry_run:
                 ctx.log_debug(f'[DRY RUN] Нормализовал бы (feat.): {f.name}')
+                repo.simulate_update_tags(f, new_artist, new_title)
                 normalized_count += 1
             elif repo.update_tags(f, new_artist, new_title):
                 ctx.log_debug(f'Нормализован (feat.): {f.name}')
@@ -1445,6 +1468,7 @@ def main() -> None:
             title = sep_candidates[i][2]
             if ctx.dry_run:
                 ctx.log_debug(f'[DRY RUN] Нормализовал бы разделители: {f.name}')
+                repo.simulate_update_tags(f, new_artist, title)
                 normalized_count += 1
             elif repo.update_tags(f, new_artist, title):
                 ctx.log_debug(f'Нормализован (разделители): {f.name}')
@@ -1469,6 +1493,7 @@ def main() -> None:
             )
             for ann in problematic:
                 print(f'    - ({ann})')
+
             removed_count = 0
             for ann in problematic:
                 for f in annotations[ann]:
@@ -1480,6 +1505,8 @@ def main() -> None:
                         if new_title != tags.title:
                             if ctx.dry_run:
                                 ctx.log_debug(f'[DRY RUN] Автоудалил бы: ({ann}) из {f.name}')
+                                repo.simulate_update_tags(f, tags.artist, new_title)
+                                removed_count += 1
                             elif repo.update_tags(f, tags.artist, new_title):
                                 ctx.log_debug(f'Автоудалено: ({ann}) из {f.name}')
                                 removed_count += 1
@@ -1533,6 +1560,8 @@ def main() -> None:
                         if new_title != tags.title:
                             if ctx.dry_run:
                                 ctx.log_debug(f'[DRY RUN] Удалил бы из тега: ({ann}) из {f.name}')
+                                repo.simulate_update_tags(f, tags.artist, new_title)
+                                removed_count += 1
                             elif repo.update_tags(f, tags.artist, new_title):
                                 ctx.log_debug(f'Удалено из тега: ({ann}) из {f.name}')
                                 removed_count += 1
@@ -1641,7 +1670,7 @@ def main() -> None:
             old_path, new_name = safe_candidates[i]
             new_path = old_path.with_name(new_name)
 
-            status, result_path = simple_rename(old_path, new_path, ctx)
+            status, result_path = simple_rename(old_path, new_path, ctx, repo)
 
             if status == 'renamed':
                 ctx.log_debug(f'Переименован: {old_path.name} -> {new_path.name}')
@@ -1857,6 +1886,8 @@ def main() -> None:
                                 )
                                 if ctx.dry_run:
                                     ctx.log_debug(f'[DRY RUN] Обновил бы теги из имени: {f.name}')
+                                    repo.simulate_update_tags(f, cleaned_artist, cleaned_title)
+                                    ctx.increment_stat('tags_written')
                                 elif repo.update_tags(f, cleaned_artist, cleaned_title):
                                     ctx.log_debug(f'Теги обновлены из имени: {f.name}')
                                     ctx.increment_stat('tags_written')
@@ -1915,6 +1946,8 @@ def main() -> None:
                         if parsed:
                             if ctx.dry_run:
                                 ctx.log_debug(f'[DRY RUN] Обновил бы теги из имени: {f.name}')
+                                repo.simulate_update_tags(f, parsed[0], parsed[1])
+                                ctx.increment_stat('tags_written')
                             elif repo.update_tags(f, parsed[0], parsed[1]):
                                 ctx.log_debug(f'Теги обновлены из имени: {f.name}')
                                 ctx.increment_stat('tags_written')
@@ -1998,7 +2031,7 @@ def main() -> None:
 
             if ctx.dry_run:
                 ctx.log_debug(f'[DRY RUN] Записал бы теги: {f.name}')
-                repo._cache[f] = AudioTags(artist, title)
+                repo.simulate_update_tags(f, artist, title)
                 written_count += 1
             else:
                 if repo.update_tags(f, artist, title):
@@ -2088,6 +2121,9 @@ def main() -> None:
                             print(
                                 f'  [DRY RUN] Обновил бы тег: {f.name} ({full_artist} -> {new_full_artist})'
                             )
+                            repo.simulate_update_tags(f, new_full_artist, tags.title)
+                            ctx.increment_stat('artists_normalized')
+                            unique_normalized.add(key)
                         elif repo.update_tags(f, new_full_artist, tags.title):
                             ctx.log_debug(
                                 f'Обновлено: {f.name} ({full_artist} -> {new_full_artist})'
