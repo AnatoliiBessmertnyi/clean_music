@@ -1,8 +1,9 @@
 import re
 import sys
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from mutagen.asf import ASF
 from mutagen.flac import FLAC
@@ -20,6 +21,7 @@ from config import (
     TOTAL_STAGES,
 )
 from context import SessionContext
+from interactor import ConsoleInteractor
 from naming import (
     build_safe_filename,
     normalize_dash,
@@ -34,6 +36,7 @@ from parsing import (
     extract_title_from_filename,
     parse_artist_title,
 )
+from strategies import StrategyFactory
 from tag_repository import AudioTags, TagRepository
 
 
@@ -48,15 +51,6 @@ def show_progress(current: int, total: int, prefix: str = '') -> None:
     print(f'\r{prefix}{current}/{total} [{bar}] {percent:.0f}%', end='', flush=True)
     if current == total:
         print()
-
-
-def get_choice_with_default(prompt: str, default: str = '1') -> str:
-    """Запрашивает выбор у пользователя и помечает выбор по умолчанию."""
-    choice = input(prompt).strip().lower()
-    if not choice:
-        print(f'  [Выбран вариант {default} по умолчанию]')
-        return default
-    return choice
 
 
 def has_encoding_issues(text: str) -> bool:
@@ -98,7 +92,7 @@ def categorize_mismatch(filepath: Path, file_title: str, tag_title: str, tag_art
 
 
 def sanitize_filename_interactive(
-    name: str, current_filename: str, ctx: SessionContext
+    name: str, current_filename: str, ctx: SessionContext, interactor: ConsoleInteractor
 ) -> str | None:
     """Интерактивно очищает имя файла от недопустимых символов."""
     invalid_chars = set(INVALID_FILENAME_CHARS.findall(name))
@@ -199,7 +193,7 @@ def sanitize_filename_interactive(
                 f"Нажмите 'a', чтобы запомнить.]"
             )
 
-    choice = get_choice_with_default('  Выберите вариант [1]: ', default='1')
+    choice = interactor.prompt('  Выберите вариант [1]: ', default='1')
 
     # Обработка "запомнить для всех"
     if choice == 'a':
@@ -230,12 +224,14 @@ def sanitize_filename_interactive(
     return 'SKIP'
 
 
-def clean_filename_safely(raw_name: str, current_filename: str, ctx: SessionContext) -> str | None:
+def clean_filename_safely(
+    raw_name: str, current_filename: str, ctx: SessionContext, interactor: ConsoleInteractor
+) -> str | None:
     """Очищает имя файла с проверкой недопустимых символов."""
     if not INVALID_FILENAME_CHARS.search(raw_name):
         return raw_name
 
-    return sanitize_filename_interactive(raw_name, current_filename, ctx)
+    return sanitize_filename_interactive(raw_name, current_filename, ctx, interactor)
 
 
 def stage(number: int, name: str, ctx: SessionContext) -> None:
@@ -747,14 +743,17 @@ def handle_rename_result(
 ) -> Path | None:
     """Обрабатывает результат safe_rename и обновляет статистику."""
     if status == 'renamed':
-        ctx.log_debug(f'Переименован: {old_path.name} -> {result_path.name}')
+        if result_path:
+            ctx.log_debug(f'Переименован: {old_path.name} -> {result_path.name}')
+
         ctx.increment_stat(stat_key)
         return result_path
     if status == 'kept_existing':
-        ctx.log_debug(
-            f'Текущий файл удалён как дубликат: {old_path.name} '
-            f'(файл {result_path.name} оставлен без изменений)'
-        )
+        if result_path:
+            ctx.log_debug(
+                f'Текущий файл удалён как дубликат: {old_path.name} '
+                f'(файл {result_path.name} оставлен без изменений)'
+            )
         ctx.increment_stat(stat_key)
         return result_path
     ctx.log_debug(f'Пропущен: {old_path.name}')
@@ -856,6 +855,7 @@ def process_rename_batch(
             new_path = f.with_name(transform(f.stem) + f.suffix)
             status, result_path = safe_rename(f, new_path, ctx, repo)
             result = handle_rename_result(status, f, result_path, ctx, stat_key)
+            assert result is not None
             new_files.append(result)
         else:
             new_files.append(f)
@@ -1113,7 +1113,7 @@ def collect_invalid_filename_files(
 
 
 def choose_strategy_for_group(
-    problem_key: str, examples: list[tuple[Path, str, str]]
+    problem_key: str, examples: list[tuple[Path, str, str]], interactor: ConsoleInteractor
 ) -> tuple[str, dict]:
     """Запрашивает у пользователя стратегию обработки для группы файлов.
 
@@ -1146,9 +1146,10 @@ def choose_strategy_for_group(
     # Показываем все файлы с итоговыми именами (только один раз!)
     print()
     for i, (f, current_name, proposed_name) in enumerate(examples, 1):
-        # Применяем стратегию по умолчанию для предпросмотра
-        preview_result = apply_strategy_to_file(f, proposed_name, default_strategy, {})
-
+        strategy_obj = StrategyFactory.create(default_strategy, {}, interactor, f.name)
+        preview_result = strategy_obj.apply(
+            proposed_name, set(INVALID_FILENAME_CHARS.findall(proposed_name))
+        )
         print(f'  {i}. {current_name}')
         print(f'     {proposed_name}')
         if preview_result:
@@ -1165,7 +1166,7 @@ def choose_strategy_for_group(
         print('  3. Ввести имя вручную для каждого файла')
         print('  4. Пропустить все файлы')
 
-        choice = get_choice_with_default('  Выберите вариант [1]: ', default='1')
+        choice = interactor.prompt('  Выберите вариант [1]: ', default='1')
 
         try:
             idx = int(choice)
@@ -1186,7 +1187,7 @@ def choose_strategy_for_group(
         print('  2. Ввести имя вручную для каждого файла')
         print('  3. Пропустить все файлы')
 
-        choice = get_choice_with_default('  Выберите вариант [1]: ', default='1')
+        choice = interactor.prompt('  Выберите вариант [1]: ', default='1')
 
         try:
             idx = int(choice)
@@ -1207,7 +1208,7 @@ def choose_strategy_for_group(
         print('  3. Ввести имя вручную для каждого файла')
         print('  4. Пропустить все файлы')
 
-        choice = get_choice_with_default('  Выберите вариант [1]: ', default='1')
+        choice = interactor.prompt('  Выберите вариант [1]: ', default='1')
 
         try:
             idx = int(choice)
@@ -1222,63 +1223,6 @@ def choose_strategy_for_group(
             return ('manual', {})
         else:
             return ('skip', {})
-
-
-def apply_strategy_to_file(f: Path, raw_name: str, strategy: str, params: dict) -> str | None:
-    """Применяет выбранную стратегию к файлу и возвращает очищенное имя."""
-    invalid_chars = set(INVALID_FILENAME_CHARS.findall(raw_name))
-
-    if strategy == 'remove':
-        result = raw_name
-        for c in invalid_chars:
-            result = result.replace(c, '')
-        return re.sub(r'\s+', ' ', result).strip()
-
-    elif strategy == 'replace':
-        result = raw_name
-        for c in invalid_chars:
-            result = result.replace(c, params['char'])
-        return re.sub(r'\s+', ' ', result).strip()
-
-    elif strategy in ('first_title', 'second_title'):
-        # Извлекаем (feat. ...) отдельно
-        feat_suffix = ''
-        feat_match = re.search(r'\s*\(feat\.\s*[^)]+\)\s*$', raw_name)
-        if feat_match:
-            feat_suffix = feat_match.group(0)
-            name_without_feat = raw_name[: feat_match.start()]
-        else:
-            name_without_feat = raw_name
-
-        # Ищем паттерн "Artist - Name1 / Name2"
-        slash_match = re.search(r'^(.*?\s+-\s+)([^/]+)\s*/\s*(.+)$', name_without_feat)
-        if slash_match:
-            prefix = slash_match.group(1)
-            first_title = slash_match.group(2).strip()
-            second_title = slash_match.group(3).strip()
-
-            if strategy == 'first_title':
-                return f'{prefix}{first_title}{feat_suffix}'
-            else:
-                return f'{prefix}{second_title}{feat_suffix}'
-
-        # Если паттерн не найден, просто удаляем '/'
-        result = raw_name.replace('/', '')
-        return re.sub(r'\s+', ' ', result).strip()
-
-    elif strategy == 'manual':
-        # Ручной ввод для конкретного файла
-        print(f'\n  Файл: {f.name}')
-        print(f'  Предлагаемое: {raw_name}')
-        custom = input('  Введите имя (без расширения, пустой ввод - пропустить): ').strip()
-        if not custom:
-            return None
-        if INVALID_FILENAME_CHARS.search(custom):
-            print('  Имя содержит недопустимые символы, пропускаю.')
-            return None
-        return custom
-
-    return None
 
 
 def categorize_slash_usage(raw_name: str) -> str:
@@ -1316,6 +1260,7 @@ def main() -> None:
         debug='--debug' in sys.argv,
     )
     repo = TagRepository()
+    interactor = ConsoleInteractor()
 
     print('=== Обработчик аудиофайлов ===')
     if ctx.dry_run:
@@ -1410,13 +1355,13 @@ def main() -> None:
             if new_filename != f.name:
                 print(f'        Файл:        {new_filename}')
 
-        idx = select_indices(
+        selected_indices = select_indices(
             [f.name for f, *_ in feat_candidates],
             '\nКакие файлы нормализовать?',
         )
 
         normalized_count = 0
-        for i in idx:
+        for i in selected_indices:
             f, _, _, new_artist, new_title, _ = feat_candidates[i]
             if ctx.dry_run:
                 ctx.log_debug(f'[DRY RUN] Нормализовал бы (feat.): {f.name}')
@@ -1457,13 +1402,13 @@ def main() -> None:
             print('      СТАНЕТ:')
             print(f'        Исполнитель: {new_artist!r}')
 
-        idx = select_indices(
+        selected_indices = select_indices(
             [f.name for f, *_ in sep_candidates],
             '\nКакие файлы нормализовать?',
         )
 
         normalized_count = 0
-        for i in idx:
+        for i in selected_indices:
             f, _, _, new_artist = sep_candidates[i]
             title = sep_candidates[i][2]
             if ctx.dry_run:
@@ -1531,7 +1476,7 @@ def main() -> None:
         print('\nКакие категории удалить из тегов?')
         print('  Полные названия: remaster, soundtrack, version, other')
         print('  Сокращения:      r,        s,          v,       o')
-        choice = get_choice_with_default('  (y - все, n - оставить все) [y]: ', default='y')
+        choice = interactor.prompt('  (y - все, n - оставить все) [y]: ', default='y')
 
         shortcuts = {'r': 'remaster', 's': 'soundtrack', 'v': 'version', 'o': 'other'}
 
@@ -1589,7 +1534,7 @@ def main() -> None:
             if problem_key not in invalid_files:
                 continue
             examples = invalid_files[problem_key]
-            strategy, params = choose_strategy_for_group(problem_key, examples)
+            strategy, params = choose_strategy_for_group(problem_key, examples, interactor)
             strategies[problem_key] = (strategy, params)
 
     safe_candidates = []
@@ -1629,7 +1574,10 @@ def main() -> None:
                     strategy, params = strategies[problem_key]
 
                     if strategy != 'skip':
-                        base_name = apply_strategy_to_file(f, raw_name, strategy, params)
+                        strategy_obj = StrategyFactory.create(strategy, params, interactor, f.name)
+                        base_name = strategy_obj.apply(
+                            raw_name, set(INVALID_FILENAME_CHARS.findall(raw_name))
+                        )
                         if base_name:
                             user_already_chose = True
                         else:
@@ -1658,7 +1606,7 @@ def main() -> None:
 
     if safe_candidates:
         labels = [f'{f.name}  ->  {new_name}' for f, new_name in safe_candidates]
-        idx = select_indices(
+        selected_indices = select_indices(
             labels,
             f'Найдено {len(safe_candidates)} файлов для переименования по тегам (названия совпадают)',
         )
@@ -1666,7 +1614,7 @@ def main() -> None:
         renamed_count = 0
         duplicates_found = []
 
-        for i in idx:
+        for i in selected_indices:
             old_path, new_name = safe_candidates[i]
             new_path = old_path.with_name(new_name)
 
@@ -1773,7 +1721,7 @@ def main() -> None:
             f'\n  Найдено {len(mismatch_candidates)} файлов с расхождением названий (файл vs теги):'
         )
 
-        categorized: dict[str, list] = {
+        categorized: dict[str, list[Any]] = {
             'A': [],
             'B': [],
             'C': [],
@@ -2018,7 +1966,7 @@ def main() -> None:
             else:
                 labels.append(f'{f.name} (artist: {artist!r}, title: {title!r})')
 
-        idx = select_indices(
+        selected_indices = select_indices(
             labels,
             f'Найдено {len(tags_to_write)} файлов с корректным именем, но без тегов. Записать теги?',
         )
@@ -2026,7 +1974,7 @@ def main() -> None:
         written_count = 0
         renamed_count = 0
 
-        for i in idx:
+        for i in selected_indices:
             f, artist, title = tags_to_write[i]
 
             if ctx.dry_run:
@@ -2079,8 +2027,7 @@ def main() -> None:
             for i, (artist, count) in enumerate(sorted_artists, 1):
                 print(f'  {i}. {artist} ({count} файлов)')
 
-            choice = get_choice_with_default('Выберите номер варианта (n - пропустить) [1]: ')
-
+            choice = interactor.prompt('Выберите номер варианта (n - пропустить) [1]: ')
             if choice in ('n', 'no', 'н', 'нет'):
                 continue
 
@@ -2136,7 +2083,7 @@ def main() -> None:
                         raw_name = f'{new_full_artist} - {parsed[1]}'
 
                         if INVALID_FILENAME_CHARS.search(raw_name):
-                            base_name = clean_filename_safely(raw_name, f.name, ctx)
+                            base_name = clean_filename_safely(raw_name, f.name, ctx, interactor)
                             if base_name == 'SKIP':
                                 ctx.log_debug(f'Пропущен из-за недопустимых символов: {f.name}')
                                 continue
@@ -2163,11 +2110,11 @@ def main() -> None:
 
     if actually_missing:
         labels = [f.name for f in actually_missing]
-        idx = select_indices(
+        selected_indices = select_indices(
             labels,
             f'Найдено {len(actually_missing)} файлов без тегов и формата. Ввести исполнителя вручную?',
         )
-        for i in idx:
+        for i in selected_indices:
             f = actually_missing[i]
             if not f.exists():
                 continue
@@ -2182,7 +2129,7 @@ def main() -> None:
             raw_name = f'{artist} - {title}'
 
             if INVALID_FILENAME_CHARS.search(raw_name):
-                base_name = clean_filename_safely(raw_name, f.name, ctx)
+                base_name = clean_filename_safely(raw_name, f.name, ctx, interactor)
                 if base_name == 'SKIP':
                     print(f'  Оставлен без изменений: {f.name}')
                     continue
