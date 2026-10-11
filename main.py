@@ -3,7 +3,7 @@ import sys
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from mutagen.asf import ASF
 from mutagen.flac import FLAC
@@ -743,19 +743,20 @@ def handle_rename_result(
 ) -> Path | None:
     """Обрабатывает результат safe_rename и обновляет статистику."""
     if status == 'renamed':
-        if result_path:
+        if result_path is not None:
             ctx.log_debug(f'Переименован: {old_path.name} -> {result_path.name}')
-
         ctx.increment_stat(stat_key)
         return result_path
+
     if status == 'kept_existing':
-        if result_path:
+        if result_path is not None:
             ctx.log_debug(
                 f'Текущий файл удалён как дубликат: {old_path.name} '
                 f'(файл {result_path.name} оставлен без изменений)'
             )
         ctx.increment_stat(stat_key)
         return result_path
+
     ctx.log_debug(f'Пропущен: {old_path.name}')
     return old_path
 
@@ -949,7 +950,8 @@ def process_duplicates(files: list[Path], ctx: SessionContext, repo: TagReposito
     # Показываем все группы с планом действий
     print(f'\nНайдено {len(plans)} групп дубликатов:')
 
-    for i, plan in enumerate(plans, 1):
+    for i, raw_plan in enumerate(plans, 1):
+        plan = cast(dict[str, Any], raw_plan)
         print(f'\n  {i}. Группа из {len(plan["group"])} файлов:')
 
         for f in plan['group']:
@@ -965,25 +967,27 @@ def process_duplicates(files: list[Path], ctx: SessionContext, repo: TagReposito
 
     # Один вопрос для всех групп
     group_labels = []
-    for plan in plans:
+    for raw_plan in plans:
+        plan = cast(dict[str, Any], raw_plan)
         label = f'{plan["keep"].name}'
         if plan['needs_rename']:
             label += f' → {plan["best_name_file"].name}'
         group_labels.append(label)
 
-    idx = select_indices(
+    selected_indices = select_indices(
         group_labels,
         '\nКакие группы обработать?',
     )
 
-    if not idx:
+    if not selected_indices:
         print('  Все группы пропущены.')
         return files
 
     # Применяем выбор
     processed_count = 0
-    for i in idx:
-        plan = plans[i]
+    for i in selected_indices:
+        raw_plan = plans[i]
+        plan = cast(dict[str, Any], raw_plan)
 
         if ctx.dry_run:
             ctx.log_debug(f'[DRY RUN] Обработал бы группу: {plan["keep"].name}')
@@ -1011,15 +1015,14 @@ def process_duplicates(files: list[Path], ctx: SessionContext, repo: TagReposito
             new_name = plan['best_name_file'].name
             new_path = plan['keep'].with_name(new_name)
             status, result_path = safe_rename(plan['keep'], new_path, ctx, repo)
-            if status == 'renamed':
+            if status == 'renamed' and result_path is not None:
                 print(f'  Переименован в лучшее имя: {plan["keep"].name} → {result_path.name}')
-            elif status == 'kept_existing':
+            elif status == 'kept_existing' and result_path is not None:
                 print(f'  Оставлен существующий: {result_path.name}')
 
         processed_count += 1
 
     print(f'  Обработано групп: {processed_count}')
-
     return [f for f in files if f.exists()]
 
 
@@ -1737,7 +1740,7 @@ def main() -> None:
             category = categorize_mismatch(f, file_title, tag_title, tag_artist)
             categorized[category].append((f, file_title, new_name, tag_artist, tag_title))
 
-        category_info = {
+        category_info: dict[str, dict[str, str | None]] = {
             'A': {
                 'name': 'Файлы с номерами треков',
                 'hint': '💡 В имени нет исполнителя',
