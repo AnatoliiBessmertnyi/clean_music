@@ -65,6 +65,7 @@ def main() -> None:
         print('*** СУХОЙ РЕЖИМ: изменения не будут применены ***')
 
     target_dir = get_valid_path()
+    ctx.target_dir = target_dir
     files = get_audio_files(target_dir)
 
     total = len(files)

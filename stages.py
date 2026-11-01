@@ -8,6 +8,7 @@ from config import (
     FEAT_VARIANTS_PATTERN,
     INVALID_FILENAME_CHARS,
     JUNK_PATTERN,
+    SUPPORTED_EXTENSIONS,
 )
 from context import SessionContext
 from interactor import UserInteractor
@@ -1218,6 +1219,13 @@ class ArtistNormalizationStage:
         repo: TagRepository,
         interactor: UserInteractor,
     ) -> list[Path]:
+        if ctx.target_dir is not None:
+            files = [
+                f for f in ctx.target_dir.iterdir()
+                if f.suffix.lower() in SUPPORTED_EXTENSIONS
+            ]
+            ctx.log_debug(f'Пересканировано файлов перед этапом 6: {len(files)}')
+
         artist_variations = find_artist_variations(files, repo)
         unique_normalized: set[str] = set()
 
@@ -1328,6 +1336,13 @@ class ManualInputStage:
         repo: TagRepository,
         interactor: UserInteractor,
     ) -> list[Path]:
+        if ctx.target_dir is not None:
+            files = [
+                f for f in ctx.target_dir.iterdir()
+                if f.suffix.lower() in SUPPORTED_EXTENSIONS
+            ]
+            ctx.log_debug(f'Пересканировано файлов перед этапом 7: {len(files)}')
+
         still_missing: list[Path] = []
 
         actually_missing = [

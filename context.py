@@ -21,6 +21,7 @@ class SessionContext:
 
     dry_run: bool
     debug: bool
+    target_dir: Path | None = None
     remembered_choices: dict[frozenset[str], int] = field(default_factory=dict)
     ask_counts: dict[frozenset[str], int] = field(default_factory=dict)
     stats: dict[str, int] = field(
