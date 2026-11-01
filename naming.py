@@ -3,8 +3,12 @@
 import re
 import unicodedata
 
-from config import (ARTIST_NAME_EXCEPTIONS, FEAT_VARIANTS_PATTERN,
-                    INVALID_FILENAME_CHARS, JUNK_PATTERN)
+from config import (
+    ARTIST_NAME_EXCEPTIONS,
+    FEAT_VARIANTS_PATTERN,
+    INVALID_FILENAME_CHARS,
+    JUNK_PATTERN,
+)
 
 
 def normalize_filename_stem(stem: str) -> str:

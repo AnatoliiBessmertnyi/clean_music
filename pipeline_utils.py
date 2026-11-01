@@ -11,13 +11,11 @@ from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
 from mutagen.oggvorbis import OggVorbis
 
-from config import (FEAT_VARIANTS_PATTERN, INVALID_FILENAME_CHARS,
-                    LEADING_TRACK_PATTERN)
+from config import FEAT_VARIANTS_PATTERN, INVALID_FILENAME_CHARS, LEADING_TRACK_PATTERN
 from context import SessionContext
 from interactor import UserInteractor
-from naming import (normalize_filename_stem, normalize_title_spacing,
-                    normalize_unicode)
-from parsing import clean_extracted_tags, parse_artist_title
+from naming import normalize_filename_stem, normalize_unicode
+from parsing import parse_artist_title
 from tag_repository import TagRepository
 
 
@@ -29,12 +27,12 @@ def select_indices(items: list[str], description: str, interactor: UserInteracto
 
     prompt = '(Enter - применить ко всем / номера - ИСКЛЮЧИТЬ из обработки / n - отменить все): '
     choice = interactor.prompt(prompt, default='').strip().lower()
-    
+
     if not choice or choice in ('y', 'yes', 'д', 'да'):
         return list(range(len(items)))
     if choice in ('n', 'no', 'н', 'нет'):
         return []
-    
+
     try:
         excluded = {int(p) for p in re.split(r'[,\s]+', choice) if p}
         selected = [i for i in range(len(items)) if (i + 1) not in excluded]
@@ -159,11 +157,11 @@ def process_rename_batch(
     """Универсальная обработка пакета переименований."""
     if not candidates:
         return files
-    
+
     labels = [f'{f.name}  ->  {transform(f.stem)}{f.suffix}' for f in candidates]
     idx = select_indices(labels, f'Найдено {len(candidates)} {description}', interactor)
     chosen = {candidates[i] for i in idx}
-    
+
     new_files = []
     for f in files:
         if f in chosen:

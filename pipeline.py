@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Protocol
 
 # Импорты из уже созданных модулей вашего проекта
 from context import SessionContext
@@ -32,7 +33,7 @@ class ProcessingStage(Protocol):
     ) -> list[Path]:
         """
         Выполняет бизнес-логику конкретного этапа.
-        
+
         :param files: Текущий список файлов для обработки.
         :param ctx: Контекст сессии (содержит dry_run, пути и глобальные настройки).
         :param repo: Кэширующий репозиторий тегов.
@@ -45,7 +46,7 @@ class ProcessingStage(Protocol):
 class AudioProcessingPipeline:
     """
     Оркестратор конвейера обработки.
-    Принимает набор этапов и последовательно выполняет их, 
+    Принимает набор этапов и последовательно выполняет их,
     передавая результат (список файлов) от одного этапа к другому.
     """
 
@@ -70,10 +71,10 @@ class AudioProcessingPipeline:
             interactor.display(f'[Этап {index}/{total_stages}] {stage.name}')
             interactor.display(f'{"=" * 60}')
             ctx.log_debug(f'Начинаю этап {index}/{total_stages}: {stage.name}')
-            
+
             # Выполняем этап
             current_files = stage.execute(current_files, ctx, repo, interactor)
-            
+
             interactor.display(f'\n✅ Этап "{stage.name}" успешно завершен.')
 
         return current_files

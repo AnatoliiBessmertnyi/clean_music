@@ -4,23 +4,37 @@ import re
 from pathlib import Path
 from typing import Any
 
-from config import (ARTIST_NAME_EXCEPTIONS, FEAT_VARIANTS_PATTERN,
-                    INVALID_FILENAME_CHARS, JUNK_PATTERN)
+from config import (
+    FEAT_VARIANTS_PATTERN,
+    INVALID_FILENAME_CHARS,
+    JUNK_PATTERN,
+)
 from context import SessionContext
 from interactor import UserInteractor
-from naming import (build_safe_filename, normalize_artist_separators,
-                    normalize_dash, normalize_feat_pair,
-                    normalize_filename_stem, normalize_title_spacing,
-                    remove_annotation_from_text,
-                    remove_feat_guests_from_artist, remove_junk)
-from parsing import (clean_extracted_tags, extract_title_from_filename,
-                     parse_artist_title)
-from pipeline import ProcessingStage
-from pipeline_utils import (categorize_mismatch, clean_filename_safely,
-                            file_info_line, find_artist_variations,
-                            handle_rename_result, name_quality_score,
-                            process_duplicates, process_rename_batch,
-                            safe_rename, select_indices)
+from naming import (
+    build_safe_filename,
+    normalize_artist_separators,
+    normalize_dash,
+    normalize_feat_pair,
+    normalize_filename_stem,
+    normalize_title_spacing,
+    remove_annotation_from_text,
+    remove_feat_guests_from_artist,
+    remove_junk,
+)
+from parsing import clean_extracted_tags, extract_title_from_filename, parse_artist_title
+from pipeline_utils import (
+    categorize_mismatch,
+    clean_filename_safely,
+    file_info_line,
+    find_artist_variations,
+    handle_rename_result,
+    name_quality_score,
+    process_duplicates,
+    process_rename_batch,
+    safe_rename,
+    select_indices,
+)
 from strategies import StrategyFactory
 from tag_repository import TagRepository
 
@@ -68,11 +82,11 @@ class JunkCleaningStage:
             tags = repo.get_tags(f)
             if not tags:
                 continue
-            
+
             artist, title = str(tags.artist), str(tags.title)
             new_artist = remove_junk(artist)
             new_title = remove_junk(title)
-            
+
             if new_artist != artist or new_title != title:
                 candidates.append((f, artist, title, new_artist, new_title))
 
@@ -130,7 +144,7 @@ class NormalizationStage:
             return text
 
         candidates = [f for f in files if normalize_text(f.stem) != f.stem]
-        
+
         return process_rename_batch(
             files=files,
             candidates=candidates,
