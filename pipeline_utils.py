@@ -15,7 +15,8 @@ from config import (FEAT_VARIANTS_PATTERN, INVALID_FILENAME_CHARS,
                     LEADING_TRACK_PATTERN)
 from context import SessionContext
 from interactor import UserInteractor
-from naming import normalize_title_spacing
+from naming import (normalize_filename_stem, normalize_title_spacing,
+                    normalize_unicode)
 from parsing import clean_extracted_tags, parse_artist_title
 from tag_repository import TagRepository
 
@@ -409,3 +410,158 @@ def clean_filename_safely(
     if not INVALID_FILENAME_CHARS.search(raw_name):
         return raw_name
     return sanitize_filename_interactive(raw_name, current_filename, ctx, interactor)
+
+
+def find_duplicates(files: list[Path], repo: TagRepository) -> list[list[Path]]:
+    """Находит дубликаты файлов по тегам и нормализованным именам."""
+    tag_map: dict[tuple[str, str, str], list[Path]] = {}
+    for f in files:
+        tags = repo.get_tags(f)
+        normalized_name = normalize_filename_stem(f.stem).lower()
+
+        if tags:
+            artist_norm = normalize_unicode(tags.artist).lower().strip()
+            title_norm = normalize_unicode(tags.title).lower().strip()
+            key = (artist_norm, title_norm, 'tags')
+        else:
+            name_norm = normalize_unicode(normalized_name)
+            key = (name_norm, '', 'name')
+
+        if key not in tag_map:
+            tag_map[key] = []
+        tag_map[key].append(f)
+
+    return [group for group in tag_map.values() if len(group) > 1]
+
+
+def get_best_name_from_group(group: list[Path]) -> Path:
+    """Выбирает файл с наиболее правильным именем из группы дубликатов."""
+    return max(group, key=name_quality_score)
+
+
+def process_duplicates(
+    files: list[Path], ctx: SessionContext, repo: TagRepository, interactor: UserInteractor
+) -> list[Path]:
+    """Обрабатывает группы дубликатов с умным объединением имён."""
+    duplicates = find_duplicates(files, repo)
+    if not duplicates:
+        interactor.display('  Дубликатов не найдено.')
+        return files
+
+    plans: list[dict[str, Any]] = []
+    for group in duplicates:
+        sorted_group = sorted(group, key=lambda p: p.stat().st_size, reverse=True)
+        best_name_file = get_best_name_from_group(group)
+        keep_file = sorted_group[0]
+        files_to_delete = [f for f in sorted_group if f != keep_file]
+
+        needs_rename = keep_file != best_name_file and not files_are_same(keep_file, best_name_file)
+
+        plans.append(
+            {
+                'group': sorted_group,
+                'keep': keep_file,
+                'delete': files_to_delete,
+                'best_name_file': best_name_file,
+                'needs_rename': needs_rename,
+            }
+        )
+
+    interactor.display(f'\nНайдено {len(plans)} групп дубликатов:')
+
+    for i, plan in enumerate(plans, 1):
+        interactor.display(f'\n  {i}. Группа из {len(plan["group"])} файлов:')
+
+        for f in plan['group']:
+            info = file_info_line(f)
+            marker = ' [оставить]' if files_are_same(f, plan['keep']) else ' [удалить]'
+            interactor.display(f'      {f.name} ({info}){marker}')
+
+        if plan['needs_rename']:
+            final_name = plan['best_name_file'].name
+            interactor.display(f'      Итог:     {plan["keep"].name} → {final_name}')
+        else:
+            interactor.display('      Итог:     без переименования')
+
+    group_labels: list[str] = []
+    for plan in plans:
+        label = f'{plan["keep"].name}'
+        if plan['needs_rename']:
+            label += f' → {plan["best_name_file"].name}'
+        group_labels.append(label)
+
+    selected_indices = select_indices(
+        group_labels,
+        '\nКакие группы обработать?',
+        interactor,
+    )
+
+    if not selected_indices:
+        interactor.display('  Все группы пропущены.')
+        return files
+
+    processed_count = 0
+    for i in selected_indices:
+        plan = plans[i]
+
+        if ctx.dry_run:
+            ctx.log_debug(f'[DRY RUN] Обработал бы группу: {plan["keep"].name}')
+            for f in plan['delete']:
+                repo.simulate_unlink(f)
+                ctx.stats['duplicates_removed'] += 1
+
+            if plan['needs_rename']:
+                new_name = plan['best_name_file'].name
+                new_path = plan['keep'].with_name(new_name)
+                repo.simulate_rename(plan['keep'], new_path)
+
+            processed_count += 1
+            continue
+
+        for f in plan['delete']:
+            if safe_unlink(f, interactor):
+                interactor.display(f'  Удалён: {f.name}')
+                repo.simulate_unlink(f)
+                ctx.stats['duplicates_removed'] += 1
+
+        if plan['needs_rename']:
+            new_name = plan['best_name_file'].name
+            new_path = plan['keep'].with_name(new_name)
+            status, result_path = safe_rename(plan['keep'], new_path, ctx, repo)
+            if status == 'renamed' and result_path is not None:
+                interactor.display(f'  Переименован в лучшее имя: {plan["keep"].name} → {result_path.name}')
+            elif status == 'kept_existing' and result_path is not None:
+                interactor.display(f'  Оставлен существующий: {result_path.name}')
+
+        processed_count += 1
+
+    interactor.display(f'  Обработано групп: {processed_count}')
+    return [f for f in files if f.exists()]
+
+
+def find_artist_variations(
+    files: list[Path], repo: TagRepository
+) -> dict[str, list[tuple[Path, str, str]]]:
+    """Находит разные варианты написания одного исполнителя."""
+    artist_map: dict[str, list[tuple[Path, str, str]]] = {}
+    for f in files:
+        tags = repo.get_tags(f)
+        if tags:
+            full_artist = tags.artist.strip()
+            individual_artists = [a.strip() for a in re.split(r'\s*[,;]\s*', full_artist)]
+
+            for artist in individual_artists:
+                if not artist:
+                    continue
+                key = artist.lower()
+                if key not in artist_map:
+                    artist_map[key] = []
+                if not any(files_are_same(existing_f, f) for existing_f, _, _ in artist_map[key]):
+                    artist_map[key].append((f, full_artist, artist))
+
+    variations: dict[str, list[tuple[Path, str, str]]] = {}
+    for key, entries in artist_map.items():
+        unique_artists = set(individual_artist for _, _, individual_artist in entries)
+        if len(unique_artists) > 1:
+            variations[key] = entries
+    return variations
