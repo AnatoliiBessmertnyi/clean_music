@@ -84,14 +84,22 @@ def safe_unlink(filepath: Path, interactor: UserInteractor) -> bool:
         return False
 
 
-def safe_rename(
-    old_path: Path, new_path: Path, ctx: SessionContext, repo: TagRepository
+def simple_rename(
+    old_path: Path,
+    new_path: Path,
+    ctx: SessionContext,
+    repo: TagRepository,
+    interactor: UserInteractor,
 ) -> tuple[str, Path | None]:
-    """Безопасно переименовывает файл, обрабатывая дубликаты и смену регистра."""
-    ctx.log_debug(f'rename: {old_path.name!r} -> {new_path.name!r}')
+    """Простое переименование без разрешения дубликатов.
+
+    Если целевое имя занято, возвращает 'duplicate_exists',
+    чтобы вызывающий код мог обработать дубликат отдельно.
+    """
+    ctx.log_debug(f'simple_rename: {old_path.name!r} -> {new_path.name!r}')
 
     if not old_path.exists():
-        ctx.log_debug(f'Файл не найден: {old_path.name}')
+        interactor.display(f'  Файл не найден: {old_path.name}')
         return 'skipped', None
 
     if files_are_same(old_path, new_path):
@@ -101,6 +109,7 @@ def safe_rename(
             return 'renamed', new_path
         if rename_case_sensitive(old_path, new_path, ctx):
             ctx.log_debug(f'Регистр успешно изменён: {new_path.name}')
+            repo.simulate_rename(old_path, new_path)
             return 'renamed', new_path
         ctx.log_debug('Не удалось изменить регистр, пропускаю')
         return 'skipped', None
@@ -115,6 +124,71 @@ def safe_rename(
         return 'renamed', new_path
 
     return 'duplicate_exists', new_path
+
+
+def safe_rename(
+    old_path: Path,
+    new_path: Path,
+    ctx: SessionContext,
+    repo: TagRepository,
+    interactor: UserInteractor,
+) -> tuple[str, Path | None]:
+    """Безопасно переименовывает файл, автоматически разрешая дубликаты.
+
+    Если целевое имя занято, сравнивает файлы и оставляет лучший,
+    удаляя худший дубликат.
+    """
+    ctx.log_debug(f'rename: {old_path.name!r} -> {new_path.name!r}')
+
+    if not old_path.exists():
+        interactor.display(f'  Файл не найден: {old_path.name}')
+        return 'skipped', None
+
+    if files_are_same(old_path, new_path):
+        ctx.log_debug('Это один и тот же файл (samefile), меняем только регистр')
+        if ctx.dry_run:
+            ctx.log_debug('[DRY RUN] Пропускаю смену регистра')
+            return 'renamed', new_path
+        if rename_case_sensitive(old_path, new_path, ctx):
+            ctx.log_debug(f'Регистр успешно изменён: {new_path.name}')
+            repo.simulate_rename(old_path, new_path)
+            return 'renamed', new_path
+        ctx.log_debug('Не удалось изменить регистр, пропускаю')
+        return 'skipped', None
+
+    if not new_path.exists():
+        if ctx.dry_run:
+            ctx.log_debug(f'[DRY RUN] Переименовал бы: {old_path.name} -> {new_path.name}')
+            repo.simulate_rename(old_path, new_path)
+            return 'renamed', new_path
+        old_path.rename(new_path)
+        repo.simulate_rename(old_path, new_path)
+        return 'renamed', new_path
+
+    old_score = (old_path.stat().st_size, name_quality_score(old_path))
+    new_score = (new_path.stat().st_size, name_quality_score(new_path))
+
+    if old_score >= new_score:
+        if ctx.dry_run:
+            ctx.log_debug('[DRY RUN] Удалил бы дубликат и переименовал')
+            repo.simulate_unlink(new_path)
+            repo.simulate_rename(old_path, new_path)
+            return 'renamed', new_path
+        if not safe_unlink(new_path, interactor):
+            return 'skipped', None
+        old_path.rename(new_path)
+        repo.simulate_unlink(new_path)
+        repo.simulate_rename(old_path, new_path)
+        return 'renamed', new_path
+
+    if ctx.dry_run:
+        ctx.log_debug('[DRY RUN] Удалил бы старый файл как дубликат')
+        repo.simulate_unlink(old_path)
+        return 'kept_existing', new_path
+    if not safe_unlink(old_path, interactor):
+        return 'skipped', None
+    repo.simulate_unlink(old_path)
+    return 'kept_existing', new_path
 
 
 def handle_rename_result(
@@ -166,7 +240,7 @@ def process_rename_batch(
     for f in files:
         if f in chosen:
             new_path = f.with_name(transform(f.stem) + f.suffix)
-            status, result_path = safe_rename(f, new_path, ctx, repo)
+            status, result_path = safe_rename(f, new_path, ctx, repo, interactor)
             result = handle_rename_result(status, f, result_path, ctx, stat_key)
             assert result is not None
             new_files.append(result)
@@ -525,7 +599,7 @@ def process_duplicates(
         if plan['needs_rename']:
             new_name = plan['best_name_file'].name
             new_path = plan['keep'].with_name(new_name)
-            status, result_path = safe_rename(plan['keep'], new_path, ctx, repo)
+            status, result_path = safe_rename(plan['keep'], new_path, ctx, repo, interactor)
             if status == 'renamed' and result_path is not None:
                 interactor.display(f'  Переименован в лучшее имя: {plan["keep"].name} → {result_path.name}')
             elif status == 'kept_existing' and result_path is not None:

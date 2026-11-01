@@ -4,12 +4,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from config import (
-    FEAT_VARIANTS_PATTERN,
-    INVALID_FILENAME_CHARS,
-    JUNK_PATTERN,
-    SUPPORTED_EXTENSIONS,
-)
+from config import FEAT_VARIANTS_PATTERN, INVALID_FILENAME_CHARS, JUNK_PATTERN, SUPPORTED_EXTENSIONS
 from context import SessionContext
 from interactor import UserInteractor
 from naming import (
@@ -35,6 +30,7 @@ from pipeline_utils import (
     process_rename_batch,
     safe_rename,
     select_indices,
+    simple_rename,
 )
 from strategies import StrategyFactory
 from tag_repository import TagRepository
@@ -520,7 +516,7 @@ class TagRenamingStage:
                 old_path, new_name = safe_candidates[i]
                 new_path = old_path.with_name(new_name)
 
-                status, result_path = safe_rename(old_path, new_path, ctx, repo)
+                status, result_path = simple_rename(old_path, new_path, ctx, repo, interactor)
 
                 if status == 'renamed':
                     ctx.log_debug(f'Переименован: {old_path.name} -> {new_path.name}')
@@ -678,7 +674,7 @@ class TagRenamingStage:
                     for f, file_title, new_name, tag_artist, tag_title in categorized[cat_key]:
                         if default == 't':
                             new_path = f.with_name(new_name)
-                            status, result_path = safe_rename(f, new_path, ctx, repo)
+                            status, result_path = safe_rename(f, new_path, ctx, repo, interactor)
                             handle_rename_result(status, f, result_path, ctx, 'renamed_by_tags')
                         else:
                             parsed = parse_artist_title(f.stem)
@@ -740,7 +736,7 @@ class TagRenamingStage:
 
                     if choice == 't':
                         new_path = f.with_name(current_new_name)
-                        status, result_path = safe_rename(f, new_path, ctx, repo)
+                        status, result_path = safe_rename(f, new_path, ctx, repo, interactor)
                         handle_rename_result(status, f, result_path, ctx, 'renamed_by_tags')
                     elif choice == 'f':
                         parsed = parse_artist_title(f.stem)
@@ -806,7 +802,7 @@ class TagRenamingStage:
         if choice in ('', 'y', 'yes', 'д', 'да'):
             merged_count = 0
             for old_path, new_path in duplicates_found:
-                status, result_path = safe_rename(old_path, new_path, ctx, repo)
+                status, result_path = safe_rename(old_path, new_path, ctx, repo, interactor)
                 handle_rename_result(status, old_path, result_path, ctx, 'renamed_by_tags')
                 if status in ('renamed', 'kept_existing'):
                     merged_count += 1
@@ -1135,7 +1131,7 @@ class TagWritingStage:
 
                     if new_filename != f.name:
                         new_path = f.with_name(new_filename)
-                        status, result_path = safe_rename(f, new_path, ctx, repo)
+                        status, result_path = safe_rename(f, new_path, ctx, repo, interactor)
                         if status in ('renamed', 'kept_existing'):
                             renamed_count += 1
                             ctx.increment_stat('renamed_by_tags')
@@ -1313,7 +1309,7 @@ class ArtistNormalizationStage:
 
                         new_name = f'{base_name}{f.suffix}'
                         new_path = f.with_name(new_name)
-                        status, result_path = safe_rename(f, new_path, ctx, repo)
+                        status, result_path = safe_rename(f, new_path, ctx, repo, interactor)
                         handle_rename_result(status, f, result_path, ctx, 'renamed_by_tags')
 
                     processed_files.add(f)
@@ -1388,7 +1384,7 @@ class ManualInputStage:
 
             new_name = f'{base_name}{f.suffix}'
             new_path = f.with_name(new_name)
-            status, result_path = safe_rename(f, new_path, ctx, repo)
+            status, result_path = safe_rename(f, new_path, ctx, repo, interactor)
             handle_rename_result(status, f, result_path, ctx, 'manual_input')
 
         ctx._still_missing = still_missing  # type: ignore[attr-defined]
