@@ -1,6 +1,7 @@
 """Контекст сессии обработки аудиофайлов."""
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass
@@ -36,6 +37,7 @@ class SessionContext:
             'manual_input': 0,
         }
     )
+    missing_files: list[Path] = field(default_factory=list)
 
     def increment_stat(self, key: str, amount: int = 1) -> None:
         """Увеличивает счетчик статистики.
