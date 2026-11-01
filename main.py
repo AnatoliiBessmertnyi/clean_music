@@ -38,6 +38,9 @@ from parsing import (
 )
 from strategies import StrategyFactory
 from tag_repository import AudioTags, TagRepository
+from stages import JunkCleaningStage, NormalizationStage
+from pipeline import AudioProcessingPipeline
+from pipeline_utils import select_indices
 
 
 def show_progress(current: int, total: int, prefix: str = '') -> None:
@@ -579,45 +582,6 @@ def titles_match(file_title: str, tag_title: str) -> bool:
     return False
 
 
-def files_are_same(old_path: Path, new_path: Path) -> bool:
-    """Проверяет, являются ли два пути одним и тем же файлом на диске."""
-    try:
-        return old_path.samefile(new_path)
-    except (OSError, FileNotFoundError, ValueError):
-        return False
-
-
-def rename_case_sensitive(old_path: Path, new_path: Path, ctx: SessionContext) -> bool:
-    """Переименовывает файл с изменением только регистра (Windows)."""
-    temp_name = new_path.stem + '__temp__' + new_path.suffix
-    temp_path = old_path.with_name(temp_name)
-    try:
-        old_path.rename(temp_path)
-        temp_path.rename(new_path)
-        return True
-    except OSError as e:
-        ctx.log_debug(f'Ошибка при case-sensitive rename: {e}')
-        if temp_path.exists():
-            try:
-                temp_path.rename(old_path)
-            except OSError:
-                pass
-        return False
-
-
-def safe_unlink(filepath: Path) -> bool:
-    """Безопасно удаляет файл, обрабатывая ошибки блокировки."""
-    try:
-        filepath.unlink()
-        return True
-    except PermissionError:
-        print(f'  Ошибка: файл заблокирован, не могу удалить: {filepath.name}')
-        return False
-    except OSError as e:
-        print(f'  Ошибка при удалении {filepath.name}: {e}')
-        return False
-
-
 def simple_rename(
     old_path: Path, new_path: Path, ctx: SessionContext, repo: TagRepository
 ) -> tuple[str, Path | None]:
@@ -650,139 +614,6 @@ def simple_rename(
         return 'renamed', new_path
 
     return 'duplicate_exists', new_path
-
-
-def safe_rename(
-    old_path: Path, new_path: Path, ctx: SessionContext, repo: TagRepository
-) -> tuple[str, Path | None]:
-    """Безопасно переименовывает файл, обрабатывая дубликаты."""
-    ctx.log_debug(f'rename: {old_path.name!r} -> {new_path.name!r}')
-
-    if not old_path.exists():
-        print(f'  Файл не найден: {old_path.name}')
-        return 'skipped', None
-
-    if files_are_same(old_path, new_path):
-        ctx.log_debug('Это один и тот же файл (samefile), меняем только регистр')
-        if ctx.dry_run:
-            ctx.log_debug('[DRY RUN] Пропускаю смену регистра')
-            return 'renamed', new_path
-        if rename_case_sensitive(old_path, new_path, ctx):
-            ctx.log_debug(f'Регистр успешно изменён: {new_path.name}')
-            return 'renamed', new_path
-        ctx.log_debug('Не удалось изменить регистр, пропускаю')
-        return 'skipped', None
-
-    if not new_path.exists():
-        if ctx.dry_run:
-            ctx.log_debug(f'[DRY RUN] Переименовал бы: {old_path.name} -> {new_path.name}')
-            repo.simulate_rename(old_path, new_path)
-            return 'renamed', new_path
-        old_path.rename(new_path)
-        repo.simulate_rename(old_path, new_path)
-        return 'renamed', new_path
-
-    # Дубликат обнаружен — решаем автоматически
-    old_tags = repo.get_tags(old_path)
-    existing_tags = repo.get_tags(new_path)
-
-    tags_match = (
-        old_tags
-        and existing_tags
-        and old_tags.artist.lower().strip() == existing_tags.artist.lower().strip()
-        and old_tags.title.lower().strip() == existing_tags.title.lower().strip()
-    )
-
-    old_info = file_info_line(old_path)
-    existing_info = file_info_line(new_path)
-
-    old_score = (old_path.stat().st_size, name_quality_score(old_path))
-    new_score = (new_path.stat().st_size, name_quality_score(new_path))
-
-    print(f'\n  Обнаружен дубликат: {new_path.name}')
-    if tags_match:
-        print('      Теги совпадают — одна и та же песня.')
-
-    if old_score >= new_score:
-        print(f'      Оставляю: {old_path.name} ({old_info})')
-        print(f'      Удаляю:   {new_path.name} ({existing_info})')
-
-        if ctx.dry_run:
-            ctx.log_debug('[DRY RUN] Удалил бы дубликат')
-            repo.simulate_unlink(new_path)
-            return 'skipped', None
-
-        if not safe_unlink(new_path):
-            return 'skipped', None
-
-        old_path.rename(new_path)
-        repo.simulate_unlink(new_path)
-        repo.simulate_rename(old_path, new_path)
-        return 'renamed', new_path
-    else:
-        print(f'      Оставляю: {new_path.name} ({existing_info})')
-        print(f'      Удаляю:   {old_path.name} ({old_info})')
-
-        if ctx.dry_run:
-            ctx.log_debug('[DRY RUN] Удалил бы старый файл')
-            repo.simulate_unlink(old_path)
-            return 'skipped', None
-
-        if not safe_unlink(old_path):
-            return 'skipped', None
-        repo.simulate_unlink(old_path)
-        return 'kept_existing', new_path
-
-
-def handle_rename_result(
-    status: str,
-    old_path: Path,
-    result_path: Path | None,
-    ctx: SessionContext,
-    stat_key: str,
-) -> Path | None:
-    """Обрабатывает результат safe_rename и обновляет статистику."""
-    if status == 'renamed':
-        if result_path is not None:
-            ctx.log_debug(f'Переименован: {old_path.name} -> {result_path.name}')
-        ctx.increment_stat(stat_key)
-        return result_path
-
-    if status == 'kept_existing':
-        if result_path is not None:
-            ctx.log_debug(
-                f'Текущий файл удалён как дубликат: {old_path.name} '
-                f'(файл {result_path.name} оставлен без изменений)'
-            )
-        ctx.increment_stat(stat_key)
-        return result_path
-
-    ctx.log_debug(f'Пропущен: {old_path.name}')
-    return old_path
-
-
-def select_indices(items: list[str], description: str) -> list[int]:
-    """Показывает нумерованный список и возвращает индексы выбранных."""
-    print(f'\n{description}:')
-    for i, item in enumerate(items, 1):
-        print(f'  [✓] {i}. {item}')
-
-    prompt = '(Enter - применить ко всем / номера - ИСКЛЮЧИТЬ из обработки / n - отменить все): '
-    choice = input(prompt).strip().lower()
-    if not choice or choice in ('y', 'yes', 'д', 'да'):
-        return list(range(len(items)))
-    if choice in ('n', 'no', 'н', 'нет'):
-        return []
-    try:
-        excluded = {int(p) for p in re.split(r'[,\s]+', choice) if p}
-        selected = [i for i in range(len(items)) if (i + 1) not in excluded]
-        skipped = len(items) - len(selected)
-        if skipped:
-            print(f'Исключено {skipped} файлов.')
-        return selected
-    except ValueError:
-        print('Некорректный ввод, применяю ко всем.')
-        return list(range(len(items)))
 
 
 def find_duplicates(files: list[Path], repo: TagRepository) -> list[list[Path]]:
@@ -833,86 +664,6 @@ def find_artist_variations(
         if len(unique_artists) > 1:
             variations[key] = entries
     return variations
-
-
-def process_rename_batch(
-    files: list[Path],
-    candidates: list[Path],
-    transform: Callable[[str], str],
-    description: str,
-    ctx: SessionContext,
-    repo: TagRepository,
-    stat_key: str,
-) -> list[Path]:
-    """Универсальная обработка пакета переименований."""
-    if not candidates:
-        return files
-    labels = [f'{f.name}  ->  {transform(f.stem)}{f.suffix}' for f in candidates]
-    idx = select_indices(labels, f'Найдено {len(candidates)} {description}')
-    chosen = {candidates[i] for i in idx}
-    new_files = []
-    for f in files:
-        if f in chosen:
-            new_path = f.with_name(transform(f.stem) + f.suffix)
-            status, result_path = safe_rename(f, new_path, ctx, repo)
-            result = handle_rename_result(status, f, result_path, ctx, stat_key)
-            assert result is not None
-            new_files.append(result)
-        else:
-            new_files.append(f)
-
-    if ctx.stats.get(stat_key, 0) > 0:
-        print(f'  Обработано файлов: {ctx.stats[stat_key]}')
-
-    return new_files
-
-
-def process_tag_junk_cleaning(files: list[Path], ctx: SessionContext, repo: TagRepository) -> None:
-    """Очищает мусор из тегов исполнителя и названия."""
-    candidates = []
-    for f in files:
-        if not f.exists():
-            continue
-        tags = repo.get_tags(f)
-        if not tags:
-            continue
-        artist, title = tags.artist, tags.title
-        new_artist = remove_junk(str(artist))
-        new_title = remove_junk(str(title))
-        if new_artist != artist or new_title != title:
-            candidates.append((f, artist, title, new_artist, new_title))
-
-    if not candidates:
-        print('  Файлов с мусором в тегах не найдено.')
-        return
-
-    print(f'\nНайдено {len(candidates)} файлов с мусором в тегах:')
-    for i, (f, artist, title, new_artist, new_title) in enumerate(candidates, 1):
-        print(f'  {i}. {f.name}')
-        if new_artist != artist:
-            print(f'      Исполнитель: {artist!r} → {new_artist!r}')
-        if new_title != title:
-            print(f'      Название:    {title!r} → {new_title!r}')
-
-    idx = select_indices(
-        [f.name for f, *_ in candidates],
-        'Какие файлы очистить?',
-    )
-
-    cleaned_count = 0
-    for i in idx:
-        f, _, _, new_artist, new_title = candidates[i]
-        if ctx.dry_run:
-            ctx.log_debug(f'[DRY RUN] Очистил бы теги: {f.name}')
-            repo.simulate_update_tags(f, new_artist, new_title)
-            cleaned_count += 1
-        elif repo.update_tags(f, new_artist, new_title):
-            print(f'  Теги очищены: {f.name}')
-            cleaned_count += 1
-
-    if cleaned_count:
-        ctx.stats['tags_cleaned'] = cleaned_count
-        print(f'  Очищено тегов: {cleaned_count}')
 
 
 def process_duplicates(files: list[Path], ctx: SessionContext, repo: TagRepository) -> list[Path]:
@@ -977,6 +728,7 @@ def process_duplicates(files: list[Path], ctx: SessionContext, repo: TagReposito
     selected_indices = select_indices(
         group_labels,
         '\nКакие группы обработать?',
+        interactor,
     )
 
     if not selected_indices:
@@ -1280,43 +1032,21 @@ def main() -> None:
     if not files:
         return
 
-    # --- Шаг 1: Очистка от мусора ---
-    stage(1, 'Очистка от мусора', ctx)
-    junk = [f for f in files if JUNK_PATTERN.search(f.stem)]
-    files = process_rename_batch(
-        files,
-        junk,
-        remove_junk,
-        'файлов с мусором (vksaver)',
-        ctx,
-        repo,
-        'junk_removed',
-    )
-
-    print('\n  [Подэтап 1.2] Очистка мусора из тегов')
-    ctx.log_debug('Подэтап 1.2: очистка мусора из тегов')
-    process_tag_junk_cleaning(files, ctx, repo)
-
-    # --- Шаг 2: Нормализация тире и пробелов ---
-    stage(2, 'Нормализация тире и пробелов', ctx)
-
-    def normalize_text(text: str) -> str:
-        text = normalize_dash(text)
-        text = normalize_filename_stem(text)
-        return text
-
-    candidates = [f for f in files if normalize_text(f.stem) != f.stem]
-    files = process_rename_batch(
-        files,
-        candidates,
-        normalize_text,
-        'файлов с нестандартными тире или лишними пробелами',
-        ctx,
-        repo,
-        'dash_normalized',
+    # --- Запуск Этапов 1 и 2 через Pipeline ---
+    pipeline = AudioProcessingPipeline([
+        JunkCleaningStage(),
+        NormalizationStage(),
+    ])
+    
+    files = pipeline.run(
+        initial_files=files,
+        ctx=ctx,
+        repo=repo,
+        interactor=interactor,
     )
 
     # --- Шаг 3: Переименование по тегам ---
+    # (Временный вызов старой функции stage, пока мы не рефакторили этот этап)
     stage(3, 'Переименование по тегам', ctx)
 
     # --- Подэтап 3.1: Нормализация (feat. X) ---
@@ -1361,6 +1091,7 @@ def main() -> None:
         selected_indices = select_indices(
             [f.name for f, *_ in feat_candidates],
             '\nКакие файлы нормализовать?',
+            interactor,
         )
 
         normalized_count = 0
@@ -1408,6 +1139,7 @@ def main() -> None:
         selected_indices = select_indices(
             [f.name for f, *_ in sep_candidates],
             '\nКакие файлы нормализовать?',
+            interactor,
         )
 
         normalized_count = 0
@@ -1612,6 +1344,7 @@ def main() -> None:
         selected_indices = select_indices(
             labels,
             f'Найдено {len(safe_candidates)} файлов для переименования по тегам (названия совпадают)',
+            interactor,
         )
 
         renamed_count = 0
@@ -1972,6 +1705,7 @@ def main() -> None:
         selected_indices = select_indices(
             labels,
             f'Найдено {len(tags_to_write)} файлов с корректным именем, но без тегов. Записать теги?',
+            interactor,
         )
 
         written_count = 0
@@ -2116,6 +1850,7 @@ def main() -> None:
         selected_indices = select_indices(
             labels,
             f'Найдено {len(actually_missing)} файлов без тегов и формата. Ввести исполнителя вручную?',
+            interactor,
         )
         for i in selected_indices:
             f = actually_missing[i]
