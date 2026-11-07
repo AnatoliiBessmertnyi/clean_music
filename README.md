@@ -39,34 +39,76 @@ Python CLI для очистки музыкальных тегов и имён �
 
 ## Требования и установка
 
-Требуется Python **3.13 или новее**, согласно `pyproject.toml`. Работа с аудиотегами
-реализована через Mutagen. Зависимости и настройки инструментов определены в
-`pyproject.toml`; `requirements.txt` содержит только `mutagen` и не описывает полное
-окружение проекта.
+Требуется Python **3.13 или новее**. `.python-version` выбирает Python 3.13;
+uv загрузит его при отсутствии. Зависимости и настройки определены в
+`pyproject.toml`, разрешённые версии — в общем для Windows и Linux `uv.lock`.
+Приложение запускается из исходного каталога без установки проекта как пакета
+(`tool.uv.package = false`).
 
-Из корня репозитория, в выбранном виртуальном окружении:
+Один checkout на NTFS используется из двух ОС, но окружения физически раздельны.
+Не используйте Windows-окружение из WSL и наоборот. Следующие переменные действуют
+в текущей сессии; задавайте их перед работой в новой оболочке. Активация venv
+не требуется; если старое окружение активировано, сначала выполните `deactivate`.
+
+### Windows (PowerShell)
+
+Если uv отсутствует, установите его через имеющийся Python без изменения PATH
+и политики выполнения PowerShell:
 
 ```powershell
-python -m pip install -e .
+python -m pip install uv --target "$env:LOCALAPPDATA\clean_music\uv-bootstrap"
 ```
 
-Для разработки:
+Из корня репозитория:
 
 ```powershell
-python -m pip install -e ".[dev]"
+$uv = "$env:LOCALAPPDATA\clean_music\uv-bootstrap\bin\uv.exe"
+$env:UV_PROJECT_ENVIRONMENT = "$env:LOCALAPPDATA\clean_music\.venv"
+& $uv sync --locked
+& $uv run --locked python main.py
 ```
 
-Список модулей упаковки сейчас неполон. Указанный способ рассчитан на работу
-из исходного репозитория; установка собранного пакета вне него не подтверждена.
+Если uv уже установлен, вместо `& $uv` можно использовать `uv`.
+
+### WSL2 (Bash)
+
+Если uv отсутствует, установите его без изменения профиля и PATH:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh
+```
+
+В том же репозитории на NTFS (путь при необходимости скорректируйте):
+
+```bash
+cd '/mnt/d/Program Files/Dev/clean_music'
+export PATH="$HOME/.local/bin:$PATH"
+export UV_PROJECT_ENVIRONMENT="$HOME/.cache/clean_music/.venv"
+uv sync --locked
+uv run --locked python main.py
+```
+
+PATH здесь меняется только для текущей сессии. Старое окружение не удаляйте,
+пока новая схема не проверена. `sync` по умолчанию включает группу разработки;
+для окружения только приложения используйте `uv sync --locked --no-dev`.
+Выбирайте выделенный путь: точная синхронизация удаляет лишние пакеты из него.
+
+`uv lock --check` проверяет актуальность lock-файла. Обычная работа использует
+`--locked`: несоответствие конфигурации завершится ошибкой без перезаписи lock.
+После согласованного изменения зависимостей выполните `uv lock`, проверьте diff
+и зафиксируйте `uv.lock` вместе с `pyproject.toml`. Обновление через
+`uv lock --upgrade` выполняется только как отдельное согласованное действие.
+Справка: [установка uv](https://docs.astral.sh/uv/getting-started/installation/),
+[синхронизация](https://docs.astral.sh/uv/concepts/projects/sync/).
 
 ## Запуск
 
 Из корня репозитория:
 
 ```powershell
-python -m main
-python -m main --dry-run
-python -m main --debug
+uv run --locked python main.py
+uv run --locked python main.py --dry-run
+uv run --locked python main.py --debug
 ```
 
 Программа интерактивно запрашивает путь к папке и решения по обработке.
@@ -99,14 +141,15 @@ python -m main --debug
 ## Разработка и проверки
 
 Основная рабочая среда — Windows; основной контур локальных проверок — отдельное
-окружение Python в WSL. Команды ниже выполняются в активированном окружении проекта
-из его корня. Версии и правила инструментов следует брать из `pyproject.toml`.
+окружение Python в WSL. Команды ниже выполняются из корня после выбора
+`UV_PROJECT_ENVIRONMENT` и `uv sync --locked`, описанных выше. В PowerShell
+с установкой через pip заменяйте `uv` на `& $uv`.
 
 ```bash
-python -m pytest tests/ -v
-python -m ruff check .
-python -m ruff format --check .
-python -m mypy .
+uv run --locked python -m pytest tests/ -v
+uv run --locked python -m ruff check .
+uv run --locked python -m ruff format --check .
+uv run --locked python -m mypy .
 ```
 
 Файловые тесты должны использовать синтетические данные и временные каталоги.
