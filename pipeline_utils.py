@@ -19,7 +19,9 @@ from parsing import parse_artist_title
 from tag_repository import TagRepository
 
 
-def select_indices(items: list[str], description: str, interactor: UserInteractor) -> list[int]:
+def select_indices(
+    items: list[str], description: str, interactor: UserInteractor
+) -> list[int]:
     """Показывает нумерованный список и возвращает индексы выбранных элементов."""
     interactor.display(f'\n{description}:')
     for i, item in enumerate(items, 1):
@@ -116,7 +118,9 @@ def simple_rename(
 
     if not new_path.exists():
         if ctx.dry_run:
-            ctx.log_debug(f'[DRY RUN] Переименовал бы: {old_path.name} -> {new_path.name}')
+            ctx.log_debug(
+                f'[DRY RUN] Переименовал бы: {old_path.name} -> {new_path.name}'
+            )
             repo.simulate_rename(old_path, new_path)
             return 'renamed', new_path
         old_path.rename(new_path)
@@ -158,7 +162,9 @@ def safe_rename(
 
     if not new_path.exists():
         if ctx.dry_run:
-            ctx.log_debug(f'[DRY RUN] Переименовал бы: {old_path.name} -> {new_path.name}')
+            ctx.log_debug(
+                f'[DRY RUN] Переименовал бы: {old_path.name} -> {new_path.name}'
+            )
             repo.simulate_rename(old_path, new_path)
             return 'renamed', new_path
         old_path.rename(new_path)
@@ -260,7 +266,7 @@ def get_audio_duration(filepath: Path) -> float | None:
         if ext == '.mp3':
             return float(MP3(filepath).info.length)  # type: ignore[attr-defined]
         if ext in ('.m4a', '.mp4'):
-            return float(MP4(filepath).info.length) # type: ignore[attr-defined]
+            return float(MP4(filepath).info.length)  # type: ignore[attr-defined]
         if ext == '.flac':
             return float(FLAC(filepath).info.length)  # type: ignore[union-attr]
         if ext == '.ogg':
@@ -307,6 +313,7 @@ def name_quality_score(filepath: Path) -> int:
 
 # === Утилиты для анализа расхождений и санитизации ===
 
+
 def has_encoding_issues(text: str) -> bool:
     """Проверяет, содержит ли текст признаки неправильной кодировки."""
     mojibake_pattern = re.compile(r'[À-ÿ]{2,}')
@@ -334,7 +341,9 @@ def categorize_mismatch(
             return 'A'
         return 'B'
 
-    if FEAT_VARIANTS_PATTERN.search(parsed[0]) or FEAT_VARIANTS_PATTERN.search(parsed[1]):
+    if FEAT_VARIANTS_PATTERN.search(parsed[0]) or FEAT_VARIANTS_PATTERN.search(
+        parsed[1]
+    ):
         return 'C'
 
     return 'E'
@@ -423,12 +432,17 @@ def sanitize_filename_interactive(
         marker = ' [по умолчанию]' if i == 1 else ''
         remembered = (
             ' [запомнено]'
-            if (chars_key in ctx.remembered_choices and ctx.remembered_choices[chars_key] == i - 1)
+            if (
+                chars_key in ctx.remembered_choices
+                and ctx.remembered_choices[chars_key] == i - 1
+            )
             else ''
         )
         interactor.display(f'  {i}. {label}{marker}{remembered}')
 
-    interactor.display(f"  a. Запомнить и применить вариант 1 ко всем файлам с '{chars_str}'")
+    interactor.display(
+        f"  a. Запомнить и применить вариант 1 ко всем файлам с '{chars_str}'"
+    )
 
     # Подсказка при повторении
     if chars_key not in ctx.ask_counts:
@@ -438,15 +452,16 @@ def sanitize_filename_interactive(
     count = ctx.ask_counts[chars_key]
     if count >= 3:
         interactor.display(
-            f'  [Подсказка: вы уже {count} раз выбрали этот вариант. '
-            f"Нажмите 'a', чтобы запомнить.]"
+            f"  [Подсказка: вы уже {count} раз выбрали этот вариант. Нажмите 'a', чтобы запомнить.]"
         )
 
     choice = interactor.prompt('  Выберите вариант [1]: ', default='1')
 
     if choice == 'a':
         ctx.remembered_choices[chars_key] = 0
-        interactor.display(f"  Запомнено: применять 'Удалить символы' для всех '{chars_str}'")
+        interactor.display(
+            f"  Запомнено: применять 'Удалить символы' для всех '{chars_str}'"
+        )
         _, value = options[0]
         return value
 
@@ -462,7 +477,9 @@ def sanitize_filename_interactive(
                 if not custom:
                     return 'SKIP'
                 if INVALID_FILENAME_CHARS.search(custom):
-                    interactor.display('  Имя всё ещё содержит недопустимые символы, оставляю как есть.')
+                    interactor.display(
+                        '  Имя всё ещё содержит недопустимые символы, оставляю как есть.'
+                    )
                     return 'SKIP'
                 return custom
             return value
@@ -512,7 +529,10 @@ def get_best_name_from_group(group: list[Path]) -> Path:
 
 
 def process_duplicates(
-    files: list[Path], ctx: SessionContext, repo: TagRepository, interactor: UserInteractor
+    files: list[Path],
+    ctx: SessionContext,
+    repo: TagRepository,
+    interactor: UserInteractor,
 ) -> list[Path]:
     """Обрабатывает группы дубликатов с умным объединением имён."""
     duplicates = find_duplicates(files, repo)
@@ -527,7 +547,9 @@ def process_duplicates(
         keep_file = sorted_group[0]
         files_to_delete = [f for f in sorted_group if f != keep_file]
 
-        needs_rename = keep_file != best_name_file and not files_are_same(keep_file, best_name_file)
+        needs_rename = keep_file != best_name_file and not files_are_same(
+            keep_file, best_name_file
+        )
 
         plans.append(
             {
@@ -599,9 +621,13 @@ def process_duplicates(
         if plan['needs_rename']:
             new_name = plan['best_name_file'].name
             new_path = plan['keep'].with_name(new_name)
-            status, result_path = safe_rename(plan['keep'], new_path, ctx, repo, interactor)
+            status, result_path = safe_rename(
+                plan['keep'], new_path, ctx, repo, interactor
+            )
             if status == 'renamed' and result_path is not None:
-                interactor.display(f'  Переименован в лучшее имя: {plan["keep"].name} → {result_path.name}')
+                interactor.display(
+                    f'  Переименован в лучшее имя: {plan["keep"].name} → {result_path.name}'
+                )
             elif status == 'kept_existing' and result_path is not None:
                 interactor.display(f'  Оставлен существующий: {result_path.name}')
 
@@ -620,7 +646,9 @@ def find_artist_variations(
         tags = repo.get_tags(f)
         if tags:
             full_artist = tags.artist.strip()
-            individual_artists = [a.strip() for a in re.split(r'\s*[,;]\s*', full_artist)]
+            individual_artists = [
+                a.strip() for a in re.split(r'\s*[,;]\s*', full_artist)
+            ]
 
             for artist in individual_artists:
                 if not artist:
@@ -628,7 +656,10 @@ def find_artist_variations(
                 key = artist.lower()
                 if key not in artist_map:
                     artist_map[key] = []
-                if not any(files_are_same(existing_f, f) for existing_f, _, _ in artist_map[key]):
+                if not any(
+                    files_are_same(existing_f, f)
+                    for existing_f, _, _ in artist_map[key]
+                ):
                     artist_map[key].append((f, full_artist, artist))
 
     variations: dict[str, list[tuple[Path, str, str]]] = {}

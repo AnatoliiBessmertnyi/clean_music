@@ -4,7 +4,12 @@ import re
 from pathlib import Path
 from typing import Any
 
-from config import FEAT_VARIANTS_PATTERN, INVALID_FILENAME_CHARS, JUNK_PATTERN, SUPPORTED_EXTENSIONS
+from config import (
+    FEAT_VARIANTS_PATTERN,
+    INVALID_FILENAME_CHARS,
+    JUNK_PATTERN,
+    SUPPORTED_EXTENSIONS,
+)
 from context import SessionContext
 from interactor import UserInteractor
 from naming import (
@@ -18,7 +23,11 @@ from naming import (
     remove_feat_guests_from_artist,
     remove_junk,
 )
-from parsing import clean_extracted_tags, extract_title_from_filename, parse_artist_title
+from parsing import (
+    clean_extracted_tags,
+    extract_title_from_filename,
+    parse_artist_title,
+)
 from pipeline_utils import (
     categorize_mismatch,
     clean_filename_safely,
@@ -41,7 +50,7 @@ class JunkCleaningStage:
 
     @property
     def name(self) -> str:
-        return "Очистка от мусора"
+        return 'Очистка от мусора'
 
     def execute(
         self,
@@ -56,11 +65,11 @@ class JunkCleaningStage:
             files=files,
             candidates=junk_files,
             transform=remove_junk,
-            description="файлов с мусором (vksaver)",
+            description='файлов с мусором (vksaver)',
             ctx=ctx,
             repo=repo,
             interactor=interactor,
-            stat_key="junk_removed",
+            stat_key='junk_removed',
         )
 
         # Подэтап 1.2: Очистка тегов
@@ -69,7 +78,11 @@ class JunkCleaningStage:
         return current_files
 
     def _clean_tag_junk(
-        self, files: list[Path], ctx: SessionContext, repo: TagRepository, interactor: UserInteractor
+        self,
+        files: list[Path],
+        ctx: SessionContext,
+        repo: TagRepository,
+        interactor: UserInteractor,
     ) -> None:
         """Очищает мусор из тегов исполнителя и названия."""
         candidates = []
@@ -126,7 +139,7 @@ class NormalizationStage:
 
     @property
     def name(self) -> str:
-        return "Нормализация тире и пробелов"
+        return 'Нормализация тире и пробелов'
 
     def execute(
         self,
@@ -146,11 +159,11 @@ class NormalizationStage:
             files=files,
             candidates=candidates,
             transform=normalize_text,
-            description="файлов с нестандартными тире или лишними пробелами",
+            description='файлов с нестандартными тире или лишними пробелами',
             ctx=ctx,
             repo=repo,
             interactor=interactor,
-            stat_key="dash_normalized",
+            stat_key='dash_normalized',
         )
 
 
@@ -159,7 +172,7 @@ class TagRenamingStage:
 
     @property
     def name(self) -> str:
-        return "Переименование по тегам"
+        return 'Переименование по тегам'
 
     def execute(
         self,
@@ -168,12 +181,16 @@ class TagRenamingStage:
         repo: TagRepository,
         interactor: UserInteractor,
     ) -> list[Path]:
-        interactor.display('\n  [Подэтап 3.1] Нормализация участников (feat./ft./featuring)')
+        interactor.display(
+            '\n  [Подэтап 3.1] Нормализация участников (feat./ft./featuring)'
+        )
         interactor.display('  Приводим все вариации к единому формату: (feat. Guest)')
         files = self._normalize_feat(files, ctx, repo, interactor)
 
         interactor.display('\n  [Подэтап 3.2] Нормализация разделителей исполнителей')
-        interactor.display("  Приводим все разделители к запятой с пробелом: 'Artist1, Artist2'")
+        interactor.display(
+            "  Приводим все разделители к запятой с пробелом: 'Artist1, Artist2'"
+        )
         files = self._normalize_separators(files, ctx, repo, interactor)
 
         interactor.display('\n  [Подэтап 3.3] Анализ уточнений в скобках')
@@ -197,7 +214,11 @@ class TagRenamingStage:
     # === Подэтап 3.1: feat ===
 
     def _normalize_feat(
-        self, files: list[Path], ctx: SessionContext, repo: TagRepository, interactor: UserInteractor
+        self,
+        files: list[Path],
+        ctx: SessionContext,
+        repo: TagRepository,
+        interactor: UserInteractor,
     ) -> list[Path]:
         feat_candidates: list[tuple[Path, str, str, str, str, str]] = []
         for f in files:
@@ -208,7 +229,10 @@ class TagRenamingStage:
                 continue
 
             artist, title = str(tags.artist), str(tags.title)
-            if not (FEAT_VARIANTS_PATTERN.search(artist) or FEAT_VARIANTS_PATTERN.search(title)):
+            if not (
+                FEAT_VARIANTS_PATTERN.search(artist)
+                or FEAT_VARIANTS_PATTERN.search(title)
+            ):
                 continue
 
             new_artist, new_title = normalize_feat_pair(artist, title)
@@ -216,13 +240,17 @@ class TagRenamingStage:
 
             if new_artist != artist or new_title != title:
                 new_filename = build_safe_filename(new_artist, new_title, f.suffix)
-                feat_candidates.append((f, artist, title, new_artist, new_title, new_filename))
+                feat_candidates.append(
+                    (f, artist, title, new_artist, new_title, new_filename)
+                )
 
         if not feat_candidates:
             interactor.display('  Файлов для нормализации (feat.) не найдено.')
             return files
 
-        interactor.display(f'\nНайдено {len(feat_candidates)} файлов для нормализации (feat.):')
+        interactor.display(
+            f'\nНайдено {len(feat_candidates)} файлов для нормализации (feat.):'
+        )
         for i, (f, artist, title, new_artist, new_title, new_filename) in enumerate(
             feat_candidates, 1
         ):
@@ -261,7 +289,11 @@ class TagRenamingStage:
     # === Подэтап 3.2: разделители ===
 
     def _normalize_separators(
-        self, files: list[Path], ctx: SessionContext, repo: TagRepository, interactor: UserInteractor
+        self,
+        files: list[Path],
+        ctx: SessionContext,
+        repo: TagRepository,
+        interactor: UserInteractor,
     ) -> list[Path]:
         sep_candidates: list[tuple[Path, str, str, str]] = []
         for f in files:
@@ -279,7 +311,9 @@ class TagRenamingStage:
             interactor.display('  Файлов для нормализации разделителей не найдено.')
             return files
 
-        interactor.display(f'\nНайдено {len(sep_candidates)} файлов для нормализации разделителей:')
+        interactor.display(
+            f'\nНайдено {len(sep_candidates)} файлов для нормализации разделителей:'
+        )
         for i, (f, artist, title, new_artist) in enumerate(sep_candidates, 1):
             interactor.display(f'\n  {i}. {f.name}')
             interactor.display('      БЫЛО:')
@@ -313,7 +347,11 @@ class TagRenamingStage:
     # === Подэтап 3.3: уточнения в скобках ===
 
     def _process_annotations(
-        self, files: list[Path], ctx: SessionContext, repo: TagRepository, interactor: UserInteractor
+        self,
+        files: list[Path],
+        ctx: SessionContext,
+        repo: TagRepository,
+        interactor: UserInteractor,
     ) -> list[Path]:
         annotations = self._find_tag_annotations(files, repo)
         if not annotations:
@@ -339,7 +377,9 @@ class TagRenamingStage:
                         new_title = remove_annotation_from_text(tags.title, ann)
                         if new_title != tags.title:
                             if ctx.dry_run:
-                                ctx.log_debug(f'[DRY RUN] Автоудалил бы: ({ann}) из {f.name}')
+                                ctx.log_debug(
+                                    f'[DRY RUN] Автоудалил бы: ({ann}) из {f.name}'
+                                )
                                 repo.simulate_update_tags(f, tags.artist, new_title)
                                 removed_count += 1
                             elif repo.update_tags(f, tags.artist, new_title):
@@ -355,13 +395,20 @@ class TagRenamingStage:
 
         categories = self._categorize_annotations(annotations)
 
-        interactor.display(f'\nНайдено {len(annotations)} уникальных уточнений в {len(categories)} категориях:')
+        interactor.display(
+            f'\nНайдено {len(annotations)} уникальных уточнений в {len(categories)} категориях:'
+        )
 
         for cat_key, cat_data in categories.items():
-            total_files = sum(len(file_list) for file_list in cat_data['items'].values())
+            total_files = sum(
+                len(file_list) for file_list in cat_data['items'].values()
+            )
             interactor.display(f'\n  {cat_data["name"]} ({total_files} файлов):')
             for i, (ann, file_list) in enumerate(
-                sorted(cat_data['items'].items(), key=lambda x: len(x[1]), reverse=True), 1
+                sorted(
+                    cat_data['items'].items(), key=lambda x: len(x[1]), reverse=True
+                ),
+                1,
             ):
                 interactor.display(f'    {i}. ({ann}) — {len(file_list)} файлов')
 
@@ -396,7 +443,9 @@ class TagRenamingStage:
                         new_title = remove_annotation_from_text(tags.title, ann)
                         if new_title != tags.title:
                             if ctx.dry_run:
-                                ctx.log_debug(f'[DRY RUN] Удалил бы из тега: ({ann}) из {f.name}')
+                                ctx.log_debug(
+                                    f'[DRY RUN] Удалил бы из тега: ({ann}) из {f.name}'
+                                )
                                 repo.simulate_update_tags(f, tags.artist, new_title)
                                 removed_count += 1
                             elif repo.update_tags(f, tags.artist, new_title):
@@ -409,7 +458,11 @@ class TagRenamingStage:
     # === Подэтап 3.4: формирование имён по тегам ===
 
     def _rename_by_tags(
-        self, files: list[Path], ctx: SessionContext, repo: TagRepository, interactor: UserInteractor
+        self,
+        files: list[Path],
+        ctx: SessionContext,
+        repo: TagRepository,
+        interactor: UserInteractor,
     ) -> list[Path]:
         ctx.log_debug('Подэтап 3.4: формирование имён из тегов')
 
@@ -431,7 +484,9 @@ class TagRenamingStage:
                 if problem_key not in invalid_files:
                     continue
                 examples = invalid_files[problem_key]
-                strategy, params = self._choose_strategy_for_group(problem_key, examples, interactor)
+                strategy, params = self._choose_strategy_for_group(
+                    problem_key, examples, interactor
+                )
                 strategies[problem_key] = (strategy, params)
 
         safe_candidates: list[tuple[Path, str]] = []
@@ -444,7 +499,9 @@ class TagRenamingStage:
 
             file_title = extract_title_from_filename(f.stem)
             tags = repo.get_tags(f)
-            ctx.log_debug(f'Анализ: {f.name}, теги: {tags}, извлечённое название: {file_title!r}')
+            ctx.log_debug(
+                f'Анализ: {f.name}, теги: {tags}, извлечённое название: {file_title!r}'
+            )
 
             if tags:
                 artist = remove_junk(str(tags.artist))
@@ -471,14 +528,18 @@ class TagRenamingStage:
                         strategy, params = strategies[problem_key]
 
                         if strategy != 'skip':
-                            strategy_obj = StrategyFactory.create(strategy, params, interactor, f.name)
+                            strategy_obj = StrategyFactory.create(
+                                strategy, params, interactor, f.name
+                            )
                             base_name = strategy_obj.apply(
                                 raw_name, set(INVALID_FILENAME_CHARS.findall(raw_name))
                             )
                             if base_name:
                                 user_already_chose = True
                             else:
-                                ctx.log_debug(f'Пропущен (стратегия вернула None): {f.name}')
+                                ctx.log_debug(
+                                    f'Пропущен (стратегия вернула None): {f.name}'
+                                )
                                 continue
                         else:
                             ctx.log_debug(f'Пропущен (стратегия skip): {f.name}')
@@ -516,7 +577,9 @@ class TagRenamingStage:
                 old_path, new_name = safe_candidates[i]
                 new_path = old_path.with_name(new_name)
 
-                status, result_path = simple_rename(old_path, new_path, ctx, repo, interactor)
+                status, result_path = simple_rename(
+                    old_path, new_path, ctx, repo, interactor
+                )
 
                 if status == 'renamed':
                     ctx.log_debug(f'Переименован: {old_path.name} -> {new_path.name}')
@@ -541,9 +604,15 @@ class TagRenamingStage:
     # === Подэтап 3.5: обработка расхождений ===
 
     def _handle_mismatches(
-        self, files: list[Path], ctx: SessionContext, repo: TagRepository, interactor: UserInteractor
+        self,
+        files: list[Path],
+        ctx: SessionContext,
+        repo: TagRepository,
+        interactor: UserInteractor,
     ) -> list[Path]:
-        mismatch_candidates: list[tuple[Path, str, str]] = getattr(self, '_pending_mismatches', [])
+        mismatch_candidates: list[tuple[Path, str, str]] = getattr(
+            self, '_pending_mismatches', []
+        )
         if not mismatch_candidates:
             return files
 
@@ -581,7 +650,11 @@ class TagRenamingStage:
         )
 
         categorized: dict[str, list[tuple[Path, str, str, str, str]]] = {
-            'A': [], 'B': [], 'C': [], 'D': [], 'E': [],
+            'A': [],
+            'B': [],
+            'C': [],
+            'D': [],
+            'E': [],
         }
 
         for f, file_title, new_name in active_mismatch:
@@ -590,7 +663,9 @@ class TagRenamingStage:
                 continue
             tag_artist, tag_title = tags.artist, tags.title
             category = categorize_mismatch(f, file_title, tag_title, tag_artist)
-            categorized[category].append((f, file_title, new_name, tag_artist, tag_title))
+            categorized[category].append(
+                (f, file_title, new_name, tag_artist, tag_title)
+            )
 
         category_names: dict[str, str] = {
             'A': 'Файлы с номерами треков',
@@ -643,7 +718,9 @@ class TagRenamingStage:
                 if cat_key == 'D':
                     parsed = parse_artist_title(f.stem)
                     if parsed:
-                        cleaned_artist, cleaned_title = clean_extracted_tags(parsed[0], parsed[1])
+                        cleaned_artist, cleaned_title = clean_extracted_tags(
+                            parsed[0], parsed[1]
+                        )
                         new_tag_str = f'{cleaned_artist} - {cleaned_title}'
                         interactor.display('      Файл останется без изменений')
                         interactor.display(f'      Теги: {tag_str}')
@@ -663,19 +740,28 @@ class TagRenamingStage:
             if cat_key != 'E':
                 default = category_defaults[cat_key]
                 action_name = (
-                    'переименовать по тегам' if default == 't' else 'обновить теги из имён'
+                    'переименовать по тегам'
+                    if default == 't'
+                    else 'обновить теги из имён'
                 )
 
                 choice = interactor.prompt(
-                    f"\nПрименить '{action_name}' ко всей группе? (y/n) [y]: ", default='y'
+                    f"\nПрименить '{action_name}' ко всей группе? (y/n) [y]: ",
+                    default='y',
                 )
 
                 if choice in ('', 'y', 'yes', 'д', 'да'):
-                    for f, file_title, new_name, tag_artist, tag_title in categorized[cat_key]:
+                    for f, file_title, new_name, tag_artist, tag_title in categorized[
+                        cat_key
+                    ]:
                         if default == 't':
                             new_path = f.with_name(new_name)
-                            status, result_path = safe_rename(f, new_path, ctx, repo, interactor)
-                            handle_rename_result(status, f, result_path, ctx, 'renamed_by_tags')
+                            status, result_path = safe_rename(
+                                f, new_path, ctx, repo, interactor
+                            )
+                            handle_rename_result(
+                                status, f, result_path, ctx, 'renamed_by_tags'
+                            )
                         else:
                             parsed = parse_artist_title(f.stem)
                             if parsed:
@@ -683,8 +769,12 @@ class TagRenamingStage:
                                     parsed[0], parsed[1]
                                 )
                                 if ctx.dry_run:
-                                    ctx.log_debug(f'[DRY RUN] Обновил бы теги из имени: {f.name}')
-                                    repo.simulate_update_tags(f, cleaned_artist, cleaned_title)
+                                    ctx.log_debug(
+                                        f'[DRY RUN] Обновил бы теги из имени: {f.name}'
+                                    )
+                                    repo.simulate_update_tags(
+                                        f, cleaned_artist, cleaned_title
+                                    )
                                     ctx.increment_stat('tags_written')
                                 elif repo.update_tags(f, cleaned_artist, cleaned_title):
                                     ctx.log_debug(f'Теги обновлены из имени: {f.name}')
@@ -694,13 +784,17 @@ class TagRenamingStage:
 
             else:
                 interactor.display('\nДля каждого файла выберите действие:')
-                interactor.display('  t - использовать данные из тега (переименовать файл)')
+                interactor.display(
+                    '  t - использовать данные из тега (переименовать файл)'
+                )
                 interactor.display('  f - использовать данные из файла (обновить тег)')
                 interactor.display('  n - пропустить')
 
                 last_action = 'n'
 
-                for f, file_title, old_new_name, tag_artist, tag_title in categorized[cat_key]:
+                for f, file_title, old_new_name, tag_artist, tag_title in categorized[
+                    cat_key
+                ]:
                     interactor.display(f'\n  {f.name}')
                     interactor.display(f'      Файл: {file_title or "(нет)"}')
                     interactor.display(f'      Теги: {tag_artist} - {tag_title}')
@@ -716,33 +810,47 @@ class TagRenamingStage:
                     elif last_action == 'f':
                         parsed = parse_artist_title(f.stem)
                         if parsed:
-                            interactor.display(f'      → Новые теги (f): {parsed[0]} - {parsed[1]}')
+                            interactor.display(
+                                f'      → Новые теги (f): {parsed[0]} - {parsed[1]}'
+                            )
                         else:
-                            interactor.display(f'      → Новые теги (f): {file_title or f.stem}')
+                            interactor.display(
+                                f'      → Новые теги (f): {file_title or f.stem}'
+                            )
                     else:
                         interactor.display(f'      → Если t: {current_new_name}')
                         parsed = parse_artist_title(f.stem)
                         if parsed:
-                            interactor.display(f'      → Если f: {parsed[0]} - {parsed[1]}')
+                            interactor.display(
+                                f'      → Если f: {parsed[0]} - {parsed[1]}'
+                            )
 
                     choice = interactor.prompt(
                         f'      Действие [t/f/n] ({last_action}): ', default=last_action
                     )
 
                     if choice == last_action and not choice:
-                        interactor.display(f'      [Использовано предыдущее действие: {choice}]')
+                        interactor.display(
+                            f'      [Использовано предыдущее действие: {choice}]'
+                        )
                     else:
                         last_action = choice
 
                     if choice == 't':
                         new_path = f.with_name(current_new_name)
-                        status, result_path = safe_rename(f, new_path, ctx, repo, interactor)
-                        handle_rename_result(status, f, result_path, ctx, 'renamed_by_tags')
+                        status, result_path = safe_rename(
+                            f, new_path, ctx, repo, interactor
+                        )
+                        handle_rename_result(
+                            status, f, result_path, ctx, 'renamed_by_tags'
+                        )
                     elif choice == 'f':
                         parsed = parse_artist_title(f.stem)
                         if parsed:
                             if ctx.dry_run:
-                                ctx.log_debug(f'[DRY RUN] Обновил бы теги из имени: {f.name}')
+                                ctx.log_debug(
+                                    f'[DRY RUN] Обновил бы теги из имени: {f.name}'
+                                )
                                 repo.simulate_update_tags(f, parsed[0], parsed[1])
                                 ctx.increment_stat('tags_written')
                             elif repo.update_tags(f, parsed[0], parsed[1]):
@@ -762,7 +870,9 @@ class TagRenamingStage:
         repo: TagRepository,
         interactor: UserInteractor,
     ) -> None:
-        interactor.display(f'\n  При переименовании обнаружено {len(duplicates_found)} дубликатов:')
+        interactor.display(
+            f'\n  При переименовании обнаружено {len(duplicates_found)} дубликатов:'
+        )
 
         for i, (old_path, new_path) in enumerate(duplicates_found, 1):
             old_info = file_info_line(old_path)
@@ -773,8 +883,10 @@ class TagRenamingStage:
             tags_match = (
                 old_tags
                 and existing_tags
-                and old_tags.artist.lower().strip() == existing_tags.artist.lower().strip()
-                and old_tags.title.lower().strip() == existing_tags.title.lower().strip()
+                and old_tags.artist.lower().strip()
+                == existing_tags.artist.lower().strip()
+                and old_tags.title.lower().strip()
+                == existing_tags.title.lower().strip()
             )
             tags_note = ' (теги совпадают)' if tags_match else ''
 
@@ -787,12 +899,18 @@ class TagRenamingStage:
 
             interactor.display(f'\n  {i}. {new_path.name}{tags_note}')
             interactor.display(f'      1. {old_path.name} ({old_info}){best_marker}')
-            interactor.display(f'      2. {new_path.name} ({existing_info}){existing_marker}')
+            interactor.display(
+                f'      2. {new_path.name} ({existing_info}){existing_marker}'
+            )
 
             if best_is_old:
-                interactor.display('      → Предлагается: оставить 1 (лучшее), удалить 2')
+                interactor.display(
+                    '      → Предлагается: оставить 1 (лучшее), удалить 2'
+                )
             else:
-                interactor.display('      → Предлагается: оставить 2 (лучшее), удалить 1')
+                interactor.display(
+                    '      → Предлагается: оставить 2 (лучшее), удалить 1'
+                )
 
         choice = interactor.prompt(
             f'\n  Объединить {len(duplicates_found)} дубликатов по лучшему качеству? (y/n) [y]: ',
@@ -802,8 +920,12 @@ class TagRenamingStage:
         if choice in ('', 'y', 'yes', 'д', 'да'):
             merged_count = 0
             for old_path, new_path in duplicates_found:
-                status, result_path = safe_rename(old_path, new_path, ctx, repo, interactor)
-                handle_rename_result(status, old_path, result_path, ctx, 'renamed_by_tags')
+                status, result_path = safe_rename(
+                    old_path, new_path, ctx, repo, interactor
+                )
+                handle_rename_result(
+                    status, old_path, result_path, ctx, 'renamed_by_tags'
+                )
                 if status in ('renamed', 'kept_existing'):
                     merged_count += 1
 
@@ -832,6 +954,7 @@ class TagRenamingStage:
                     if not match:
                         continue
                     from config import JUNK_PATTERN
+
                     if JUNK_PATTERN.search(f'({match})'):
                         continue
                     if FEAT_VARIANTS_PATTERN.match(match):
@@ -950,7 +1073,9 @@ class TagRenamingStage:
         else:
             chars_str = '/'
 
-        interactor.display('\n  Будет применено по умолчанию: ', )
+        interactor.display(
+            '\n  Будет применено по умолчанию: ',
+        )
 
         if problem_key == 'bilingual_title':
             interactor.display('оставить первое название')
@@ -961,7 +1086,9 @@ class TagRenamingStage:
 
         interactor.display('')
         for i, (f, current_name, proposed_name) in enumerate(examples, 1):
-            strategy_obj = StrategyFactory.create(default_strategy, {}, interactor, f.name)
+            strategy_obj = StrategyFactory.create(
+                default_strategy, {}, interactor, f.name
+            )
             preview_result = strategy_obj.apply(
                 proposed_name, set(INVALID_FILENAME_CHARS.findall(proposed_name))
             )
@@ -1066,7 +1193,7 @@ class TagWritingStage:
 
     @property
     def name(self) -> str:
-        return "Запись тегов из имени файла"
+        return 'Запись тегов из имени файла'
 
     def execute(
         self,
@@ -1102,7 +1229,9 @@ class TagWritingStage:
         for f, artist, title in tags_to_write:
             new_filename = build_safe_filename(artist, title, f.suffix)
             if new_filename != f.name:
-                labels.append(f'{f.name} → {new_filename} (artist: {artist!r}, title: {title!r})')
+                labels.append(
+                    f'{f.name} → {new_filename} (artist: {artist!r}, title: {title!r})'
+                )
             else:
                 labels.append(f'{f.name} (artist: {artist!r}, title: {title!r})')
 
@@ -1131,7 +1260,9 @@ class TagWritingStage:
 
                     if new_filename != f.name:
                         new_path = f.with_name(new_filename)
-                        status, result_path = safe_rename(f, new_path, ctx, repo, interactor)
+                        status, result_path = safe_rename(
+                            f, new_path, ctx, repo, interactor
+                        )
                         if status in ('renamed', 'kept_existing'):
                             renamed_count += 1
                             ctx.increment_stat('renamed_by_tags')
@@ -1167,9 +1298,13 @@ class TagWritingStage:
         )
         for i, f, artist, title, matches in files_with_annotations:
             interactor.display(f'    {f.name}')
-            interactor.display(f'      Уточнения: {", ".join(f"({m})" for m in matches)}')
+            interactor.display(
+                f'      Уточнения: {", ".join(f"({m})" for m in matches)}'
+            )
 
-        choice = interactor.prompt('\n  Удалить уточнения из тегов и имён? (y/n) [y]: ', default='y')
+        choice = interactor.prompt(
+            '\n  Удалить уточнения из тегов и имён? (y/n) [y]: ', default='y'
+        )
 
         if choice in ('', 'y', 'yes', 'д', 'да'):
             for i, f, artist, title, matches in files_with_annotations:
@@ -1189,7 +1324,7 @@ class DuplicateResolutionStage:
 
     @property
     def name(self) -> str:
-        return "Поиск и объединение дубликатов"
+        return 'Поиск и объединение дубликатов'
 
     def execute(
         self,
@@ -1206,7 +1341,7 @@ class ArtistNormalizationStage:
 
     @property
     def name(self) -> str:
-        return "Нормализация имён исполнителей"
+        return 'Нормализация имён исполнителей'
 
     def execute(
         self,
@@ -1217,7 +1352,8 @@ class ArtistNormalizationStage:
     ) -> list[Path]:
         if ctx.target_dir is not None:
             files = [
-                f for f in ctx.target_dir.iterdir()
+                f
+                for f in ctx.target_dir.iterdir()
                 if f.suffix.lower() in SUPPORTED_EXTENSIONS
             ]
             ctx.log_debug(f'Пересканировано файлов перед этапом 6: {len(files)}')
@@ -1235,9 +1371,13 @@ class ArtistNormalizationStage:
         for key, entries in artist_variations.items():
             artist_counts: dict[str, int] = {}
             for _, _, individual_artist in entries:
-                artist_counts[individual_artist] = artist_counts.get(individual_artist, 0) + 1
+                artist_counts[individual_artist] = (
+                    artist_counts.get(individual_artist, 0) + 1
+                )
 
-            sorted_artists = sorted(artist_counts.items(), key=lambda x: x[1], reverse=True)
+            sorted_artists = sorted(
+                artist_counts.items(), key=lambda x: x[1], reverse=True
+            )
 
             interactor.display(f'\nИсполнитель: {key}')
             interactor.display('Варианты написания:')
@@ -1261,7 +1401,9 @@ class ArtistNormalizationStage:
                     selected_idx = 0
 
             canonical = sorted_artists[selected_idx][0]
-            ctx.log_debug(f'Обрабатываю исполнителя {key!r}, канонический вариант: {canonical!r}')
+            ctx.log_debug(
+                f'Обрабатываю исполнителя {key!r}, канонический вариант: {canonical!r}'
+            )
 
             processed_files: set[Path] = set()
             for f, full_artist, individual_artist in entries:
@@ -1300,17 +1442,25 @@ class ArtistNormalizationStage:
                         raw_name = f'{new_full_artist} - {parsed[1]}'
 
                         if INVALID_FILENAME_CHARS.search(raw_name):
-                            base_name = clean_filename_safely(raw_name, f.name, ctx, interactor)
+                            base_name = clean_filename_safely(
+                                raw_name, f.name, ctx, interactor
+                            )
                             if base_name == 'SKIP':
-                                ctx.log_debug(f'Пропущен из-за недопустимых символов: {f.name}')
+                                ctx.log_debug(
+                                    f'Пропущен из-за недопустимых символов: {f.name}'
+                                )
                                 continue
                         else:
                             base_name = raw_name
 
                         new_name = f'{base_name}{f.suffix}'
                         new_path = f.with_name(new_name)
-                        status, result_path = safe_rename(f, new_path, ctx, repo, interactor)
-                        handle_rename_result(status, f, result_path, ctx, 'renamed_by_tags')
+                        status, result_path = safe_rename(
+                            f, new_path, ctx, repo, interactor
+                        )
+                        handle_rename_result(
+                            status, f, result_path, ctx, 'renamed_by_tags'
+                        )
 
                     processed_files.add(f)
 
@@ -1323,7 +1473,7 @@ class ManualInputStage:
 
     @property
     def name(self) -> str:
-        return "Ручной ввод для файлов без метаданных"
+        return 'Ручной ввод для файлов без метаданных'
 
     def execute(
         self,
@@ -1334,7 +1484,8 @@ class ManualInputStage:
     ) -> list[Path]:
         if ctx.target_dir is not None:
             files = [
-                f for f in ctx.target_dir.iterdir()
+                f
+                for f in ctx.target_dir.iterdir()
                 if f.suffix.lower() in SUPPORTED_EXTENSIONS
             ]
             ctx.log_debug(f'Пересканировано файлов перед этапом 7: {len(files)}')
@@ -1367,7 +1518,9 @@ class ManualInputStage:
             title = extract_title_from_filename(f.stem)
             interactor.display(f'\n  Файл: {f.name}')
             interactor.display(f'  Предполагаемое название: {title}')
-            artist = interactor.prompt('  Введите исполнителя (Enter - пропустить): ').strip()
+            artist = interactor.prompt(
+                '  Введите исполнителя (Enter - пропустить): '
+            ).strip()
             if not artist:
                 still_missing.append(f)
                 continue
