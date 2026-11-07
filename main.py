@@ -77,15 +77,17 @@ def main() -> None:
         return
 
     # 2. Сборка пайплайна
-    pipeline = AudioProcessingPipeline([
-        JunkCleaningStage(),
-        NormalizationStage(),
-        TagRenamingStage(),
-        TagWritingStage(),
-        DuplicateResolutionStage(),
-        ArtistNormalizationStage(),
-        ManualInputStage(),
-    ])
+    pipeline = AudioProcessingPipeline(
+        [
+            JunkCleaningStage(),
+            NormalizationStage(),
+            TagRenamingStage(),
+            TagWritingStage(),
+            DuplicateResolutionStage(),
+            ArtistNormalizationStage(),
+            ManualInputStage(),
+        ]
+    )
 
     # 3. Запуск пайплайна
     files = pipeline.run(

@@ -89,7 +89,9 @@ def build_safe_filename(artist: str, title: str, extension: str) -> str:
 
 def remove_annotation_from_text(text: str, annotation: str) -> str:
     """Удаляет конкретное уточнение в скобках из текста."""
-    pattern = re.compile(r'\s*[\(\[]\s*' + re.escape(annotation) + r'\s*[\)\]]\s*', re.IGNORECASE)
+    pattern = re.compile(
+        r'\s*[\(\[]\s*' + re.escape(annotation) + r'\s*[\)\]]\s*', re.IGNORECASE
+    )
     return pattern.sub('', text).strip()
 
 
@@ -108,7 +110,11 @@ def normalize_feat_pair(artist: str, title: str) -> tuple[str, str]:
     if feat_matches:
         for i, match in enumerate(feat_matches):
             start = match.end()
-            end = feat_matches[i + 1].start() if i + 1 < len(feat_matches) else len(artist)
+            end = (
+                feat_matches[i + 1].start()
+                if i + 1 < len(feat_matches)
+                else len(artist)
+            )
             guest_part = artist[start:end].strip()
             for g in re.split(r'\s*[&,]\s*', guest_part):
                 g = g.strip()
@@ -117,7 +123,11 @@ def normalize_feat_pair(artist: str, title: str) -> tuple[str, str]:
 
         base = artist
         for i, match in enumerate(feat_matches):
-            end = feat_matches[i + 1].start() if i + 1 < len(feat_matches) else len(artist)
+            end = (
+                feat_matches[i + 1].start()
+                if i + 1 < len(feat_matches)
+                else len(artist)
+            )
             base = base[: match.start()] + base[end:]
         cleaned_artist = re.sub(r'\s+', ' ', base).strip()
     else:
