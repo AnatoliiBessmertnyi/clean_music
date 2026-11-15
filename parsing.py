@@ -127,8 +127,6 @@ def clean_extracted_tags(artist: str, title: str) -> tuple[str, str]:
 
         # Нормализуем пробелы
         text = re.sub(r'\s+', ' ', text).strip()
-        text = re.sub(r'\s*[-–—]\s*', ' - ', text)
-
-        return text
+        return re.sub(r'\s*[-–—]\s*', ' - ', text)
 
     return clean_text(artist), clean_text(title)

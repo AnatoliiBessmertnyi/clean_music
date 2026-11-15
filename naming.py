@@ -244,11 +244,9 @@ def normalize_artist_separators(artist: str) -> str:
         if exception.lower() in artist_lower:
             result = artist.replace(';', ',')
             result = re.sub(r'\s*,\s*', ', ', result)
-            result = re.sub(r'\s+', ' ', result).strip()
-            return result
+            return re.sub(r'\s+', ' ', result).strip()
 
     result = artist.replace(';', ',')
     result = re.sub(r'\s*/\s*', ', ', result)
     result = re.sub(r'\s*,\s*', ', ', result)
-    result = re.sub(r'\s+', ' ', result).strip()
-    return result
+    return re.sub(r'\s+', ' ', result).strip()

@@ -2,6 +2,7 @@
 
 import re
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -66,10 +67,8 @@ def rename_case_sensitive(old_path: Path, new_path: Path, ctx: SessionContext) -
     except OSError as e:
         ctx.log_debug(f'Ошибка при case-sensitive rename: {e}')
         if temp_path.exists():
-            try:
+            with suppress(OSError):
                 temp_path.rename(old_path)
-            except OSError:
-                pass
         return False
 
 
@@ -664,7 +663,7 @@ def find_artist_variations(
 
     variations: dict[str, list[tuple[Path, str, str]]] = {}
     for key, entries in artist_map.items():
-        unique_artists = set(individual_artist for _, _, individual_artist in entries)
+        unique_artists = {individual_artist for _, _, individual_artist in entries}
         if len(unique_artists) > 1:
             variations[key] = entries
     return variations

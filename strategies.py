@@ -99,13 +99,12 @@ class StrategyFactory:
     ) -> SanitizationStrategy:
         if strategy_name == 'remove':
             return RemoveCharsStrategy()
-        elif strategy_name == 'replace':
+        if strategy_name == 'replace':
             return ReplaceCharsStrategy(params.get('char', '-'))
-        elif strategy_name in ('first_title', 'second_title'):
+        if strategy_name in ('first_title', 'second_title'):
             return BilingualTitleStrategy(keep_first=(strategy_name == 'first_title'))
-        elif strategy_name == 'manual':
+        if strategy_name == 'manual':
             return ManualInputStrategy(interactor, filename)
-        elif strategy_name == 'skip':
+        if strategy_name == 'skip':
             raise ValueError("Strategy 'skip' should be handled before applying.")
-        else:
-            raise ValueError(f'Неизвестная стратегия: {strategy_name}')
+        raise ValueError(f'Неизвестная стратегия: {strategy_name}')
