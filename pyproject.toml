@@ -8,7 +8,7 @@ dependencies = [
     "rich>=13.7.0",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "pytest>=7.4.0",
     "pytest-mock>=3.12.0",
@@ -16,8 +16,8 @@ dev = [
     "mypy>=1.8.0",
 ]
 
-[tool.setuptools]
-py-modules = ["config", "naming", "parsing", "main", "context", "tag_repository"]
+[tool.uv]
+package = false
 
 [tool.ruff]
 line-length = 88

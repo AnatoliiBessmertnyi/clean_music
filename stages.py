@@ -150,8 +150,7 @@ class NormalizationStage:
     ) -> list[Path]:
         def normalize_text(text: str) -> str:
             text = normalize_dash(text)
-            text = normalize_filename_stem(text)
-            return text
+            return normalize_filename_stem(text)
 
         candidates = [f for f in files if normalize_text(f.stem) != f.stem]
 
@@ -314,7 +313,7 @@ class TagRenamingStage:
         interactor.display(
             f'\nНайдено {len(sep_candidates)} файлов для нормализации разделителей:'
         )
-        for i, (f, artist, title, new_artist) in enumerate(sep_candidates, 1):
+        for i, (f, artist, _title, new_artist) in enumerate(sep_candidates, 1):
             interactor.display(f'\n  {i}. {f.name}')
             interactor.display('      БЫЛО:')
             interactor.display(f'        Исполнитель: {artist!r}')
@@ -399,7 +398,7 @@ class TagRenamingStage:
             f'\nНайдено {len(annotations)} уникальных уточнений в {len(categories)} категориях:'
         )
 
-        for cat_key, cat_data in categories.items():
+        for _cat_key, cat_data in categories.items():
             total_files = sum(
                 len(file_list) for file_list in cat_data['items'].values()
             )
@@ -477,7 +476,7 @@ class TagRenamingStage:
             )
 
             priority_order = ['bilingual_title', 'artist_name']
-            other_keys = [k for k in invalid_files.keys() if k not in priority_order]
+            other_keys = [k for k in invalid_files if k not in priority_order]
             ordered_keys = priority_order + sorted(other_keys)
 
             for problem_key in ordered_keys:
@@ -618,7 +617,7 @@ class TagRenamingStage:
 
         # Фильтруем несуществующие и уже корректные
         active_mismatch: list[tuple[Path, str, str]] = []
-        for f, file_title, old_new_name in mismatch_candidates:
+        for f, file_title, _old_new_name in mismatch_candidates:
             if not f.exists():
                 ctx.log_debug(f'Файл {f.name} больше не существует, пропускаю')
                 continue
@@ -751,9 +750,13 @@ class TagRenamingStage:
                 )
 
                 if choice in ('', 'y', 'yes', 'д', 'да'):
-                    for f, file_title, new_name, tag_artist, tag_title in categorized[
-                        cat_key
-                    ]:
+                    for (
+                        f,
+                        _file_title,
+                        new_name,
+                        _tag_artist,
+                        _tag_title,
+                    ) in categorized[cat_key]:
                         if default == 't':
                             new_path = f.with_name(new_name)
                             status, result_path = safe_rename(
@@ -792,7 +795,7 @@ class TagRenamingStage:
 
                 last_action = 'n'
 
-                for f, file_title, old_new_name, tag_artist, tag_title in categorized[
+                for f, file_title, _old_new_name, tag_artist, tag_title in categorized[
                     cat_key
                 ]:
                     interactor.display(f'\n  {f.name}')
@@ -1068,10 +1071,7 @@ class TagRenamingStage:
         else:
             default_strategy = 'remove'
 
-        if problem_key.startswith('other:'):
-            chars_str = problem_key[6:]
-        else:
-            chars_str = '/'
+        chars_str = problem_key[6:] if problem_key.startswith('other:') else '/'
 
         interactor.display(
             '\n  Будет применено по умолчанию: ',
@@ -1183,9 +1183,7 @@ class TagRenamingStage:
         t = tag_title.lower().strip()
         if f == t:
             return True
-        if f in t or t in f:
-            return True
-        return False
+        return f in t or t in f
 
 
 class TagWritingStage:
@@ -1296,7 +1294,7 @@ class TagWritingStage:
         interactor.display(
             f'\n  Внимание: {len(files_with_annotations)} файлов содержат уточнения в скобках:'
         )
-        for i, f, artist, title, matches in files_with_annotations:
+        for _i, f, _artist, _title, matches in files_with_annotations:
             interactor.display(f'    {f.name}')
             interactor.display(
                 f'      Уточнения: {", ".join(f"({m})" for m in matches)}'
