@@ -1,5 +1,6 @@
 """Контекст сессии обработки аудиофайлов."""
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -17,6 +18,7 @@ class SessionContext:
         remembered_choices: Запомненные выборы пользователя для санитизации
         ask_counts: Счетчики запросов для подсказок
         stats: Статистика обработки по категориям
+        blocked_paths: Абсолютные пути и причины запрета изменений до конца сессии
     """
 
     dry_run: bool
@@ -39,6 +41,23 @@ class SessionContext:
         }
     )
     missing_files: list[Path] = field(default_factory=list)
+    blocked_paths: dict[Path, str] = field(default_factory=dict)
+
+    def block_path(self, path: Path, reason: str) -> None:
+        """Запрещает дальнейшие изменения по пути, сохраняя первую причину.
+
+        absolute() не разрешает ссылки. normcase() нормализует регистр
+        только в Windows; на POSIX сохраняет исходное написание.
+        """
+        self.blocked_paths.setdefault(Path(os.path.normcase(path.absolute())), reason)
+
+    def get_block_reason(self, path: Path) -> str | None:
+        """Возвращает причину блокировки или None, если путь не заблокирован."""
+        return self.blocked_paths.get(Path(os.path.normcase(path.absolute())))
+
+    def is_path_blocked(self, path: Path) -> bool:
+        """Проверяет запрет изменений по пути в текущей сессии."""
+        return Path(os.path.normcase(path.absolute())) in self.blocked_paths
 
     def increment_stat(self, key: str, amount: int = 1) -> None:
         """Увеличивает счетчик статистики.
