@@ -31,10 +31,9 @@ from parsing import (
 from pipeline_utils import (
     categorize_mismatch,
     clean_filename_safely,
-    file_info_line,
     find_artist_variations,
     handle_rename_result,
-    name_quality_score,
+    modification_allowed,
     process_duplicates,
     process_rename_batch,
     safe_rename,
@@ -43,6 +42,25 @@ from pipeline_utils import (
 )
 from strategies import StrategyFactory
 from tag_repository import TagRepository
+
+
+def _update_tags(
+    path: Path,
+    artist: str,
+    title: str,
+    ctx: SessionContext,
+    repo: TagRepository,
+    interactor: UserInteractor,
+) -> bool:
+    """Проверяет безопасность и блокирует зависимые действия при отказе записи."""
+    if not modification_allowed(path, ctx, interactor):
+        return False
+    if repo.update_tags(path, artist, title):
+        return True
+    reason = 'запись тегов не подтверждена'
+    ctx.block_path(path, reason)
+    interactor.display_error(f'{path.name}: {reason}')
+    return False
 
 
 class JunkCleaningStage:
@@ -121,11 +139,13 @@ class JunkCleaningStage:
         cleaned_count = 0
         for i in idx:
             f, _, _, new_artist, new_title = candidates[i]
+            if not modification_allowed(f, ctx, interactor):
+                continue
             if ctx.dry_run:
                 ctx.log_debug(f'[DRY RUN] Очистил бы теги: {f.name}')
                 repo.simulate_update_tags(f, new_artist, new_title)
                 cleaned_count += 1
-            elif repo.update_tags(f, new_artist, new_title):
+            elif _update_tags(f, new_artist, new_title, ctx, repo, interactor):
                 interactor.display(f'  Теги очищены: {f.name}')
                 cleaned_count += 1
 
@@ -272,11 +292,13 @@ class TagRenamingStage:
         normalized_count = 0
         for i in selected_indices:
             f, _, _, new_artist, new_title, _ = feat_candidates[i]
+            if not modification_allowed(f, ctx, interactor):
+                continue
             if ctx.dry_run:
                 ctx.log_debug(f'[DRY RUN] Нормализовал бы (feat.): {f.name}')
                 repo.simulate_update_tags(f, new_artist, new_title)
                 normalized_count += 1
-            elif repo.update_tags(f, new_artist, new_title):
+            elif _update_tags(f, new_artist, new_title, ctx, repo, interactor):
                 ctx.log_debug(f'Нормализован (feat.): {f.name}')
                 normalized_count += 1
 
@@ -330,11 +352,13 @@ class TagRenamingStage:
         for i in selected_indices:
             f, _, _, new_artist = sep_candidates[i]
             title = sep_candidates[i][2]
+            if not modification_allowed(f, ctx, interactor):
+                continue
             if ctx.dry_run:
                 ctx.log_debug(f'[DRY RUN] Нормализовал бы разделители: {f.name}')
                 repo.simulate_update_tags(f, new_artist, title)
                 normalized_count += 1
-            elif repo.update_tags(f, new_artist, title):
+            elif _update_tags(f, new_artist, title, ctx, repo, interactor):
                 ctx.log_debug(f'Нормализован (разделители): {f.name}')
                 normalized_count += 1
 
@@ -375,13 +399,17 @@ class TagRenamingStage:
                     if tags:
                         new_title = remove_annotation_from_text(tags.title, ann)
                         if new_title != tags.title:
+                            if not modification_allowed(f, ctx, interactor):
+                                continue
                             if ctx.dry_run:
                                 ctx.log_debug(
                                     f'[DRY RUN] Автоудалил бы: ({ann}) из {f.name}'
                                 )
                                 repo.simulate_update_tags(f, tags.artist, new_title)
                                 removed_count += 1
-                            elif repo.update_tags(f, tags.artist, new_title):
+                            elif _update_tags(
+                                f, tags.artist, new_title, ctx, repo, interactor
+                            ):
                                 ctx.log_debug(f'Автоудалено: ({ann}) из {f.name}')
                                 removed_count += 1
             if removed_count:
@@ -441,13 +469,17 @@ class TagRenamingStage:
                     if tags:
                         new_title = remove_annotation_from_text(tags.title, ann)
                         if new_title != tags.title:
+                            if not modification_allowed(f, ctx, interactor):
+                                continue
                             if ctx.dry_run:
                                 ctx.log_debug(
                                     f'[DRY RUN] Удалил бы из тега: ({ann}) из {f.name}'
                                 )
                                 repo.simulate_update_tags(f, tags.artist, new_title)
                                 removed_count += 1
-                            elif repo.update_tags(f, tags.artist, new_title):
+                            elif _update_tags(
+                                f, tags.artist, new_title, ctx, repo, interactor
+                            ):
                                 ctx.log_debug(f'Удалено из тега: ({ann}) из {f.name}')
                                 removed_count += 1
             interactor.display(f'  Удалено уточнений из тегов: {removed_count}')
@@ -580,7 +612,7 @@ class TagRenamingStage:
                     old_path, new_path, ctx, repo, interactor
                 )
 
-                if status == 'renamed':
+                if status == 'renamed' and result_path is not None:
                     ctx.log_debug(f'Переименован: {old_path.name} -> {new_path.name}')
                     ctx.increment_stat('renamed_by_tags')
                     renamed_count += 1
@@ -771,6 +803,8 @@ class TagRenamingStage:
                                 cleaned_artist, cleaned_title = clean_extracted_tags(
                                     parsed[0], parsed[1]
                                 )
+                                if not modification_allowed(f, ctx, interactor):
+                                    continue
                                 if ctx.dry_run:
                                     ctx.log_debug(
                                         f'[DRY RUN] Обновил бы теги из имени: {f.name}'
@@ -779,7 +813,14 @@ class TagRenamingStage:
                                         f, cleaned_artist, cleaned_title
                                     )
                                     ctx.increment_stat('tags_written')
-                                elif repo.update_tags(f, cleaned_artist, cleaned_title):
+                                elif _update_tags(
+                                    f,
+                                    cleaned_artist,
+                                    cleaned_title,
+                                    ctx,
+                                    repo,
+                                    interactor,
+                                ):
                                     ctx.log_debug(f'Теги обновлены из имени: {f.name}')
                                     ctx.increment_stat('tags_written')
                 else:
@@ -850,13 +891,17 @@ class TagRenamingStage:
                     elif choice == 'f':
                         parsed = parse_artist_title(f.stem)
                         if parsed:
+                            if not modification_allowed(f, ctx, interactor):
+                                continue
                             if ctx.dry_run:
                                 ctx.log_debug(
                                     f'[DRY RUN] Обновил бы теги из имени: {f.name}'
                                 )
                                 repo.simulate_update_tags(f, parsed[0], parsed[1])
                                 ctx.increment_stat('tags_written')
-                            elif repo.update_tags(f, parsed[0], parsed[1]):
+                            elif _update_tags(
+                                f, parsed[0], parsed[1], ctx, repo, interactor
+                            ):
                                 ctx.log_debug(f'Теги обновлены из имени: {f.name}')
                                 ctx.increment_stat('tags_written')
                     else:
@@ -873,68 +918,10 @@ class TagRenamingStage:
         repo: TagRepository,
         interactor: UserInteractor,
     ) -> None:
-        interactor.display(
-            f'\n  При переименовании обнаружено {len(duplicates_found)} дубликатов:'
-        )
-
-        for i, (old_path, new_path) in enumerate(duplicates_found, 1):
-            old_info = file_info_line(old_path)
-            existing_info = file_info_line(new_path)
-
-            old_tags = repo.get_tags(old_path)
-            existing_tags = repo.get_tags(new_path)
-            tags_match = (
-                old_tags
-                and existing_tags
-                and old_tags.artist.lower().strip()
-                == existing_tags.artist.lower().strip()
-                and old_tags.title.lower().strip()
-                == existing_tags.title.lower().strip()
-            )
-            tags_note = ' (теги совпадают)' if tags_match else ''
-
-            old_score = (old_path.stat().st_size, name_quality_score(old_path))
-            new_score = (new_path.stat().st_size, name_quality_score(new_path))
-            best_is_old = old_score >= new_score
-
-            best_marker = ' [лучшее]' if best_is_old else ''
-            existing_marker = ' [лучшее]' if not best_is_old else ''
-
-            interactor.display(f'\n  {i}. {new_path.name}{tags_note}')
-            interactor.display(f'      1. {old_path.name} ({old_info}){best_marker}')
-            interactor.display(
-                f'      2. {new_path.name} ({existing_info}){existing_marker}'
-            )
-
-            if best_is_old:
-                interactor.display(
-                    '      → Предлагается: оставить 1 (лучшее), удалить 2'
-                )
-            else:
-                interactor.display(
-                    '      → Предлагается: оставить 2 (лучшее), удалить 1'
-                )
-
-        choice = interactor.prompt(
-            f'\n  Объединить {len(duplicates_found)} дубликатов по лучшему качеству? (y/n) [y]: ',
-            default='y',
-        )
-
-        if choice in ('', 'y', 'yes', 'д', 'да'):
-            merged_count = 0
-            for old_path, new_path in duplicates_found:
-                status, result_path = safe_rename(
-                    old_path, new_path, ctx, repo, interactor
-                )
-                handle_rename_result(
-                    status, old_path, result_path, ctx, 'renamed_by_tags'
-                )
-                if status in ('renamed', 'kept_existing'):
-                    merged_count += 1
-
-            interactor.display(f'  Объединено дубликатов: {merged_count}')
-        else:
-            interactor.display('  Дубликаты пропущены.')
+        interactor.display(f'\n  Конфликтов целевого имени: {len(duplicates_found)}')
+        for old_path, new_path in duplicates_found:
+            interactor.display(f'    {old_path.name} → {new_path.name}')
+        interactor.display('  Объединение отключено; оба файла сохранены.')
 
     # === Приватные вспомогательные методы (чистая логика) ===
 
@@ -1245,12 +1232,14 @@ class TagWritingStage:
         for i in selected_indices:
             f, artist, title = tags_to_write[i]
 
+            if not modification_allowed(f, ctx, interactor):
+                continue
             if ctx.dry_run:
                 ctx.log_debug(f'[DRY RUN] Записал бы теги: {f.name}')
                 repo.simulate_update_tags(f, artist, title)
                 written_count += 1
             else:
-                if repo.update_tags(f, artist, title):
+                if _update_tags(f, artist, title, ctx, repo, interactor):
                     ctx.log_debug(f'Записаны теги: {f.name}')
                     ctx.increment_stat('tags_written')
                     written_count += 1
@@ -1261,7 +1250,7 @@ class TagWritingStage:
                         status, result_path = safe_rename(
                             f, new_path, ctx, repo, interactor
                         )
-                        if status in ('renamed', 'kept_existing'):
+                        if status == 'renamed' and result_path is not None:
                             renamed_count += 1
                             ctx.increment_stat('renamed_by_tags')
 
@@ -1318,11 +1307,11 @@ class TagWritingStage:
 
 
 class DuplicateResolutionStage:
-    """Этап 5: Поиск и объединение дубликатов."""
+    """Этап 5: Показ кандидатов в дубликаты без объединения."""
 
     @property
     def name(self) -> str:
-        return 'Поиск и объединение дубликатов'
+        return 'Поиск кандидатов в дубликаты'
 
     def execute(
         self,
@@ -1421,6 +1410,8 @@ class ArtistNormalizationStage:
 
                     tags = repo.get_tags(f)
                     if tags:
+                        if not modification_allowed(f, ctx, interactor):
+                            continue
                         if ctx.dry_run:
                             interactor.display(
                                 f'  [DRY RUN] Обновил бы тег: {f.name} ({full_artist} -> {new_full_artist})'
@@ -1428,13 +1419,17 @@ class ArtistNormalizationStage:
                             repo.simulate_update_tags(f, new_full_artist, tags.title)
                             ctx.increment_stat('artists_normalized')
                             unique_normalized.add(key)
-                        elif repo.update_tags(f, new_full_artist, tags.title):
+                        elif _update_tags(
+                            f, new_full_artist, tags.title, ctx, repo, interactor
+                        ):
                             ctx.log_debug(
                                 f'Обновлено: {f.name} ({full_artist} -> {new_full_artist})'
                             )
                             ctx.increment_stat('artists_normalized')
                             unique_normalized.add(key)
 
+                    if ctx.is_path_blocked(f):
+                        continue
                     parsed = parse_artist_title(f.stem)
                     if parsed and parsed[0] != new_full_artist:
                         raw_name = f'{new_full_artist} - {parsed[1]}'
@@ -1511,6 +1506,8 @@ class ManualInputStage:
 
         for i in selected_indices:
             f = actually_missing[i]
+            if not modification_allowed(f, ctx, interactor):
+                continue
             if not f.exists():
                 continue
             title = extract_title_from_filename(f.stem)
