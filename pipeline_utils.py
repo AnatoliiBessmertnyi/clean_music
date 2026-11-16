@@ -1,10 +1,12 @@
 """Утилиты для оркестрации пайплайна: безопасное переименование и интерактивный выбор."""
 
+import ctypes
+import os
 import re
+import stat
+import sys
 from collections.abc import Callable
-from contextlib import suppress
 from pathlib import Path
-from typing import Any
 
 from mutagen.asf import ASF
 from mutagen.flac import FLAC
@@ -56,33 +58,83 @@ def files_are_same(old_path: Path, new_path: Path) -> bool:
         return False
 
 
+WSL_MODIFICATION_DISABLED = (
+    'Модификация на монтированных файловых системах WSL временно отключена '
+    'из соображений безопасности'
+)
+
+
+def _windows_local_ntfs(path: Path) -> bool:
+    """Подтверждает локальный NTFS; неизвестные тома не допускаются."""
+    if sys.platform != 'win32':
+        return False
+    volume = ctypes.create_unicode_buffer(261)
+    filesystem = ctypes.create_unicode_buffer(261)
+    kernel = ctypes.windll.kernel32
+    if not kernel.GetVolumePathNameW(str(path.absolute()), volume, len(volume)):
+        return False
+    if kernel.GetDriveTypeW(volume.value) != 3:
+        return False
+    if not kernel.GetVolumeInformationW(
+        volume.value, None, 0, None, None, None, filesystem, len(filesystem)
+    ):
+        return False
+    return filesystem.value == 'NTFS'
+
+
+def modification_allowed(
+    path: Path, ctx: SessionContext, interactor: UserInteractor
+) -> bool:
+    """Проверяет блокировку, платформу, ссылки и родителей без resolve()."""
+    reason = ctx.get_block_reason(path)
+    if reason is not None:
+        interactor.display(f'  Пропущен: {path.name}: {reason}')
+        return False
+    try:
+        if os.name != 'nt':
+            raise OSError(WSL_MODIFICATION_DISABLED + ' (POSIX не подтверждён)')
+        absolute = path.absolute()
+        for entry in (absolute, *absolute.parents):
+            info = os.lstat(entry)
+            if stat.S_ISLNK(info.st_mode) or (
+                getattr(info, 'st_file_attributes', 0)
+                & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                raise OSError(f'ссылки и reparse points не поддерживаются: {entry}')
+            if entry == absolute and (
+                not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+            ):
+                raise OSError('требуется обычный файл с одной жёсткой ссылкой')
+        if not _windows_local_ntfs(absolute):
+            raise OSError(
+                'модификация поддерживается только на локальном NTFS в Windows'
+            )
+    except OSError as exc:
+        ctx.block_path(path, str(exc))
+        interactor.display_error(f'{path.name}: {exc}')
+        return False
+    return True
+
+
 def rename_case_sensitive(old_path: Path, new_path: Path, ctx: SessionContext) -> bool:
-    """Переименовывает файл с изменением только регистра (Windows)."""
-    temp_name = new_path.stem + '__temp__' + new_path.suffix
-    temp_path = old_path.with_name(temp_name)
+    """Один Windows rename; написание проверяется по записи каталога."""
     try:
-        old_path.rename(temp_path)
-        temp_path.rename(new_path)
-        return True
-    except OSError as e:
-        ctx.log_debug(f'Ошибка при case-sensitive rename: {e}')
-        if temp_path.exists():
-            with suppress(OSError):
-                temp_path.rename(old_path)
+        old_path.rename(new_path)
+        actual = next(
+            (
+                entry
+                for entry in new_path.parent.iterdir()
+                if entry.name == new_path.name
+            ),
+            None,
+        )
+        if actual is None or not actual.samefile(new_path):
+            raise OSError('фактическое написание имени после rename не подтверждено')
+    except OSError as exc:
+        ctx.block_path(old_path, str(exc))
+        ctx.block_path(new_path, str(exc))
         return False
-
-
-def safe_unlink(filepath: Path, interactor: UserInteractor) -> bool:
-    """Безопасно удаляет файл, обрабатывая ошибки блокировки."""
-    try:
-        filepath.unlink()
-        return True
-    except PermissionError:
-        interactor.display_error(f'файл заблокирован, не могу удалить: {filepath.name}')
-        return False
-    except OSError as e:
-        interactor.display_error(f'при удалении {filepath.name}: {e}')
-        return False
+    return True
 
 
 def simple_rename(
@@ -92,41 +144,8 @@ def simple_rename(
     repo: TagRepository,
     interactor: UserInteractor,
 ) -> tuple[str, Path | None]:
-    """Простое переименование без разрешения дубликатов.
-
-    Если целевое имя занято, возвращает 'duplicate_exists',
-    чтобы вызывающий код мог обработать дубликат отдельно.
-    """
-    ctx.log_debug(f'simple_rename: {old_path.name!r} -> {new_path.name!r}')
-
-    if not old_path.exists():
-        interactor.display(f'  Файл не найден: {old_path.name}')
-        return 'skipped', None
-
-    if files_are_same(old_path, new_path):
-        ctx.log_debug('Это один и тот же файл (samefile), меняем только регистр')
-        if ctx.dry_run:
-            ctx.log_debug('[DRY RUN] Пропускаю смену регистра')
-            return 'renamed', new_path
-        if rename_case_sensitive(old_path, new_path, ctx):
-            ctx.log_debug(f'Регистр успешно изменён: {new_path.name}')
-            repo.simulate_rename(old_path, new_path)
-            return 'renamed', new_path
-        ctx.log_debug('Не удалось изменить регистр, пропускаю')
-        return 'skipped', None
-
-    if not new_path.exists():
-        if ctx.dry_run:
-            ctx.log_debug(
-                f'[DRY RUN] Переименовал бы: {old_path.name} -> {new_path.name}'
-            )
-            repo.simulate_rename(old_path, new_path)
-            return 'renamed', new_path
-        old_path.rename(new_path)
-        repo.simulate_rename(old_path, new_path)
-        return 'renamed', new_path
-
-    return 'duplicate_exists', new_path
+    """Переименовывает без замены; конфликт передаёт для отображения."""
+    return safe_rename(old_path, new_path, ctx, repo, interactor)
 
 
 def safe_rename(
@@ -136,64 +155,72 @@ def safe_rename(
     repo: TagRepository,
     interactor: UserInteractor,
 ) -> tuple[str, Path | None]:
-    """Безопасно переименовывает файл, автоматически разрешая дубликаты.
-
-    Если целевое имя занято, сравнивает файлы и оставляет лучший,
-    удаляя худший дубликат.
-    """
-    ctx.log_debug(f'rename: {old_path.name!r} -> {new_path.name!r}')
-
-    if not old_path.exists():
-        interactor.display(f'  Файл не найден: {old_path.name}')
+    """Один Windows rename без replace, удаления и временных путей."""
+    if not modification_allowed(old_path, ctx, interactor):
         return 'skipped', None
-
-    if files_are_same(old_path, new_path):
-        ctx.log_debug('Это один и тот же файл (samefile), меняем только регистр')
-        if ctx.dry_run:
-            ctx.log_debug('[DRY RUN] Пропускаю смену регистра')
-            return 'renamed', new_path
-        if rename_case_sensitive(old_path, new_path, ctx):
-            ctx.log_debug(f'Регистр успешно изменён: {new_path.name}')
-            repo.simulate_rename(old_path, new_path)
-            return 'renamed', new_path
-        ctx.log_debug('Не удалось изменить регистр, пропускаю')
+    if ctx.is_path_blocked(new_path):
+        ctx.block_path(old_path, 'целевой путь заблокирован')
+        interactor.display_error(f'Целевой путь заблокирован: {new_path}')
         return 'skipped', None
-
-    if not new_path.exists():
+    if old_path.absolute().parent != new_path.absolute().parent:
+        ctx.block_path(old_path, 'переименование между каталогами не поддерживается')
+        interactor.display_error('Переименование между каталогами не поддерживается')
+        return 'skipped', None
+    if str(old_path.absolute()) == str(new_path.absolute()):
+        return 'unchanged', old_path
+    try:
+        try:
+            target_info = os.lstat(new_path)
+        except FileNotFoundError:
+            occupied = False
+        else:
+            occupied = True
+        case_change = old_path.name.casefold() == new_path.name.casefold() and (
+            not occupied
+            or (
+                stat.S_ISREG(target_info.st_mode)
+                and target_info.st_nlink == 1
+                and not (
+                    getattr(target_info, 'st_file_attributes', 0)
+                    & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                )
+                and files_are_same(old_path, new_path)
+            )
+        )
+        if occupied and not case_change:
+            ctx.block_path(old_path, 'конфликт целевого имени; оба файла сохранены')
+            interactor.display(
+                f'  Конфликт имени: {new_path.name}; оба файла сохранены.'
+            )
+            return 'duplicate_exists', new_path
         if ctx.dry_run:
-            ctx.log_debug(
-                f'[DRY RUN] Переименовал бы: {old_path.name} -> {new_path.name}'
+            interactor.display(
+                f'  [DRY RUN] Переименовал бы: {old_path.name} → {new_path.name}'
             )
             repo.simulate_rename(old_path, new_path)
-            return 'renamed', new_path
-        old_path.rename(new_path)
-        repo.simulate_rename(old_path, new_path)
-        return 'renamed', new_path
-
-    old_score = (old_path.stat().st_size, name_quality_score(old_path))
-    new_score = (new_path.stat().st_size, name_quality_score(new_path))
-
-    if old_score >= new_score:
-        if ctx.dry_run:
-            ctx.log_debug('[DRY RUN] Удалил бы дубликат и переименовал')
-            repo.simulate_unlink(new_path)
-            repo.simulate_rename(old_path, new_path)
-            return 'renamed', new_path
-        if not safe_unlink(new_path, interactor):
-            return 'skipped', None
-        old_path.rename(new_path)
-        repo.simulate_unlink(new_path)
-        repo.simulate_rename(old_path, new_path)
-        return 'renamed', new_path
-
-    if ctx.dry_run:
-        ctx.log_debug('[DRY RUN] Удалил бы старый файл как дубликат')
-        repo.simulate_unlink(old_path)
-        return 'kept_existing', new_path
-    if not safe_unlink(old_path, interactor):
-        return 'skipped', None
-    repo.simulate_unlink(old_path)
-    return 'kept_existing', new_path
+            return 'planned', new_path
+        if case_change:
+            if not rename_case_sensitive(old_path, new_path, ctx):
+                interactor.display_error(
+                    f'{old_path.name}: {ctx.get_block_reason(old_path)}'
+                )
+                return 'failed', None
+        else:
+            # Windows отказывает при появлении цели, в том числе после lstat.
+            old_path.rename(new_path)
+    except FileExistsError:
+        ctx.block_path(old_path, 'целевой путь занят; переименование отклонено')
+        interactor.display_error(f'Целевой путь занят: {new_path.name}')
+        return 'duplicate_exists', new_path
+    except OSError as exc:
+        ctx.block_path(old_path, str(exc))
+        ctx.block_path(new_path, str(exc))
+        interactor.display_error(
+            f'Переименование {old_path.name} не подтверждено: {exc}'
+        )
+        return 'failed', None
+    repo.simulate_rename(old_path, new_path)
+    return 'renamed', new_path
 
 
 def handle_rename_result(
@@ -203,24 +230,14 @@ def handle_rename_result(
     ctx: SessionContext,
     stat_key: str,
 ) -> Path | None:
-    """Обрабатывает результат safe_rename и обновляет статистику."""
-    if status == 'renamed':
-        if result_path is not None:
-            ctx.log_debug(f'Переименован: {old_path.name} -> {result_path.name}')
+    """Учитывает только подтверждённое переименование; прогноз не успех."""
+    if status == 'renamed' and result_path is not None:
         ctx.increment_stat(stat_key)
         return result_path
-
-    if status == 'kept_existing':
-        if result_path is not None:
-            ctx.log_debug(
-                f'Текущий файл удалён как дубликат: {old_path.name} '
-                f'(файл {result_path.name} оставлен без изменений)'
-            )
-        ctx.increment_stat(stat_key)
+    if status in ('unchanged', 'planned') and result_path is not None:
         return result_path
-
-    ctx.log_debug(f'Пропущен: {old_path.name}')
-    return old_path
+    ctx.block_path(old_path, 'переименование не подтверждено')
+    return None
 
 
 def process_rename_batch(
@@ -247,8 +264,8 @@ def process_rename_batch(
             new_path = f.with_name(transform(f.stem) + f.suffix)
             status, result_path = safe_rename(f, new_path, ctx, repo, interactor)
             result = handle_rename_result(status, f, result_path, ctx, stat_key)
-            assert result is not None
-            new_files.append(result)
+            # Блокировка запрещает изменения, но не чтение и показ кандидатов.
+            new_files.append(result if result is not None else f)
         else:
             new_files.append(f)
 
@@ -533,107 +550,16 @@ def process_duplicates(
     repo: TagRepository,
     interactor: UserInteractor,
 ) -> list[Path]:
-    """Обрабатывает группы дубликатов с умным объединением имён."""
+    """Только показывает кандидатов; совпадение не разрешает объединение."""
     duplicates = find_duplicates(files, repo)
-    if not duplicates:
-        interactor.display('  Дубликатов не найдено.')
-        return files
-
-    plans: list[dict[str, Any]] = []
-    for group in duplicates:
-        sorted_group = sorted(group, key=lambda p: p.stat().st_size, reverse=True)
-        best_name_file = get_best_name_from_group(group)
-        keep_file = sorted_group[0]
-        files_to_delete = [f for f in sorted_group if f != keep_file]
-
-        needs_rename = keep_file != best_name_file and not files_are_same(
-            keep_file, best_name_file
-        )
-
-        plans.append(
-            {
-                'group': sorted_group,
-                'keep': keep_file,
-                'delete': files_to_delete,
-                'best_name_file': best_name_file,
-                'needs_rename': needs_rename,
-            }
-        )
-
-    interactor.display(f'\nНайдено {len(plans)} групп дубликатов:')
-
-    for i, plan in enumerate(plans, 1):
-        interactor.display(f'\n  {i}. Группа из {len(plan["group"])} файлов:')
-
-        for f in plan['group']:
-            info = file_info_line(f)
-            marker = ' [оставить]' if files_are_same(f, plan['keep']) else ' [удалить]'
-            interactor.display(f'      {f.name} ({info}){marker}')
-
-        if plan['needs_rename']:
-            final_name = plan['best_name_file'].name
-            interactor.display(f'      Итог:     {plan["keep"].name} → {final_name}')
-        else:
-            interactor.display('      Итог:     без переименования')
-
-    group_labels: list[str] = []
-    for plan in plans:
-        label = f'{plan["keep"].name}'
-        if plan['needs_rename']:
-            label += f' → {plan["best_name_file"].name}'
-        group_labels.append(label)
-
-    selected_indices = select_indices(
-        group_labels,
-        '\nКакие группы обработать?',
-        interactor,
-    )
-
-    if not selected_indices:
-        interactor.display('  Все группы пропущены.')
-        return files
-
-    processed_count = 0
-    for i in selected_indices:
-        plan = plans[i]
-
-        if ctx.dry_run:
-            ctx.log_debug(f'[DRY RUN] Обработал бы группу: {plan["keep"].name}')
-            for f in plan['delete']:
-                repo.simulate_unlink(f)
-                ctx.stats['duplicates_removed'] += 1
-
-            if plan['needs_rename']:
-                new_name = plan['best_name_file'].name
-                new_path = plan['keep'].with_name(new_name)
-                repo.simulate_rename(plan['keep'], new_path)
-
-            processed_count += 1
-            continue
-
-        for f in plan['delete']:
-            if safe_unlink(f, interactor):
-                interactor.display(f'  Удалён: {f.name}')
-                repo.simulate_unlink(f)
-                ctx.stats['duplicates_removed'] += 1
-
-        if plan['needs_rename']:
-            new_name = plan['best_name_file'].name
-            new_path = plan['keep'].with_name(new_name)
-            status, result_path = safe_rename(
-                plan['keep'], new_path, ctx, repo, interactor
-            )
-            if status == 'renamed' and result_path is not None:
-                interactor.display(
-                    f'  Переименован в лучшее имя: {plan["keep"].name} → {result_path.name}'
-                )
-            elif status == 'kept_existing' and result_path is not None:
-                interactor.display(f'  Оставлен существующий: {result_path.name}')
-
-        processed_count += 1
-
-    interactor.display(f'  Обработано групп: {processed_count}')
-    return [f for f in files if f.exists()]
+    interactor.display(f'  Групп кандидатов в дубликаты: {len(duplicates)}')
+    for i, group in enumerate(duplicates, 1):
+        interactor.display(f'  Группа {i}:')
+        for path in group:
+            interactor.display(f'    {path.name}')
+    if duplicates:
+        interactor.display('  Объединение отключено; все файлы сохранены.')
+    return files
 
 
 def find_artist_variations(
