@@ -1,8 +1,17 @@
 """Контекст сессии обработки аудиофайлов."""
 
+from __future__ import annotations
+
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from run_report import RunReport
+
+logger = logging.getLogger('clean_music')
 
 
 @dataclass
@@ -42,6 +51,7 @@ class SessionContext:
     )
     missing_files: list[Path] = field(default_factory=list)
     blocked_paths: dict[Path, str] = field(default_factory=dict)
+    report: RunReport | None = None
 
     def block_path(self, path: Path, reason: str) -> None:
         """Запрещает дальнейшие изменения по пути, сохраняя первую причину.
@@ -50,6 +60,7 @@ class SessionContext:
         только в Windows; на POSIX сохраняет исходное написание.
         """
         self.blocked_paths.setdefault(Path(os.path.normcase(path.absolute())), reason)
+        logger.info('Путь заблокирован: %s; причина: %s', path, reason)
 
     def get_block_reason(self, path: Path) -> str | None:
         """Возвращает причину блокировки или None, если путь не заблокирован."""
@@ -86,4 +97,4 @@ class SessionContext:
             message: Сообщение для вывода
         """
         if self.debug:
-            print(f'  [DEBUG] {message}')
+            logger.debug(message)
