@@ -66,6 +66,8 @@ class AudioProcessingPipeline:
         total_stages = len(self._stages)
 
         for index, stage in enumerate(self._stages, start=1):
+            if ctx.report is not None:
+                ctx.report.stage = stage.name
             # Красивый вывод, идентичный старой функции stage()
             interactor.display(f'\n{"=" * 60}')
             interactor.display(f'[Этап {index}/{total_stages}] {stage.name}')

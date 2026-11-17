@@ -26,11 +26,16 @@ def make_audio(path: Path) -> Path:
 
 
 def file_records(path: Path) -> list[dict[str, object]]:
-    return [
-        json.loads(line.split(' ФАЙЛ ', 1)[1])
-        for line in path.read_text(encoding='utf-8').splitlines()
-        if ' ФАЙЛ ' in line
-    ]
+    records = []
+    for line in path.read_text(encoding='utf-8').splitlines():
+        if line.startswith('{'):
+            item = json.loads(line)
+            if item.get('type') == 'ФАЙЛ':
+                item.pop('type')
+                records.append(item)
+        elif ' ФАЙЛ ' in line:
+            records.append(json.loads(line.split(' ФАЙЛ ', 1)[1]))
+    return records
 
 
 def test_actual_states_and_rename_chain(tmp_path: Path) -> None:
@@ -192,7 +197,7 @@ def test_dry_run_predictions_do_not_change_actual_report(tmp_path: Path) -> None
     assert report.counts == {'не изменён': 1}
     text = report.path.read_text(encoding='utf-8')
     assert 'dry-run (предложения)' in text
-    assert '[ПРЕДЛОЖЕНИЕ]' in text
+    assert 'ПРЕДЛОЖЕНИЕ' in text
     assert '[DRY RUN]' in text
 
 
@@ -209,7 +214,17 @@ def test_safe_rename_records_only_real_success(tmp_path: Path, dry_run: bool) ->
         status, _ = safe_rename(old, new, ctx, TagRepository(), ConsoleInteractor())
     assert status == ('planned' if dry_run else 'renamed')
     text = report.path.read_text(encoding='utf-8')
-    assert ('ПЕРЕИМЕНОВАНИЕ ВЫПОЛНЕНО' in text) == (not dry_run)
+    events = [json.loads(line) for line in text.splitlines() if line.startswith('{')]
+    renames = [
+        item
+        for item in events
+        if item.get('type') == 'ОПЕРАЦИЯ' and item['kind'] == 'rename'
+    ]
+    assert len(renames) == 1
+    assert renames[0]['proposed'] == dry_run
+    assert renames[0]['result'] == ('ПРЕДЛОЖЕНИЕ' if dry_run else 'успех')
+    assert renames[0]['path'] == str(old)
+    assert renames[0]['target'] == str(new)
     assert report.counts == {('не изменён' if dry_run else 'переименован'): 1}
 
 
