@@ -12,6 +12,8 @@ from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
 from mutagen.oggvorbis import OggVorbis
 
+from report_events import log_operation
+
 logger = logging.getLogger('clean_music')
 
 
@@ -37,6 +39,7 @@ class TagRepository:
 
     def __init__(self) -> None:
         self._cache: dict[Path, AudioTags | None] = {}
+        self._write_error: str | None = None
 
     def get_tags(self, filepath: Path) -> AudioTags | None:
         """Возвращает теги файла, используя кэш при наличии.
@@ -62,12 +65,23 @@ class TagRepository:
         Returns:
             True если запись успешна, False в противном случае
         """
+        self._write_error = None
         success = self._write_to_disk(filepath, artist, title)
         if success:
             self._cache[filepath] = AudioTags(artist, title)
             logger.info(
                 'Теги записаны: %s; artist=%r; title=%r', filepath, artist, title
             )
+        log_operation(
+            'tags',
+            filepath,
+            'успех' if success else 'отказ',
+            'запись выбранных artist/title'
+            if success
+            else (self._write_error or 'запись тегов не подтверждена'),
+            artist=artist,
+            title=title,
+        )
         return success
 
     def read_tags_uncached(self, filepath: Path) -> AudioTags | None:
@@ -205,6 +219,7 @@ class TagRepository:
                 audio.save()
                 return True
         except (MutagenError, OSError, ValueError) as e:
+            self._write_error = str(e)
             logger.error('Ошибка записи тегов %s: %s', filepath, e)
         return False
 
@@ -220,8 +235,13 @@ class TagRepository:
             title: Новое название трека
         """
         self._cache[filepath] = AudioTags(artist, title)
-        logger.info(
-            '[ПРЕДЛОЖЕНИЕ] Теги: %s; artist=%r; title=%r', filepath, artist, title
+        log_operation(
+            'tags',
+            filepath,
+            'ПРЕДЛОЖЕНИЕ',
+            'план записи выбранных artist/title; диск не изменён',
+            artist=artist,
+            title=title,
         )
 
     def simulate_rename(self, old_path: Path, new_path: Path) -> None:

@@ -6,10 +6,15 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import stat
+import subprocess
 import sys
+import tempfile
+import time
 from collections import Counter
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
@@ -19,12 +24,23 @@ from uuid import uuid4
 from mutagen import MutagenError
 
 from config import SUPPORTED_EXTENSIONS
+from report_events import Operation, log_operation
+from report_format import render_compact
 from tag_repository import AudioTags, TagRepository
 
 logger = logging.getLogger('clean_music')
 
 
 class _ReportHandler(logging.FileHandler):
+    observe: Callable[[Operation], None] | None = None
+
+    @override
+    def emit(self, record: logging.LogRecord) -> None:
+        super().emit(record)
+        operation = getattr(record, 'operation', None)
+        if isinstance(operation, Operation) and self.observe is not None:
+            self.observe(operation)
+
     @override
     def handleError(self, record: logging.LogRecord) -> None:
         """Не продолжать обработку молча при потере журнала."""
@@ -38,6 +54,41 @@ class FileSnapshot:
     tags: AudioTags | None = None
     identity: tuple[int, int] | None = None
     errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class FileChange:
+    status: str
+    before: FileSnapshot | None = None
+    after: FileSnapshot | None = None
+
+    @property
+    def path(self) -> str:
+        snapshot = self.before or self.after
+        assert snapshot is not None
+        return snapshot.path
+
+
+def _git_commit() -> str:
+    """Git — необязательный источник метаданных; без сетевых операций."""
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=Path(__file__).parent,
+            capture_output=True,
+            text=True,
+            encoding='ascii',
+            errors='replace',
+            timeout=2,
+            check=True,
+            stdin=subprocess.DEVNULL,
+        )
+        value = result.stdout.strip()
+        if len(value) in (40, 64) and all(char in '0123456789abcdef' for char in value):
+            return value
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return 'unknown'
 
 
 def _check_regular_path(path: Path) -> os.stat_result:
@@ -93,6 +144,7 @@ def _snapshot_data(snapshot: FileSnapshot | None) -> dict[str, object] | None:
     return {
         'path': snapshot.path,
         'sha256': snapshot.sha256,
+        'identity': snapshot.identity,
         'tags': (
             {'artist': snapshot.tags.artist, 'title': snapshot.tags.title}
             if snapshot.tags is not None
@@ -122,6 +174,20 @@ class RunReport:
         self._initial_complete = False
         self.counts: Counter[str] = Counter()
         self.verification_complete = False
+        self.changes: list[FileChange] = []
+        self.operations: list[Operation] = []
+        self.stage = ''
+        self.commit = 'unknown'
+        self.runtime = f'{sys.version}; {sys.platform}'
+        self.processing_seconds = 0.0
+        self.verification_seconds = 0.0
+        self._started = time.perf_counter()
+        self._proposed_paths: dict[str, tuple[str, ...]] = {}
+        self._handler.observe = self._observe
+
+    @property
+    def target_directory(self) -> str | None:
+        return str(self._directory) if self._directory is not None else None
 
     def __enter__(self) -> RunReport:
         logger.addHandler(self._handler)
@@ -129,6 +195,8 @@ class RunReport:
         logger.propagate = False
         try:
             logger.info('=== ЖУРНАЛ ЗАПУСКА ===')
+            self.commit = _git_commit()
+            logger.info('Commit: %s', self.commit)
             logger.info(
                 'Режим: %s', 'dry-run (предложения)' if self.dry_run else 'реальный'
             )
@@ -172,11 +240,44 @@ class RunReport:
 
     def record_rename(self, old_path: Path, new_path: Path) -> None:
         """Вызывается только после подтверждённого реального rename."""
+        log_operation(
+            'rename',
+            old_path,
+            'успех',
+            'выбранное конвейером имя; Windows rename подтверждён',
+            target=new_path,
+        )
         old, new = str(old_path.absolute()), str(new_path.absolute())
         for original, current in self._current_paths.items():
             if current == old:
                 self._current_paths[original] = new
         self._write_json('ПЕРЕИМЕНОВАНИЕ ВЫПОЛНЕНО', {'old': old, 'new': new})
+
+    def _observe(self, operation: Operation) -> None:
+        """Связывает наблюдение с исходным файлом, не управляя обработкой."""
+        path = os.path.normcase(operation.path)
+        originals = tuple(
+            original
+            for original, current in self._current_paths.items()
+            if os.path.normcase(current) == path
+        )
+        if not originals and self.dry_run:
+            originals = self._proposed_paths.get(path, ())
+        if not originals and operation.identity is not None:
+            originals = tuple(
+                original
+                for original, snapshot in self._before.items()
+                if snapshot.identity == operation.identity
+            )
+        self.operations.append(
+            replace(operation, originals=originals, stage=self.stage)
+        )
+        if (
+            operation.kind == 'rename'
+            and operation.result == 'ПРЕДЛОЖЕНИЕ'
+            and operation.target is not None
+        ):
+            self._proposed_paths[os.path.normcase(operation.target)] = originals
 
     def _write_json(self, label: str, data: object) -> None:
         logger.info('%s %s', label, json.dumps(data, ensure_ascii=False))
@@ -195,6 +296,7 @@ class RunReport:
             # Даже повторный Ctrl+C оставит уже проверенную часть в журнале.
             self._write_json('ПОСЛЕ', _snapshot_data(snapshot))
         counts: Counter[str] = Counter()
+        self.changes = []
         verification_complete = self._initial_complete
         matched: set[str] = set()
         for original, before in self._before.items():
@@ -222,6 +324,7 @@ class RunReport:
                 else:
                     status = 'не изменён'
             counts[status] += 1
+            self.changes.append(FileChange(status, before, final))
             self._write_json(
                 'ФАЙЛ',
                 {
@@ -236,6 +339,7 @@ class RunReport:
                     'появился' if self._initial_complete else 'нет исходного снимка'
                 )
                 counts[status] += 1
+                self.changes.append(FileChange(status, after=snapshot))
                 self._write_json(
                     'ФАЙЛ', {'status': status, 'after': _snapshot_data(snapshot)}
                 )
@@ -266,6 +370,7 @@ class RunReport:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
+        compact = False
         try:
             if exc is not None:
                 logger.error(
@@ -275,20 +380,79 @@ class RunReport:
                 )
             else:
                 logger.info('Конвейер завершён; выполняю сверку.')
+            self.processing_seconds = time.perf_counter() - self._started
+            verification_started = time.perf_counter()
             try:
                 self.finish()
             except (Exception, KeyboardInterrupt) as final_error:
                 self.verification_complete = False
                 logger.exception('Итоговая сверка неполна: %s', final_error)
                 sys.stderr.write(f'Итоговая сверка неполна; см. {self.path}\n')
+            finally:
+                self.verification_seconds = time.perf_counter() - verification_started
+            logger.info(
+                'Длительность обработки: %.3f с; сверки: %.3f с',
+                self.processing_seconds,
+                self.verification_seconds,
+            )
             logger.info(
                 '=== КОНЕЦ ОТЧЁТА; статус запуска: %s; полная сверка: %s ===',
                 'завершён' if exc is None else 'прерван',
                 self.verification_complete,
             )
+            compact = exc is None and self.verification_complete
+            if not compact:
+                logger.warning(
+                    'СЫРОЙ ФОРМАТ: запуск прерван или сверка неполна; компактный отчёт не сформирован.'
+                )
             sys.stdout.write(f'Полный отчёт: {self.path}\n')
         finally:
             self._close()
+        if compact:
+            self._compact()
+
+    def _compact(self) -> None:
+        """До replace исходник не трогается; сырой журнал копируется побайтово."""
+        temporary: Path | None = None
+        try:
+            header = render_compact(self).encode('utf-8')
+            with (
+                self.path.open('rb') as raw,
+                tempfile.NamedTemporaryFile(
+                    mode='wb',
+                    dir=self.path.parent,
+                    prefix=f'.{self.path.stem}-',
+                    suffix='.tmp',
+                    delete=False,
+                ) as output,
+            ):
+                temporary = Path(output.name)
+                output.write(header)
+                shutil.copyfileobj(raw, output)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, self.path)
+            temporary = None
+        except (Exception, KeyboardInterrupt) as error:
+            self._compact_warning(
+                f'Компактизация не выполнена; сохранён сырой журнал: {type(error).__name__}: {error}'
+            )
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError as error:
+                    self._compact_warning(
+                        f'Не удалось удалить временный файл {temporary}: {error}'
+                    )
+
+    def _compact_warning(self, message: str) -> None:
+        try:
+            with self.path.open('a', encoding='utf-8') as stream:
+                stream.write(f'{datetime.now().isoformat()} WARNING {message}\n')
+        except OSError:
+            pass
+        sys.stderr.write(message + '\n')
 
     def _close(self) -> None:
         logger.removeHandler(self._handler)

@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from report_events import log_operation
+
 if TYPE_CHECKING:
     from run_report import RunReport
 
@@ -61,6 +63,13 @@ class SessionContext:
         """
         self.blocked_paths.setdefault(Path(os.path.normcase(path.absolute())), reason)
         logger.info('Путь заблокирован: %s; причина: %s', path, reason)
+        log_operation(
+            'block',
+            path,
+            'блокировка',
+            self.get_block_reason(path) or reason,
+            proposed=self.dry_run,
+        )
 
     def get_block_reason(self, path: Path) -> str | None:
         """Возвращает причину блокировки или None, если путь не заблокирован."""

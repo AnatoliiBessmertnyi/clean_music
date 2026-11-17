@@ -19,6 +19,7 @@ from context import SessionContext
 from interactor import UserInteractor
 from naming import normalize_filename_stem, normalize_unicode
 from parsing import parse_artist_title
+from report_events import log_operation
 from tag_repository import TagRepository
 
 
@@ -157,14 +158,38 @@ def safe_rename(
 ) -> tuple[str, Path | None]:
     """Один Windows rename без replace, удаления и временных путей."""
     if not modification_allowed(old_path, ctx, interactor):
+        log_operation(
+            'rename',
+            old_path,
+            'блокировка',
+            ctx.get_block_reason(old_path) or 'модификация не разрешена',
+            target=new_path,
+            proposed=ctx.dry_run,
+        )
         return 'skipped', None
     if ctx.is_path_blocked(new_path):
         ctx.block_path(old_path, 'целевой путь заблокирован')
         interactor.display_error(f'Целевой путь заблокирован: {new_path}')
+        log_operation(
+            'rename',
+            old_path,
+            'блокировка',
+            'целевой путь заблокирован',
+            target=new_path,
+            proposed=ctx.dry_run,
+        )
         return 'skipped', None
     if old_path.absolute().parent != new_path.absolute().parent:
         ctx.block_path(old_path, 'переименование между каталогами не поддерживается')
         interactor.display_error('Переименование между каталогами не поддерживается')
+        log_operation(
+            'rename',
+            old_path,
+            'отказ',
+            'переименование между каталогами не поддерживается',
+            target=new_path,
+            proposed=ctx.dry_run,
+        )
         return 'skipped', None
     if str(old_path.absolute()) == str(new_path.absolute()):
         return 'unchanged', old_path
@@ -192,17 +217,39 @@ def safe_rename(
             interactor.display(
                 f'  Конфликт имени: {new_path.name}; оба файла сохранены.'
             )
+            log_operation(
+                'rename',
+                old_path,
+                'конфликт',
+                'конфликт целевого имени; оба файла сохранены',
+                target=new_path,
+                proposed=ctx.dry_run,
+            )
             return 'duplicate_exists', new_path
         if ctx.dry_run:
             interactor.display(
                 f'  [DRY RUN] Переименовал бы: {old_path.name} → {new_path.name}'
             )
             repo.simulate_rename(old_path, new_path)
+            log_operation(
+                'rename',
+                old_path,
+                'ПРЕДЛОЖЕНИЕ',
+                'выбранное конвейером имя; диск не изменён',
+                target=new_path,
+            )
             return 'planned', new_path
         if case_change:
             if not rename_case_sensitive(old_path, new_path, ctx):
                 interactor.display_error(
                     f'{old_path.name}: {ctx.get_block_reason(old_path)}'
+                )
+                log_operation(
+                    'rename',
+                    old_path,
+                    'отказ',
+                    ctx.get_block_reason(old_path) or 'переименование не подтверждено',
+                    target=new_path,
                 )
                 return 'failed', None
         else:
@@ -211,6 +258,13 @@ def safe_rename(
     except FileExistsError:
         ctx.block_path(old_path, 'целевой путь занят; переименование отклонено')
         interactor.display_error(f'Целевой путь занят: {new_path.name}')
+        log_operation(
+            'rename',
+            old_path,
+            'конфликт',
+            'цель занята при выполнении rename',
+            target=new_path,
+        )
         return 'duplicate_exists', new_path
     except OSError as exc:
         ctx.block_path(old_path, str(exc))
@@ -218,6 +272,7 @@ def safe_rename(
         interactor.display_error(
             f'Переименование {old_path.name} не подтверждено: {exc}'
         )
+        log_operation('rename', old_path, 'отказ', str(exc), target=new_path)
         return 'failed', None
     if ctx.report is not None:
         ctx.report.record_rename(old_path, new_path)
