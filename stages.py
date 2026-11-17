@@ -40,6 +40,7 @@ from pipeline_utils import (
     select_indices,
     simple_rename,
 )
+from report_events import log_operation
 from strategies import StrategyFactory
 from tag_repository import TagRepository
 
@@ -54,6 +55,15 @@ def _update_tags(
 ) -> bool:
     """Проверяет безопасность и блокирует зависимые действия при отказе записи."""
     if not modification_allowed(path, ctx, interactor):
+        log_operation(
+            'tags',
+            path,
+            'блокировка',
+            ctx.get_block_reason(path) or 'модификация не разрешена',
+            artist=artist,
+            title=title,
+            proposed=ctx.dry_run,
+        )
         return False
     if repo.update_tags(path, artist, title):
         return True
