@@ -1,5 +1,6 @@
 """Репозиторий для работы с тегами аудиофайлов с кэшированием."""
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +11,8 @@ from mutagen.id3 import ID3, TIT2, TPE1, ID3NoHeaderError
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
 from mutagen.oggvorbis import OggVorbis
+
+logger = logging.getLogger('clean_music')
 
 
 @dataclass(frozen=True)
@@ -62,7 +65,14 @@ class TagRepository:
         success = self._write_to_disk(filepath, artist, title)
         if success:
             self._cache[filepath] = AudioTags(artist, title)
+            logger.info(
+                'Теги записаны: %s; artist=%r; title=%r', filepath, artist, title
+            )
         return success
+
+    def read_tags_uncached(self, filepath: Path) -> AudioTags | None:
+        """Читает для отчёта с диска; ошибки не превращаются в отсутствие тегов."""
+        return self._read_tags(filepath, report_errors=True)
 
     def invalidate(self, filepath: Path) -> None:
         """Удаляет файл из кэша.
@@ -77,6 +87,12 @@ class TagRepository:
         self._cache.clear()
 
     def _read_from_disk(self, filepath: Path) -> AudioTags | None:
+        """Читает теги для конвейера с прежней обработкой ошибок."""
+        return self._read_tags(filepath)
+
+    def _read_tags(
+        self, filepath: Path, *, report_errors: bool = False
+    ) -> AudioTags | None:
         """Читает теги непосредственно с диска."""
         ext = filepath.suffix.lower()
         try:
@@ -86,6 +102,10 @@ class TagRepository:
                     return None
                 artist = audio.tags.get('TPE1')
                 title = audio.tags.get('TIT2')
+                if report_errors:
+                    return AudioTags(
+                        str(artist) if artist else '', str(title) if title else ''
+                    )
                 if artist and title:
                     return AudioTags(str(artist), str(title))
             elif ext in ('.m4a', '.mp4'):
@@ -94,6 +114,10 @@ class TagRepository:
                     return None
                 artist = audio.tags.get('©ART')
                 title = audio.tags.get('©nam')
+                if report_errors:
+                    return AudioTags(
+                        str(artist[0]) if artist else '', str(title[0]) if title else ''
+                    )
                 if artist and title:
                     return AudioTags(artist[0], title[0])
             elif ext == '.flac':
@@ -102,6 +126,10 @@ class TagRepository:
                     return None
                 artist = audio.tags.get('artist')
                 title = audio.tags.get('title')
+                if report_errors:
+                    return AudioTags(
+                        str(artist[0]) if artist else '', str(title[0]) if title else ''
+                    )
                 if artist and title:
                     return AudioTags(artist[0], title[0])
             elif ext == '.ogg':
@@ -110,6 +138,10 @@ class TagRepository:
                     return None
                 artist = audio.tags.get('artist')
                 title = audio.tags.get('title')
+                if report_errors:
+                    return AudioTags(
+                        str(artist[0]) if artist else '', str(title[0]) if title else ''
+                    )
                 if artist and title:
                     return AudioTags(artist[0], title[0])
             elif ext == '.wma':
@@ -118,10 +150,15 @@ class TagRepository:
                     return None
                 artist = audio.tags.get('Author')
                 title = audio.tags.get('Title')
+                if report_errors:
+                    return AudioTags(
+                        str(artist[0]) if artist else '', str(title[0]) if title else ''
+                    )
                 if artist and title:
                     return AudioTags(artist[0], title[0])
         except (MutagenError, OSError, ValueError):
-            pass
+            if report_errors:
+                raise
         return None
 
     def _write_to_disk(self, filepath: Path, artist: str, title: str) -> bool:
@@ -168,7 +205,7 @@ class TagRepository:
                 audio.save()
                 return True
         except (MutagenError, OSError, ValueError) as e:
-            print(f'  Ошибка записи тегов: {e}')
+            logger.error('Ошибка записи тегов %s: %s', filepath, e)
         return False
 
     def simulate_update_tags(self, filepath: Path, artist: str, title: str) -> None:
@@ -183,6 +220,9 @@ class TagRepository:
             title: Новое название трека
         """
         self._cache[filepath] = AudioTags(artist, title)
+        logger.info(
+            '[ПРЕДЛОЖЕНИЕ] Теги: %s; artist=%r; title=%r', filepath, artist, title
+        )
 
     def simulate_rename(self, old_path: Path, new_path: Path) -> None:
         """Имитирует переименование файла для dry-run режима.

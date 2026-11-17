@@ -219,6 +219,8 @@ def safe_rename(
             f'Переименование {old_path.name} не подтверждено: {exc}'
         )
         return 'failed', None
+    if ctx.report is not None:
+        ctx.report.record_rename(old_path, new_path)
     repo.simulate_rename(old_path, new_path)
     return 'renamed', new_path
 

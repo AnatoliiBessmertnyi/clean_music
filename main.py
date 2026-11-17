@@ -6,8 +6,9 @@ from pathlib import Path
 
 from config import SUPPORTED_EXTENSIONS
 from context import SessionContext
-from interactor import ConsoleInteractor
+from interactor import ConsoleInteractor, logged_input
 from pipeline import AudioProcessingPipeline
+from run_report import RunReport
 from stages import (
     ArtistNormalizationStage,
     DuplicateResolutionStage,
@@ -23,11 +24,13 @@ from tag_repository import TagRepository
 def get_valid_path() -> Path:
     """Запрашивает у пользователя путь и проверяет его корректность."""
     while True:
-        raw = input('Введите путь к папке: ').strip().strip('"')
+        raw = logged_input('Введите путь к папке: ').strip().strip('"')
         path_obj = Path(raw)
         if path_obj.is_dir():
             return path_obj
-        print('Ошибка: путь не является папкой. Попробуйте снова.')
+        ConsoleInteractor().display(
+            'Ошибка: путь не является папкой. Попробуйте снова.'
+        )
 
 
 def get_audio_files(directory: Path) -> list[Path]:
@@ -51,28 +54,45 @@ def format_stats_message(stats: dict[str, int]) -> str:
 
 
 def main() -> None:
-    """Запускает основной цикл обработки и переименования файлов."""
+    """Создаёт один журнал до любых вопросов и файловых изменений."""
+    try:
+        report = RunReport(Path(__file__).parent / 'logs', '--dry-run' in sys.argv)
+    except OSError as exc:
+        sys.stderr.write(f'Не удалось создать журнал; обработка не начата: {exc}\n')
+        raise SystemExit(1) from exc
+    with report:
+        ConsoleInteractor().display(f'Отчёт запуска: {report.path}')
+        _run(report)
+
+
+def _run(report: RunReport) -> None:
+    """Выполняет прежний конвейер внутри журнала запуска."""
     # 1. Инициализация зависимостей
     ctx = SessionContext(
         dry_run='--dry-run' in sys.argv,
         debug='--debug' in sys.argv,
+        report=report,
     )
     repo = TagRepository()
     interactor = ConsoleInteractor()
 
-    print('=== Обработчик аудиофайлов ===')
+    interactor.display('=== Обработчик аудиофайлов ===')
     if ctx.dry_run:
-        print('*** СУХОЙ РЕЖИМ: изменения не будут применены ***')
+        interactor.display(
+            '*** СУХОЙ РЕЖИМ: действия конвейера — предложения; итог сверяется с диском ***'
+        )
 
     target_dir = get_valid_path()
     ctx.target_dir = target_dir
+    interactor.display('Снимаю исходное состояние файлов (SHA-256 и теги)...')
+    report.start(target_dir)
     files = get_audio_files(target_dir)
 
     total = len(files)
     stats = get_format_stats(files)
     stats_msg = format_stats_message(stats)
 
-    print(f'\nНайдено {total} аудиофайлов ({stats_msg}).')
+    interactor.display(f'\nНайдено {total} аудиофайлов ({stats_msg}).')
     if not files:
         return
 
@@ -98,30 +118,34 @@ def main() -> None:
     )
 
     # 4. Финальная статистика
-    print('\n' + '=' * 60)
-    print('=== Статистика обработки ===')
-    print('=' * 60)
-    print(f'Очистка от мусора (имена): {ctx.get_stat("junk_removed")}')
-    print(f'Очистка от мусора (теги): {ctx.get_stat("tags_cleaned")}')
-    print(f'Нормализация тире и пробелов: {ctx.get_stat("dash_normalized")}')
-    print(f'Удалено дубликатов: {ctx.get_stat("duplicates_removed")}')
-    print(f'Переименовано по тегам: {ctx.get_stat("renamed_by_tags")}')
-    print(f'Записано тегов: {ctx.get_stat("tags_written")}')
-    print(
+    interactor.display('\n' + '=' * 60)
+    interactor.display('=== Счётчики конвейера (не итоговая сверка диска) ===')
+    interactor.display('=' * 60)
+    interactor.display(f'Очистка от мусора (имена): {ctx.get_stat("junk_removed")}')
+    interactor.display(f'Очистка от мусора (теги): {ctx.get_stat("tags_cleaned")}')
+    interactor.display(
+        f'Нормализация тире и пробелов: {ctx.get_stat("dash_normalized")}'
+    )
+    interactor.display(f'Удалено дубликатов: {ctx.get_stat("duplicates_removed")}')
+    interactor.display(f'Переименовано по тегам: {ctx.get_stat("renamed_by_tags")}')
+    interactor.display(f'Записано тегов: {ctx.get_stat("tags_written")}')
+    interactor.display(
         f'Нормализовано исполнителей: '
         f'{ctx.get_stat("artists_normalized")} файлов '
         f'({ctx.get_stat("artists_normalized_unique")} уникальных)'
     )
-    print(f'Ручной ввод: {ctx.get_stat("manual_input")}')
+    interactor.display(f'Ручной ввод: {ctx.get_stat("manual_input")}')
 
     still_missing: list[Path] = getattr(ctx, '_still_missing', [])
     if still_missing:
-        print(f'\nВнимание! {len(still_missing)} файлов осталось без метаданных:')
+        interactor.display(
+            f'\nВнимание! {len(still_missing)} файлов осталось без метаданных:'
+        )
         for f in still_missing:
-            print(f'  - {f.name}')
-        print('Рекомендация: AcoustID / MusicBrainz или вручную.')
+            interactor.display(f'  - {f.name}')
+        interactor.display('Рекомендация: AcoustID / MusicBrainz или вручную.')
 
-    print('\nОбработка завершена.')
+    interactor.display('\nОбработка завершена. Итоговая сверка будет записана в отчёт.')
 
 
 if __name__ == '__main__':
