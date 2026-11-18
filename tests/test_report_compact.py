@@ -110,7 +110,29 @@ def test_compact_layout_deltas_hashes_and_lossless_appendix(
     assert b''.join(appendix_lines[len(records) + len(operations) :]) == preserved[0]
     for status, count in report.counts.items():
         assert f'{status}: {count}' in text
+    assert 'появился: 0' in text
     assert len(list((tmp_path / 'logs').iterdir())) == 1
+
+
+def test_renamed_content_change_without_tag_delta(tmp_path: Path) -> None:
+    folder = tmp_path / 'music'
+    folder.mkdir()
+    original = make_audio(folder / 'before.mp3')
+    renamed = folder / 'after.mp3'
+    with RunReport(tmp_path / 'logs', False) as report:
+        report.start(folder)
+        original.rename(renamed)
+        report.record_rename(original, renamed)
+        with renamed.open('ab') as stream:
+            stream.write(b'synthetic content change')
+    assert report.counts == {'переименован и изменено содержимое/теги': 1}
+    header = report.path.read_text(encoding='utf-8').split(APPENDIX, 1)[0]
+    section = header.split('=== ИЗМЕНЁННЫЕ ФАЙЛЫ ===\n', 1)[1].split(
+        '=== НЕИЗМЕНЁННЫЕ ===', 1
+    )[0]
+    assert section.splitlines() == [
+        '"before.mp3": "before.mp3" → "after.mp3" [содержимое]'
+    ]
 
 
 @pytest.mark.parametrize('failure', [KeyboardInterrupt, EOFError, RuntimeError])

@@ -16,6 +16,21 @@ def _q(value: object) -> str:
 
 
 def render_compact(report: RunReport) -> str:
+    counts = dict.fromkeys(
+        (
+            'не изменён',
+            'переименован',
+            'изменено содержимое/теги',
+            'переименован и изменено содержимое/теги',
+            'отсутствует после запуска (удаление не подтверждено)',
+            'появился',
+            'нет исходного снимка',
+            'ошибка проверки',
+            'ошибка проверки: файловый объект заменён',
+        ),
+        0,
+    )
+    counts.update(report.counts)
     lines = [
         '=== ОТЧЁТ ЗАПУСКА v3 ===',
         'Статус запуска: завершён; полная сверка: True',
@@ -25,7 +40,7 @@ def render_compact(report: RunReport) -> str:
         f'Обработка: {report.processing_seconds:.3f} с; сверка: {report.verification_seconds:.3f} с',
         f'Папка: {_q(report.target_directory)}',
         '=== КРАТКИЙ ИТОГ: ФАКТ ДИСКА ===',
-        *(f'{status}: {count}' for status, count in report.counts.items()),
+        *(f'{status}: {count}' for status, count in counts.items()),
     ]
     facts: dict[str, list[Operation]] = {}
     for operation in report.operations:
@@ -44,6 +59,7 @@ def render_compact(report: RunReport) -> str:
         ]
         name = _q(Path(change.path).name)
         delta = []
+        tags_changed = False
         if before is not None and after is not None:
             if before.path != after.path:
                 delta.append(
@@ -53,6 +69,7 @@ def render_compact(report: RunReport) -> str:
                 old = getattr(before.tags, field, None)
                 new = getattr(after.tags, field, None)
                 if old != new:
+                    tags_changed = True
                     delta.append(f'{field}: {_q(old)} → {_q(new)}')
         if rejected or change.status.startswith(('ошибка', 'отсутствует')):
             reason = rejected[-1].reason if rejected else change.status
@@ -70,6 +87,12 @@ def render_compact(report: RunReport) -> str:
         elif change.status == 'не изменён':
             unchanged.append(name)
         else:
+            if (
+                change.status == 'переименован и изменено содержимое/теги'
+                and not tags_changed
+                and delta
+            ):
+                delta[0] += ' [содержимое]'
             changes.append(f'{name}: {delta[0] if delta else change.status}')
             changes.extend(f'  {item}' for item in delta[1:])
     lines.extend(
