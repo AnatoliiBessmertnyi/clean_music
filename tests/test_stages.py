@@ -70,6 +70,50 @@ def test_junk_then_normalization_preserves_file_id(
 
 
 @windows
+@pytest.mark.parametrize('outcome', ['success', 'simulated', 'denied'])
+def test_tag_rename_passes_current_paths_to_mismatches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    old = tmp_path / 'Title.mp3'
+    new = tmp_path / 'Artist - Title.mp3'
+    neighbor = tmp_path / 'Neighbor.mp3'
+    untagged = tmp_path / 'Untagged.mp3'
+    old.write_bytes(b'original')
+    neighbor.write_bytes(b'neighbor')
+    untagged.touch()
+    ctx = SessionContext(outcome == 'simulated', False)
+    repo, ui = MemoryRepository(), Interactor()
+    repo.simulate_update_tags(old, 'Artist', 'Title')
+    repo.simulate_update_tags(neighbor, 'Artist', 'Other')
+    file_id = ctx.registry.register(old).id
+    neighbor_id = ctx.registry.register(neighbor).id
+    if outcome == 'denied':
+        monkeypatch.setattr(Path, 'rename', Mock(side_effect=PermissionError('locked')))
+
+    stage = stages.TagRenamingStage()
+    handle_mismatches = Mock(side_effect=lambda files, *_: files)
+    monkeypatch.setattr(stage, '_handle_mismatches', handle_mismatches)
+
+    current = old if outcome == 'denied' else new
+    expected = [neighbor, current, untagged]
+    assert stage.execute([neighbor, old, untagged], ctx, repo, ui) == expected
+    handle_mismatches.assert_called_once_with(expected, ctx, repo, ui)
+    assert stage._pending_mismatches == [(neighbor, 'Neighbor', 'Artist - Other.mp3')]
+    assert ctx.missing_files == [untagged]
+    assert ctx.registry.path_of(file_id) == current
+    assert ctx.registry.id_for(current) == file_id
+    assert ctx.registry.path_of(neighbor_id) == neighbor
+    assert ctx.registry.id_for(neighbor) == neighbor_id
+    assert ctx.get_block_reason(old) == ('locked' if outcome == 'denied' else None)
+    renamed = outcome == 'success'
+    assert ctx.get_stat('renamed_by_tags') == int(renamed)
+    assert old.exists() == (not renamed)
+    assert new.exists() == renamed
+    assert (new if renamed else old).read_bytes() == b'original'
+    assert neighbor.read_bytes() == b'neighbor'
+
+
+@windows
 @pytest.mark.parametrize('answer', ['', 'y', 'yes'])
 def test_tag_rename_conflict_keeps_both(tmp_path: Path, answer: str) -> None:
     old, new = tmp_path / 'Title.mp3', tmp_path / 'Artist - Title.mp3'
@@ -78,7 +122,10 @@ def test_tag_rename_conflict_keeps_both(tmp_path: Path, answer: str) -> None:
     repo, ctx, ui = MemoryRepository(), SessionContext(False, False), Interactor(answer)
     repo.simulate_update_tags(old, 'Artist', 'Title')
     repo.simulate_update_tags(new, 'Artist', 'Title')
-    stages.TagRenamingStage()._rename_by_tags([old, new], ctx, repo, ui)
+    assert stages.TagRenamingStage()._rename_by_tags([old, new], ctx, repo, ui) == [
+        old,
+        new,
+    ]
     assert old.read_bytes() == b'old' and new.read_bytes() == b'new target'
     assert ctx.is_path_blocked(old) and not ctx.get_stat('renamed_by_tags')
     assert 'Объединение отключено' in '\n'.join(ui.messages)
