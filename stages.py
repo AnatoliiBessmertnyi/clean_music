@@ -732,6 +732,19 @@ class TagRenamingStage:
         if not active_mismatch:
             return files
 
+        renamed_paths: dict[Path, Path] = {}
+
+        def rename_by_tags(path: Path, new_name: str) -> None:
+            result = _file_executor.rename(
+                path, path.with_name(new_name), ctx, repo, interactor
+            )
+            if result.is_confirmed_change:
+                ctx.increment_stat('renamed_by_tags')
+            if (
+                result.is_confirmed_change or result.is_model_change
+            ) and result.path is not None:
+                renamed_paths[path] = result.path
+
         interactor.display(
             f'\n  Найдено {len(active_mismatch)} файлов с расхождением названий (файл vs теги):'
         )
@@ -846,13 +859,7 @@ class TagRenamingStage:
                         _tag_title,
                     ) in categorized[cat_key]:
                         if default == 't':
-                            new_path = f.with_name(new_name)
-                            status, result_path = safe_rename(
-                                f, new_path, ctx, repo, interactor
-                            )
-                            handle_rename_result(
-                                status, f, result_path, ctx, 'renamed_by_tags'
-                            )
+                            rename_by_tags(f, new_name)
                         else:
                             parsed = parse_artist_title(f.stem)
                             if parsed:
@@ -937,13 +944,7 @@ class TagRenamingStage:
                         last_action = choice
 
                     if choice == 't':
-                        new_path = f.with_name(current_new_name)
-                        status, result_path = safe_rename(
-                            f, new_path, ctx, repo, interactor
-                        )
-                        handle_rename_result(
-                            status, f, result_path, ctx, 'renamed_by_tags'
-                        )
+                        rename_by_tags(f, current_new_name)
                     elif choice == 'f':
                         parsed = parse_artist_title(f.stem)
                         if parsed:
@@ -963,7 +964,7 @@ class TagRenamingStage:
                     else:
                         interactor.display(f'      Пропущен: {f.name}')
 
-        return files
+        return [renamed_paths.get(path, path) for path in files]
 
     # === Обработка дубликатов при переименовании ===
 
