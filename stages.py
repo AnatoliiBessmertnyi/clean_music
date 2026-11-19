@@ -13,6 +13,7 @@ from config import (
 )
 from context import SessionContext
 from file_operations import FileExecutor
+from file_state import OperationStatus
 from interactor import UserInteractor
 from naming import (
     build_safe_filename,
@@ -39,7 +40,6 @@ from pipeline_utils import (
     process_duplicates,
     safe_rename,
     select_indices,
-    simple_rename,
 )
 from report_events import log_operation
 from strategies import StrategyFactory
@@ -573,11 +573,11 @@ class TagRenamingStage:
                 )
                 strategies[problem_key] = (strategy, params)
 
-        safe_candidates: list[tuple[Path, str]] = []
+        safe_candidates: list[tuple[int, Path, str]] = []
         mismatch_candidates: list[tuple[Path, str, str]] = []
         missing: list[Path] = []
 
-        for f in files:
+        for position, f in enumerate(files):
             if not f.exists():
                 continue
 
@@ -640,14 +640,15 @@ class TagRenamingStage:
                     continue
 
                 if user_already_chose or self._titles_match(file_title, title):
-                    safe_candidates.append((f, new_name))
+                    safe_candidates.append((position, f, new_name))
                 else:
                     mismatch_candidates.append((f, file_title, new_name))
             else:
                 missing.append(f)
 
+        resulting_files = files.copy()
         if safe_candidates:
-            labels = [f'{f.name}  ->  {new_name}' for f, new_name in safe_candidates]
+            labels = [f'{f.name}  ->  {new_name}' for _, f, new_name in safe_candidates]
             selected_indices = select_indices(
                 labels,
                 f'Найдено {len(safe_candidates)} файлов для переименования по тегам (названия совпадают)',
@@ -658,18 +659,20 @@ class TagRenamingStage:
             duplicates_found: list[tuple[Path, Path]] = []
 
             for i in selected_indices:
-                old_path, new_name = safe_candidates[i]
+                position, old_path, new_name = safe_candidates[i]
                 new_path = old_path.with_name(new_name)
-
-                status, result_path = simple_rename(
+                result = _file_executor.rename(
                     old_path, new_path, ctx, repo, interactor
                 )
 
-                if status == 'renamed' and result_path is not None:
-                    ctx.log_debug(f'Переименован: {old_path.name} -> {new_path.name}')
+                if (
+                    result.is_confirmed_change or result.is_model_change
+                ) and result.path is not None:
+                    resulting_files[position] = result.path
+                if result.is_confirmed_change:
                     ctx.increment_stat('renamed_by_tags')
                     renamed_count += 1
-                elif status == 'duplicate_exists':
+                elif result.status is OperationStatus.CONFLICT:
                     duplicates_found.append((old_path, new_path))
 
             if renamed_count:
@@ -683,7 +686,7 @@ class TagRenamingStage:
         # Сохраняем mismatch_candidates для подэтапа 3.5
         self._pending_mismatches = mismatch_candidates
 
-        return files
+        return resulting_files
 
     # === Подэтап 3.5: обработка расхождений ===
 
