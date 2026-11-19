@@ -1,3 +1,5 @@
+"""Проверки результатов операций и сессионного реестра файлов."""
+
 import os
 from pathlib import Path
 
@@ -51,6 +53,21 @@ def test_update_path_rejects_occupied_target_atomically() -> None:
     assert registry.register(target) == second
 
 
+def test_update_path_preserves_new_case_and_id() -> None:
+    registry = FileRegistry()
+    source, target = Path('Track.mp3'), Path('track.mp3')
+    entry = registry.register(source)
+
+    registry.update_path(entry.id, target)
+
+    assert registry.path_of(entry.id).name == target.name
+    assert registry.id_for(target) == entry.id
+    if os.path.normcase(source) == os.path.normcase(target):
+        assert registry.id_for(source) == entry.id
+    else:
+        assert registry.id_for(source) is None
+
+
 def test_current_paths_keeps_registration_order_and_omits_missing() -> None:
     registry = FileRegistry()
     first = registry.register(Path('z.mp3'))
@@ -63,9 +80,68 @@ def test_current_paths_keeps_registration_order_and_omits_missing() -> None:
 
     registry.mark_missing(second.id)
     assert registry.current_paths() == [target, third.path]
-    assert registry.id_for(second.path) == second.id
+    assert registry.id_for(second.path) is None
     assert registry.path_of(second.id) == second.path
-    assert not registry.register(second.path).present
+
+
+def test_register_reuses_missing_path_with_new_id() -> None:
+    registry = FileRegistry()
+    path = Path('track.mp3')
+    missing = registry.register(path)
+    registry.mark_missing(missing.id)
+    registry.mark_missing(missing.id)
+    assert registry.id_for(path) is None
+
+    current = registry.register(path)
+    registry.mark_missing(missing.id)
+
+    assert current.id > missing.id
+    assert current.present
+    assert registry.path_of(missing.id) == path
+    assert registry.id_for(path) == current.id
+    assert registry.current_paths() == [path]
+
+
+def test_update_path_can_claim_missing_path() -> None:
+    registry = FileRegistry()
+    missing = registry.register(Path('missing.mp3'))
+    current = registry.register(Path('current.mp3'))
+    registry.mark_missing(missing.id)
+
+    registry.update_path(current.id, missing.path)
+
+    assert registry.id_for(missing.path) == current.id
+    assert registry.id_for(current.path) is None
+    assert registry.path_of(missing.id) == missing.path
+    assert registry.current_paths() == [missing.path]
+
+
+def test_update_path_rejects_missing_id_atomically() -> None:
+    registry = FileRegistry()
+    missing = registry.register(Path('missing.mp3'))
+    current = registry.register(Path('current.mp3'))
+    target = Path('target.mp3')
+    registry.mark_missing(missing.id)
+
+    with pytest.raises(ValueError, match='Файл помечен как пропавший'):
+        registry.update_path(missing.id, target)
+
+    assert registry.path_of(missing.id) == missing.path
+    assert registry.id_for(missing.path) is None
+    assert registry.id_for(target) is None
+    assert registry.id_for(current.path) == current.id
+    assert registry.current_paths() == [current.path]
+
+
+def test_unknown_id_raises_key_error() -> None:
+    registry = FileRegistry()
+
+    with pytest.raises(KeyError):
+        registry.path_of(1)
+    with pytest.raises(KeyError):
+        registry.update_path(1, Path('target.mp3'))
+    with pytest.raises(KeyError):
+        registry.mark_missing(1)
 
 
 @pytest.mark.parametrize(
