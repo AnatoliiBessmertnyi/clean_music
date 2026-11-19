@@ -10,6 +10,7 @@ import pytest
 
 import run_report
 from context import SessionContext
+from file_state import OperationStatus
 from interactor import ConsoleInteractor
 from pipeline_utils import safe_rename
 from report_events import log_operation
@@ -342,7 +343,11 @@ def test_tag_write_failure_has_structured_reason(
     repo = TagRepository()
     with RunReport(tmp_path / 'logs', False) as report:
         report.start(folder)
-        monkeypatch.setattr(repo, '_write_to_disk', Mock(return_value=False))
+        monkeypatch.setattr(
+            repo,
+            '_write_to_disk',
+            Mock(return_value=(OperationStatus.ERROR, 'запись тегов не подтверждена')),
+        )
         assert not repo.update_tags(path, 'Не записано', 'Тег')
     header = report.path.read_text(encoding='utf-8').split(APPENDIX)[0]
     assert 'запись тегов не подтверждена' in header

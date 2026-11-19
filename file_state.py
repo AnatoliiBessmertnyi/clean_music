@@ -47,6 +47,8 @@ class FileRegistry:
     def __init__(self) -> None:
         self._records: dict[int, tuple[FileRecord, Path]] = {}
         self._ids_by_path: dict[Path, int] = {}
+        self._previous_ids: dict[Path, int] = {}
+        self._model_sources: dict[int, Path] = {}
 
     @staticmethod
     def _path_key(path: Path) -> Path:
@@ -68,11 +70,27 @@ class FileRegistry:
         """Возвращает id присутствующей записи по пути или None."""
         return self._ids_by_path.get(self._path_key(path))
 
+    def track(self, path: Path) -> FileRecord:
+        """Разрешает входной путь, включая прежний путь и пропавшую запись."""
+        key = self._path_key(path)
+        file_id = self._ids_by_path.get(key, self._previous_ids.get(key))
+        if file_id is None:
+            return self.register(path)
+        return self._records[file_id][0]
+
+    def record_of(self, file_id: int) -> FileRecord:
+        return self._records[file_id][0]
+
+    def physical_path(self, record: FileRecord) -> Path:
+        return self._model_sources.get(record.id, record.path)
+
     def path_of(self, file_id: int) -> Path:
         """Возвращает последний известный путь или вызывает KeyError для неизвестного id."""
         return self._records[file_id][0].path
 
-    def update_path(self, file_id: int, new_path: Path) -> None:
+    def update_path(
+        self, file_id: int, new_path: Path, *, simulated: bool = False
+    ) -> None:
         """Атомарно меняет путь (KeyError для неизвестного id, ValueError при отсутствии файла или конфликте путей)."""
         record, old_key = self._records[file_id]
         if not record.present:
@@ -86,6 +104,11 @@ class FileRegistry:
         if new_key != old_key:
             self._ids_by_path[new_key] = file_id
             del self._ids_by_path[old_key]
+            self._previous_ids[old_key] = file_id
+        if simulated:
+            self._model_sources.setdefault(file_id, record.path)
+        else:
+            self._model_sources.pop(file_id, None)
         self._records[file_id] = (updated, new_key)
 
     def mark_missing(self, file_id: int) -> None:
@@ -94,6 +117,8 @@ class FileRegistry:
         if record.present:
             self._records[file_id] = (replace(record, present=False), key)
             del self._ids_by_path[key]
+            self._previous_ids[key] = file_id
+            self._model_sources.pop(file_id, None)
 
     def current_paths(self) -> list[Path]:
         """Возвращает пути присутствующих файлов в порядке регистрации."""

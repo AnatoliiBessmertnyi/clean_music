@@ -154,6 +154,7 @@ def simulate_rename(
     interactor.display(
         f'  [DRY RUN] Переименовал бы: {old_path.name} → {new_path.name}'
     )
+    repo.get_tags(old_path)
     repo.simulate_rename(old_path, new_path)
     log_operation(
         'rename',
