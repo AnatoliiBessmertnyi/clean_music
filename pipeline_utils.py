@@ -5,7 +5,6 @@ import os
 import re
 import stat
 import sys
-from collections.abc import Callable
 from pathlib import Path
 
 from mutagen.asf import ASF
@@ -149,6 +148,22 @@ def simple_rename(
     return safe_rename(old_path, new_path, ctx, repo, interactor)
 
 
+def simulate_rename(
+    old_path: Path, new_path: Path, repo: TagRepository, interactor: UserInteractor
+) -> None:
+    interactor.display(
+        f'  [DRY RUN] Переименовал бы: {old_path.name} → {new_path.name}'
+    )
+    repo.simulate_rename(old_path, new_path)
+    log_operation(
+        'rename',
+        old_path,
+        'ПРЕДЛОЖЕНИЕ',
+        'выбранное конвейером имя; диск не изменён',
+        target=new_path,
+    )
+
+
 def safe_rename(
     old_path: Path,
     new_path: Path,
@@ -227,17 +242,7 @@ def safe_rename(
             )
             return 'duplicate_exists', new_path
         if ctx.dry_run:
-            interactor.display(
-                f'  [DRY RUN] Переименовал бы: {old_path.name} → {new_path.name}'
-            )
-            repo.simulate_rename(old_path, new_path)
-            log_operation(
-                'rename',
-                old_path,
-                'ПРЕДЛОЖЕНИЕ',
-                'выбранное конвейером имя; диск не изменён',
-                target=new_path,
-            )
+            simulate_rename(old_path, new_path, repo, interactor)
             return 'planned', new_path
         if case_change:
             if not rename_case_sensitive(old_path, new_path, ctx):
@@ -295,41 +300,6 @@ def handle_rename_result(
         return result_path
     ctx.block_path(old_path, 'переименование не подтверждено')
     return None
-
-
-def process_rename_batch(
-    files: list[Path],
-    candidates: list[Path],
-    transform: Callable[[str], str],
-    description: str,
-    ctx: SessionContext,
-    repo: TagRepository,
-    interactor: UserInteractor,
-    stat_key: str,
-) -> list[Path]:
-    """Универсальная обработка пакета переименований."""
-    if not candidates:
-        return files
-
-    labels = [f'{f.name}  ->  {transform(f.stem)}{f.suffix}' for f in candidates]
-    idx = select_indices(labels, f'Найдено {len(candidates)} {description}', interactor)
-    chosen = {candidates[i] for i in idx}
-
-    new_files = []
-    for f in files:
-        if f in chosen:
-            new_path = f.with_name(transform(f.stem) + f.suffix)
-            status, result_path = safe_rename(f, new_path, ctx, repo, interactor)
-            result = handle_rename_result(status, f, result_path, ctx, stat_key)
-            # Блокировка запрещает изменения, но не чтение и показ кандидатов.
-            new_files.append(result if result is not None else f)
-        else:
-            new_files.append(f)
-
-    if ctx.get_stat(stat_key) > 0:
-        interactor.display(f'  Обработано файлов: {ctx.get_stat(stat_key)}')
-
-    return new_files
 
 
 def get_audio_duration(filepath: Path) -> float | None:

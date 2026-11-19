@@ -10,6 +10,7 @@ import pytest
 
 import pipeline_utils as utils
 from context import SessionContext
+from stages import process_rename_batch
 from tag_repository import AudioTags, TagRepository
 
 
@@ -347,7 +348,7 @@ def test_batch_conflict_remains_available_for_display(tmp_path: Path) -> None:
     ctx, repo, ui = SessionContext(False, False), MemoryRepository(), Interactor()
     repo.simulate_update_tags(old, 'Artist', 'Title')
     repo.simulate_update_tags(new, 'Artist', 'Title')
-    result = utils.process_rename_batch(
+    result = process_rename_batch(
         [old, new],
         [old],
         lambda stem: 'new',

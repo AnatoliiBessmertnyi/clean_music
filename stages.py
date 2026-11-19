@@ -1,6 +1,7 @@
 """Конкретные этапы (Stages) конвейера обработки аудиофайлов."""
 
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ from config import (
     SUPPORTED_EXTENSIONS,
 )
 from context import SessionContext
+from file_operations import FileExecutor
 from interactor import UserInteractor
 from naming import (
     build_safe_filename,
@@ -35,7 +37,6 @@ from pipeline_utils import (
     handle_rename_result,
     modification_allowed,
     process_duplicates,
-    process_rename_batch,
     safe_rename,
     select_indices,
     simple_rename,
@@ -43,6 +44,48 @@ from pipeline_utils import (
 from report_events import log_operation
 from strategies import StrategyFactory
 from tag_repository import TagRepository
+
+_file_executor = FileExecutor()
+
+
+def process_rename_batch(
+    files: list[Path],
+    candidates: list[Path],
+    transform: Callable[[str], str],
+    description: str,
+    ctx: SessionContext,
+    repo: TagRepository,
+    interactor: UserInteractor,
+    stat_key: str,
+) -> list[Path]:
+    """Универсальная обработка пакета переименований."""
+    if not candidates:
+        return files
+
+    labels = [f'{f.name}  ->  {transform(f.stem)}{f.suffix}' for f in candidates]
+    idx = select_indices(labels, f'Найдено {len(candidates)} {description}', interactor)
+    chosen = {candidates[i] for i in idx}
+
+    new_files = []
+    for f in files:
+        if f not in chosen:
+            new_files.append(f)
+            continue
+        new_path = f.with_name(transform(f.stem) + f.suffix)
+        result = _file_executor.rename(f, new_path, ctx, repo, interactor)
+        if result.is_confirmed_change:
+            ctx.increment_stat(stat_key)
+        if (
+            result.is_confirmed_change or result.is_model_change
+        ) and result.path is not None:
+            new_files.append(result.path)
+        else:
+            new_files.append(f)
+
+    if ctx.get_stat(stat_key) > 0:
+        interactor.display(f'  Обработано файлов: {ctx.get_stat(stat_key)}')
+
+    return new_files
 
 
 def _update_tags(
