@@ -114,6 +114,80 @@ def test_tag_rename_passes_current_paths_to_mismatches(
 
 
 @windows
+@pytest.mark.parametrize('dry_run', [False, True])
+def test_tag_rename_applies_mismatches_in_input_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry_run: bool
+) -> None:
+    individual = tmp_path / 'Artist - Original.mp3'
+    safe = tmp_path / 'Matching.mp3'
+    neighbor = tmp_path / 'Artist - Unchanged.mp3'
+    group = tmp_path / 'Without separator.mp3'
+    files = [individual, safe, neighbor, group]
+    expected = [
+        tmp_path / 'Artist - Corrected.mp3',
+        tmp_path / 'Artist - Matching.mp3',
+        neighbor,
+        tmp_path / 'Artist - Grouped.mp3',
+    ]
+    ctx, repo, ui = SessionContext(dry_run, False), MemoryRepository(), Interactor()
+    monkeypatch.setattr(ui, 'prompt', Mock(side_effect=['', 'y', 't']))
+    titles = ['Corrected', 'Matching', 'Unchanged', 'Grouped']
+    ids = []
+    for source, title in zip(files, titles, strict=True):
+        source.write_bytes(title.encode())
+        repo.simulate_update_tags(source, 'Artist', title)
+        ids.append(ctx.registry.register(source).id)
+
+    assert stages.TagRenamingStage().execute(files, ctx, repo, ui) == expected
+    assert [ctx.registry.id_for(path) for path in expected] == ids
+    assert [ctx.registry.path_of(file_id) for file_id in ids] == expected
+    assert ctx.get_stat('renamed_by_tags') == (0 if dry_run else 3)
+    for source, target, title in zip(files, expected, titles, strict=True):
+        assert (source if dry_run else target).read_bytes() == title.encode()
+        if source != target:
+            assert not (target if dry_run else source).exists()
+            assert ctx.registry.id_for(source) is None
+
+
+@windows
+@pytest.mark.parametrize('outcome', ['conflict', 'denied', 'blocked'])
+def test_tag_mismatch_keeps_original_path_on_rename_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    source = tmp_path / 'Without separator.mp3'
+    target = tmp_path / 'Artist - Corrected.mp3'
+    source.write_bytes(b'original')
+    ctx, repo, ui = SessionContext(False, False), MemoryRepository(), Interactor('y')
+    repo.simulate_update_tags(source, 'Artist', 'Corrected')
+    file_id = ctx.registry.register(source).id
+    files = [source]
+    if outcome == 'conflict':
+        target.write_bytes(b'occupied')
+        files.append(target)
+        target_id = ctx.registry.register(target).id
+        reason = 'конфликт целевого имени; оба файла сохранены'
+    elif outcome == 'denied':
+        reason = 'locked'
+        monkeypatch.setattr(Path, 'rename', Mock(side_effect=PermissionError(reason)))
+    else:
+        reason = 'ранее заблокирован'
+        ctx.block_path(source, reason)
+
+    assert stages.TagRenamingStage().execute(files, ctx, repo, ui) == files
+    assert ctx.registry.path_of(file_id) == source
+    assert ctx.registry.id_for(source) == file_id
+    assert ctx.get_stat('renamed_by_tags') == 0
+    assert ctx.get_block_reason(source) == reason
+    assert source.read_bytes() == b'original'
+    if outcome == 'conflict':
+        assert target.read_bytes() == b'occupied'
+        assert ctx.registry.id_for(target) == target_id
+    else:
+        assert not target.exists()
+        assert ctx.get_block_reason(target) == (reason if outcome == 'denied' else None)
+
+
+@windows
 @pytest.mark.parametrize('answer', ['', 'y', 'yes'])
 def test_tag_rename_conflict_keeps_both(tmp_path: Path, answer: str) -> None:
     old, new = tmp_path / 'Title.mp3', tmp_path / 'Artist - Title.mp3'
