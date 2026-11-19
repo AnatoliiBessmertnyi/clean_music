@@ -9,7 +9,6 @@ from config import (
     FEAT_VARIANTS_PATTERN,
     INVALID_FILENAME_CHARS,
     JUNK_PATTERN,
-    SUPPORTED_EXTENSIONS,
 )
 from context import SessionContext
 from file_operations import FileExecutor
@@ -35,13 +34,10 @@ from pipeline_utils import (
     categorize_mismatch,
     clean_filename_safely,
     find_artist_variations,
-    handle_rename_result,
     modification_allowed,
     process_duplicates,
-    safe_rename,
     select_indices,
 )
-from report_events import log_operation
 from strategies import StrategyFactory
 from tag_repository import TagRepository
 
@@ -96,24 +92,8 @@ def _update_tags(
     repo: TagRepository,
     interactor: UserInteractor,
 ) -> bool:
-    """Проверяет безопасность и блокирует зависимые действия при отказе записи."""
-    if not modification_allowed(path, ctx, interactor):
-        log_operation(
-            'tags',
-            path,
-            'блокировка',
-            ctx.get_block_reason(path) or 'модификация не разрешена',
-            artist=artist,
-            title=title,
-            proposed=ctx.dry_run,
-        )
-        return False
-    if repo.update_tags(path, artist, title):
-        return True
-    reason = 'запись тегов не подтверждена'
-    ctx.block_path(path, reason)
-    interactor.display_error(f'{path.name}: {reason}')
-    return False
+    result = _file_executor.write_tags(path, artist, title, ctx, repo, interactor)
+    return result.is_confirmed_change or result.is_model_change
 
 
 class JunkCleaningStage:
@@ -130,6 +110,7 @@ class JunkCleaningStage:
         repo: TagRepository,
         interactor: UserInteractor,
     ) -> list[Path]:
+        files = ctx.present_paths(ctx.file_ids(files))
         # Подэтап 1.1: Очистка имён файлов
         junk_files = [f for f in files if JUNK_PATTERN.search(f.stem)]
         current_files = process_rename_batch(
@@ -158,8 +139,6 @@ class JunkCleaningStage:
         """Очищает мусор из тегов исполнителя и названия."""
         candidates = []
         for f in files:
-            if not f.exists():
-                continue
             tags = repo.get_tags(f)
             if not tags:
                 continue
@@ -192,13 +171,7 @@ class JunkCleaningStage:
         cleaned_count = 0
         for i in idx:
             f, _, _, new_artist, new_title = candidates[i]
-            if not modification_allowed(f, ctx, interactor):
-                continue
-            if ctx.dry_run:
-                ctx.log_debug(f'[DRY RUN] Очистил бы теги: {f.name}')
-                repo.simulate_update_tags(f, new_artist, new_title)
-                cleaned_count += 1
-            elif _update_tags(f, new_artist, new_title, ctx, repo, interactor):
+            if _update_tags(f, new_artist, new_title, ctx, repo, interactor):
                 interactor.display(f'  Теги очищены: {f.name}')
                 cleaned_count += 1
 
@@ -221,6 +194,8 @@ class NormalizationStage:
         repo: TagRepository,
         interactor: UserInteractor,
     ) -> list[Path]:
+        files = ctx.present_paths(ctx.file_ids(files))
+
         def normalize_text(text: str) -> str:
             text = normalize_dash(text)
             return normalize_filename_stem(text)
@@ -253,6 +228,7 @@ class TagRenamingStage:
         repo: TagRepository,
         interactor: UserInteractor,
     ) -> list[Path]:
+        files = ctx.present_paths(ctx.file_ids(files))
         interactor.display(
             '\n  [Подэтап 3.1] Нормализация участников (feat./ft./featuring)'
         )
@@ -294,8 +270,6 @@ class TagRenamingStage:
     ) -> list[Path]:
         feat_candidates: list[tuple[Path, str, str, str, str, str]] = []
         for f in files:
-            if not f.exists():
-                continue
             tags = repo.get_tags(f)
             if not tags:
                 continue
@@ -345,13 +319,7 @@ class TagRenamingStage:
         normalized_count = 0
         for i in selected_indices:
             f, _, _, new_artist, new_title, _ = feat_candidates[i]
-            if not modification_allowed(f, ctx, interactor):
-                continue
-            if ctx.dry_run:
-                ctx.log_debug(f'[DRY RUN] Нормализовал бы (feat.): {f.name}')
-                repo.simulate_update_tags(f, new_artist, new_title)
-                normalized_count += 1
-            elif _update_tags(f, new_artist, new_title, ctx, repo, interactor):
+            if _update_tags(f, new_artist, new_title, ctx, repo, interactor):
                 ctx.log_debug(f'Нормализован (feat.): {f.name}')
                 normalized_count += 1
 
@@ -371,8 +339,6 @@ class TagRenamingStage:
     ) -> list[Path]:
         sep_candidates: list[tuple[Path, str, str, str]] = []
         for f in files:
-            if not f.exists():
-                continue
             tags = repo.get_tags(f)
             if not tags:
                 continue
@@ -405,13 +371,7 @@ class TagRenamingStage:
         for i in selected_indices:
             f, _, _, new_artist = sep_candidates[i]
             title = sep_candidates[i][2]
-            if not modification_allowed(f, ctx, interactor):
-                continue
-            if ctx.dry_run:
-                ctx.log_debug(f'[DRY RUN] Нормализовал бы разделители: {f.name}')
-                repo.simulate_update_tags(f, new_artist, title)
-                normalized_count += 1
-            elif _update_tags(f, new_artist, title, ctx, repo, interactor):
+            if _update_tags(f, new_artist, title, ctx, repo, interactor):
                 ctx.log_debug(f'Нормализован (разделители): {f.name}')
                 normalized_count += 1
 
@@ -446,25 +406,14 @@ class TagRenamingStage:
             removed_count = 0
             for ann in problematic:
                 for f in annotations[ann]:
-                    if not f.exists():
-                        continue
                     tags = repo.get_tags(f)
                     if tags:
                         new_title = remove_annotation_from_text(tags.title, ann)
-                        if new_title != tags.title:
-                            if not modification_allowed(f, ctx, interactor):
-                                continue
-                            if ctx.dry_run:
-                                ctx.log_debug(
-                                    f'[DRY RUN] Автоудалил бы: ({ann}) из {f.name}'
-                                )
-                                repo.simulate_update_tags(f, tags.artist, new_title)
-                                removed_count += 1
-                            elif _update_tags(
-                                f, tags.artist, new_title, ctx, repo, interactor
-                            ):
-                                ctx.log_debug(f'Автоудалено: ({ann}) из {f.name}')
-                                removed_count += 1
+                        if new_title != tags.title and _update_tags(
+                            f, tags.artist, new_title, ctx, repo, interactor
+                        ):
+                            ctx.log_debug(f'Автоудалено: ({ann}) из {f.name}')
+                            removed_count += 1
             if removed_count:
                 interactor.display(f'  Автоматически удалено: {removed_count}')
                 for ann in problematic:
@@ -516,25 +465,14 @@ class TagRenamingStage:
             removed_count = 0
             for ann in to_remove:
                 for f in annotations[ann]:
-                    if not f.exists():
-                        continue
                     tags = repo.get_tags(f)
                     if tags:
                         new_title = remove_annotation_from_text(tags.title, ann)
-                        if new_title != tags.title:
-                            if not modification_allowed(f, ctx, interactor):
-                                continue
-                            if ctx.dry_run:
-                                ctx.log_debug(
-                                    f'[DRY RUN] Удалил бы из тега: ({ann}) из {f.name}'
-                                )
-                                repo.simulate_update_tags(f, tags.artist, new_title)
-                                removed_count += 1
-                            elif _update_tags(
-                                f, tags.artist, new_title, ctx, repo, interactor
-                            ):
-                                ctx.log_debug(f'Удалено из тега: ({ann}) из {f.name}')
-                                removed_count += 1
+                        if new_title != tags.title and _update_tags(
+                            f, tags.artist, new_title, ctx, repo, interactor
+                        ):
+                            ctx.log_debug(f'Удалено из тега: ({ann}) из {f.name}')
+                            removed_count += 1
             interactor.display(f'  Удалено уточнений из тегов: {removed_count}')
 
         return files
@@ -578,9 +516,6 @@ class TagRenamingStage:
         missing: list[Path] = []
 
         for position, f in enumerate(files):
-            if not f.exists():
-                continue
-
             file_title = extract_title_from_filename(f.stem)
             tags = repo.get_tags(f)
             ctx.log_debug(
@@ -706,10 +641,10 @@ class TagRenamingStage:
         # Фильтруем несуществующие и уже корректные
         active_mismatch: list[tuple[Path, str, str]] = []
         for f, file_title, _old_new_name in mismatch_candidates:
-            if not f.exists():
-                ctx.log_debug(f'Файл {f.name} больше не существует, пропускаю')
+            current = ctx.present_path(ctx.registry.track(f).id)
+            if current is None:
                 continue
-
+            f = current
             tags = repo.get_tags(f)
             if not tags:
                 continue
@@ -866,17 +801,7 @@ class TagRenamingStage:
                                 cleaned_artist, cleaned_title = clean_extracted_tags(
                                     parsed[0], parsed[1]
                                 )
-                                if not modification_allowed(f, ctx, interactor):
-                                    continue
-                                if ctx.dry_run:
-                                    ctx.log_debug(
-                                        f'[DRY RUN] Обновил бы теги из имени: {f.name}'
-                                    )
-                                    repo.simulate_update_tags(
-                                        f, cleaned_artist, cleaned_title
-                                    )
-                                    ctx.increment_stat('tags_written')
-                                elif _update_tags(
+                                if _update_tags(
                                     f,
                                     cleaned_artist,
                                     cleaned_title,
@@ -947,20 +872,11 @@ class TagRenamingStage:
                         rename_by_tags(f, current_new_name)
                     elif choice == 'f':
                         parsed = parse_artist_title(f.stem)
-                        if parsed:
-                            if not modification_allowed(f, ctx, interactor):
-                                continue
-                            if ctx.dry_run:
-                                ctx.log_debug(
-                                    f'[DRY RUN] Обновил бы теги из имени: {f.name}'
-                                )
-                                repo.simulate_update_tags(f, parsed[0], parsed[1])
-                                ctx.increment_stat('tags_written')
-                            elif _update_tags(
-                                f, parsed[0], parsed[1], ctx, repo, interactor
-                            ):
-                                ctx.log_debug(f'Теги обновлены из имени: {f.name}')
-                                ctx.increment_stat('tags_written')
+                        if parsed and _update_tags(
+                            f, parsed[0], parsed[1], ctx, repo, interactor
+                        ):
+                            ctx.log_debug(f'Теги обновлены из имени: {f.name}')
+                            ctx.increment_stat('tags_written')
                     else:
                         interactor.display(f'      Пропущен: {f.name}')
 
@@ -990,8 +906,6 @@ class TagRenamingStage:
         bracket_pattern = re.compile(r'[\(\[]([^\)\]]+)[\)\]]')
 
         for f in files:
-            if not f.exists():
-                continue
             tags = repo.get_tags(f)
             if tags:
                 title = tags.title
@@ -1061,9 +975,6 @@ class TagRenamingStage:
         problems: dict[str, list[tuple[Path, str, str]]] = {}
 
         for f in files:
-            if not f.exists():
-                continue
-
             tags = repo.get_tags(f)
             if not tags:
                 continue
@@ -1244,11 +1155,11 @@ class TagWritingStage:
         repo: TagRepository,
         interactor: UserInteractor,
     ) -> list[Path]:
+        file_ids = ctx.file_ids(files)
+        files = ctx.present_paths(file_ids)
         tags_to_write: list[tuple[Path, str, str]] = []
 
         for f in files:
-            if not f.exists():
-                continue
             parsed = parse_artist_title(f.stem)
             if parsed:
                 tags = repo.get_tags(f)
@@ -1289,34 +1200,27 @@ class TagWritingStage:
         for i in selected_indices:
             f, artist, title = tags_to_write[i]
 
-            if not modification_allowed(f, ctx, interactor):
+            result = _file_executor.write_tags(f, artist, title, ctx, repo, interactor)
+            if not (result.is_confirmed_change or result.is_model_change):
                 continue
-            if ctx.dry_run:
-                ctx.log_debug(f'[DRY RUN] Записал бы теги: {f.name}')
-                repo.simulate_update_tags(f, artist, title)
-                written_count += 1
-            else:
-                if _update_tags(f, artist, title, ctx, repo, interactor):
-                    ctx.log_debug(f'Записаны теги: {f.name}')
-                    ctx.increment_stat('tags_written')
-                    written_count += 1
-                    new_filename = build_safe_filename(artist, title, f.suffix)
-
-                    if new_filename != f.name:
-                        new_path = f.with_name(new_filename)
-                        status, result_path = safe_rename(
-                            f, new_path, ctx, repo, interactor
-                        )
-                        if status == 'renamed' and result_path is not None:
-                            renamed_count += 1
-                            ctx.increment_stat('renamed_by_tags')
+            written_count += 1
+            if result.is_confirmed_change:
+                ctx.increment_stat('tags_written')
+            new_filename = build_safe_filename(artist, title, f.suffix)
+            if new_filename != f.name:
+                renamed = _file_executor.rename(
+                    f, f.with_name(new_filename), ctx, repo, interactor
+                )
+                if renamed.is_confirmed_change:
+                    ctx.increment_stat('renamed_by_tags')
+                    renamed_count += 1
 
         if written_count:
             interactor.display(f'  Записано тегов: {written_count}')
         if renamed_count:
             interactor.display(f'  Переименовано файлов: {renamed_count}')
 
-        return files
+        return ctx.present_paths(file_ids)
 
     def _handle_annotations(
         self,
@@ -1377,7 +1281,9 @@ class DuplicateResolutionStage:
         repo: TagRepository,
         interactor: UserInteractor,
     ) -> list[Path]:
-        return process_duplicates(files, ctx, repo, interactor)
+        return process_duplicates(
+            ctx.present_paths(ctx.file_ids(files)), ctx, repo, interactor
+        )
 
 
 class ArtistNormalizationStage:
@@ -1394,15 +1300,11 @@ class ArtistNormalizationStage:
         repo: TagRepository,
         interactor: UserInteractor,
     ) -> list[Path]:
-        if ctx.target_dir is not None:
-            files = [
-                f
-                for f in ctx.target_dir.iterdir()
-                if f.suffix.lower() in SUPPORTED_EXTENSIONS
-            ]
-            ctx.log_debug(f'Пересканировано файлов перед этапом 6: {len(files)}')
+        file_ids = ctx.file_ids(files)
+        files = ctx.present_paths(file_ids)
 
         artist_variations = find_artist_variations(files, repo)
+        ids_by_path = {path: ctx.registry.track(path).id for path in files}
         unique_normalized: set[str] = set()
 
         if not artist_variations:
@@ -1449,73 +1351,54 @@ class ArtistNormalizationStage:
                 f'Обрабатываю исполнителя {key!r}, канонический вариант: {canonical!r}'
             )
 
-            processed_files: set[Path] = set()
-            for f, full_artist, individual_artist in entries:
-                if not f.exists():
-                    ctx.log_debug(f'Файл {f.name} уже не существует, пропускаю')
+            processed_files: set[int] = set()
+            for original, _, individual_artist in entries:
+                file_id = ids_by_path[original]
+                if file_id in processed_files or individual_artist == canonical:
                     continue
-                if f in processed_files:
+                f = ctx.present_path(file_id)
+                if f is None or (tags := repo.get_tags(f)) is None:
                     continue
 
-                if individual_artist != canonical:
-                    new_full_artist = re.sub(
-                        r'\b' + re.escape(individual_artist) + r'\b',
-                        canonical,
-                        full_artist,
-                        flags=re.IGNORECASE,
-                    )
+                new_full_artist = re.sub(
+                    r'\b' + re.escape(individual_artist) + r'\b',
+                    canonical,
+                    tags.artist,
+                    flags=re.IGNORECASE,
+                )
+                result = _file_executor.write_tags(
+                    f, new_full_artist, tags.title, ctx, repo, interactor
+                )
+                if not (result.is_confirmed_change or result.is_model_change):
+                    continue
+                processed_files.add(file_id)
+                ctx.increment_stat('artists_normalized')
+                unique_normalized.add(key)
 
-                    tags = repo.get_tags(f)
-                    if tags:
-                        if not modification_allowed(f, ctx, interactor):
-                            continue
-                        if ctx.dry_run:
-                            interactor.display(
-                                f'  [DRY RUN] Обновил бы тег: {f.name} ({full_artist} -> {new_full_artist})'
-                            )
-                            repo.simulate_update_tags(f, new_full_artist, tags.title)
-                            ctx.increment_stat('artists_normalized')
-                            unique_normalized.add(key)
-                        elif _update_tags(
-                            f, new_full_artist, tags.title, ctx, repo, interactor
-                        ):
+                parsed = parse_artist_title(f.stem)
+                if parsed and parsed[0] != new_full_artist:
+                    raw_name = f'{new_full_artist} - {parsed[1]}'
+
+                    if INVALID_FILENAME_CHARS.search(raw_name):
+                        base_name = clean_filename_safely(
+                            raw_name, f.name, ctx, interactor
+                        )
+                        if base_name == 'SKIP':
                             ctx.log_debug(
-                                f'Обновлено: {f.name} ({full_artist} -> {new_full_artist})'
+                                f'Пропущен из-за недопустимых символов: {f.name}'
                             )
-                            ctx.increment_stat('artists_normalized')
-                            unique_normalized.add(key)
+                            continue
+                    else:
+                        base_name = raw_name
 
-                    if ctx.is_path_blocked(f):
-                        continue
-                    parsed = parse_artist_title(f.stem)
-                    if parsed and parsed[0] != new_full_artist:
-                        raw_name = f'{new_full_artist} - {parsed[1]}'
-
-                        if INVALID_FILENAME_CHARS.search(raw_name):
-                            base_name = clean_filename_safely(
-                                raw_name, f.name, ctx, interactor
-                            )
-                            if base_name == 'SKIP':
-                                ctx.log_debug(
-                                    f'Пропущен из-за недопустимых символов: {f.name}'
-                                )
-                                continue
-                        else:
-                            base_name = raw_name
-
-                        new_name = f'{base_name}{f.suffix}'
-                        new_path = f.with_name(new_name)
-                        status, result_path = safe_rename(
-                            f, new_path, ctx, repo, interactor
-                        )
-                        handle_rename_result(
-                            status, f, result_path, ctx, 'renamed_by_tags'
-                        )
-
-                    processed_files.add(f)
+                    new_name = f'{base_name}{f.suffix}'
+                    new_path = f.with_name(new_name)
+                    renamed = _file_executor.rename(f, new_path, ctx, repo, interactor)
+                    if renamed.is_confirmed_change:
+                        ctx.increment_stat('renamed_by_tags')
 
         ctx.stats['artists_normalized_unique'] = len(unique_normalized)
-        return files
+        return ctx.present_paths(file_ids)
 
 
 class ManualInputStage:
@@ -1532,22 +1415,25 @@ class ManualInputStage:
         repo: TagRepository,
         interactor: UserInteractor,
     ) -> list[Path]:
-        if ctx.target_dir is not None:
-            files = [
-                f
-                for f in ctx.target_dir.iterdir()
-                if f.suffix.lower() in SUPPORTED_EXTENSIONS
-            ]
-            ctx.log_debug(f'Пересканировано файлов перед этапом 7: {len(files)}')
+        file_ids = ctx.file_ids(files)
+        files = ctx.present_paths(file_ids)
 
         still_missing: list[Path] = []
 
-        actually_missing = [
-            f for f in ctx.missing_files if f.exists() and repo.get_tags(f) is None
+        missing_count = len(ctx.missing_files)
+        present_ids = set(file_ids)
+        missing_ids = [
+            file_id
+            for file_id in ctx.file_ids(ctx.missing_files)
+            if file_id in present_ids
         ]
+        actually_missing = [
+            f for f in ctx.present_paths(missing_ids) if repo.get_tags(f) is None
+        ]
+        ctx.missing_files = actually_missing
         ctx.log_debug(
             f'Файлов без тегов после Этапа 6: {len(actually_missing)} '
-            f'(было {len(ctx.missing_files)})'
+            f'(было {missing_count})'
         )
 
         if not actually_missing:
@@ -1563,9 +1449,10 @@ class ManualInputStage:
 
         for i in selected_indices:
             f = actually_missing[i]
-            if not modification_allowed(f, ctx, interactor):
-                continue
-            if not f.exists():
+            record = ctx.registry.track(f)
+            physical = ctx.registry.physical_path(record) if ctx.dry_run else f
+            checked_path = f if ctx.is_path_blocked(f) else physical
+            if not modification_allowed(checked_path, ctx, interactor):
                 continue
             title = extract_title_from_filename(f.stem)
             interactor.display(f'\n  Файл: {f.name}')
@@ -1589,8 +1476,9 @@ class ManualInputStage:
 
             new_name = f'{base_name}{f.suffix}'
             new_path = f.with_name(new_name)
-            status, result_path = safe_rename(f, new_path, ctx, repo, interactor)
-            handle_rename_result(status, f, result_path, ctx, 'manual_input')
+            result = _file_executor.rename(f, new_path, ctx, repo, interactor)
+            if result.is_confirmed_change:
+                ctx.increment_stat('manual_input')
 
         ctx._still_missing = still_missing  # type: ignore[attr-defined]
-        return files
+        return ctx.present_paths(file_ids)

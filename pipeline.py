@@ -62,7 +62,8 @@ class AudioProcessingPipeline:
         interactor: UserInteractor,
     ) -> list[Path]:
         """Запускает конвейер обработки."""
-        current_files = initial_files
+        file_ids = ctx.file_ids(initial_files)
+        current_files = ctx.present_paths(file_ids)
         total_stages = len(self._stages)
 
         for index, stage in enumerate(self._stages, start=1):
@@ -75,7 +76,8 @@ class AudioProcessingPipeline:
             ctx.log_debug(f'Начинаю этап {index}/{total_stages}: {stage.name}')
 
             # Выполняем этап
-            current_files = stage.execute(current_files, ctx, repo, interactor)
+            stage.execute(current_files, ctx, repo, interactor)
+            current_files = ctx.present_paths(file_ids)
 
             interactor.display(f'\n✅ Этап "{stage.name}" успешно завершен.')
 

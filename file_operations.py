@@ -2,12 +2,11 @@
 
 from collections.abc import Callable
 from pathlib import Path
-from weakref import WeakKeyDictionary
 
 from context import SessionContext
-from file_state import FileRegistry, OperationResult, OperationStatus
+from file_state import OperationResult, OperationStatus
 from interactor import UserInteractor
-from pipeline_utils import safe_rename, simulate_rename
+from pipeline_utils import modification_allowed, safe_rename, simulate_rename
 from report_events import log_operation
 from tag_repository import TagRepository
 
@@ -29,9 +28,59 @@ _RENAME_RESULTS = {
 class FileExecutor:
     def __init__(self, rename_fn: RenameFn = safe_rename) -> None:
         self._rename_fn = rename_fn
-        self._simulated_paths: WeakKeyDictionary[FileRegistry, dict[int, Path]] = (
-            WeakKeyDictionary()
-        )
+
+    def write_tags(
+        self,
+        path: Path,
+        artist: str,
+        title: str,
+        ctx: SessionContext,
+        repo: TagRepository,
+        interactor: UserInteractor,
+    ) -> OperationResult:
+        record = ctx.registry.track(path)
+        current = ctx.present_path(record.id)
+        if current is None:
+            reason = 'файл отсутствует'
+            log_operation(
+                'tags',
+                record.path,
+                'отказ',
+                reason,
+                artist=artist,
+                title=title,
+                proposed=ctx.dry_run,
+            )
+            return OperationResult(OperationStatus.ERROR, None, reason)
+
+        physical = ctx.registry.physical_path(record) if ctx.dry_run else current
+        checked_path = current if ctx.is_path_blocked(current) else physical
+        if not modification_allowed(checked_path, ctx, interactor):
+            reason = (
+                ctx.get_block_reason(current)
+                or ctx.get_block_reason(physical)
+                or 'модификация не разрешена'
+            )
+            log_operation(
+                'tags',
+                current,
+                'блокировка',
+                reason,
+                artist=artist,
+                title=title,
+                proposed=ctx.dry_run,
+            )
+            return OperationResult(OperationStatus.ERROR, current, reason)
+
+        result = repo.apply_tags(current, artist, title, simulated=ctx.dry_run)
+        if (
+            result.is_confirmed_change or result.is_model_change
+        ) and current in ctx.missing_files:
+            ctx.missing_files.remove(current)
+        if result.status in (OperationStatus.ERROR, OperationStatus.UNCERTAIN):
+            ctx.block_path(current, result.reason)
+            interactor.display_error(f'{current.name}: {result.reason}')
+        return result
 
     def rename(
         self,
@@ -42,17 +91,19 @@ class FileExecutor:
         interactor: UserInteractor,
     ) -> OperationResult:
         registry = ctx.registry
-        record = registry.register(old_path.absolute())
+        record = registry.track(old_path.absolute())
+        if not record.present:
+            return OperationResult(OperationStatus.ERROR, None, 'файл отсутствует')
+        if str(record.path.absolute()) != str(old_path.absolute()):
+            old_path = record.path
         target = new_path.absolute()
-        simulated = self._simulated_paths.get(registry, {})
-        is_model_source = (
-            ctx.dry_run
-            and simulated.get(record.id) == record.path
-            and record.path == old_path.absolute()
-        )
+        physical = registry.physical_path(record)
+        is_model_source = ctx.dry_run and str(physical) != str(record.path)
 
         if is_model_source:
             reason = ctx.get_block_reason(old_path)
+            if reason is None and not modification_allowed(physical, ctx, interactor):
+                reason = ctx.get_block_reason(physical) or 'модификация не разрешена'
             if reason is None and ctx.is_path_blocked(new_path):
                 reason = 'целевой путь заблокирован'
             if reason is None and old_path.absolute().parent != target.parent:
@@ -126,13 +177,23 @@ class FileExecutor:
                 registry.mark_missing(owner)
 
         if operation_status in (OperationStatus.SUCCESS, OperationStatus.SIMULATED):
-            registry.update_path(record.id, target)
-            if operation_status is OperationStatus.SIMULATED:
-                self._simulated_paths.setdefault(registry, {})[record.id] = target
-            else:
-                simulated.pop(record.id, None)
+            missing_ids = ctx.file_ids(ctx.missing_files)
+            registry.update_path(
+                record.id,
+                target,
+                simulated=operation_status is OperationStatus.SIMULATED,
+            )
+            ctx.missing_files = [
+                entry.path
+                for file_id in missing_ids
+                if (entry := registry.record_of(file_id)).present
+            ]
         elif operation_status in (OperationStatus.ERROR, OperationStatus.UNCERTAIN):
             path = None
 
         reason = ctx.get_block_reason(old_path) or default_reason
+        if operation_status is OperationStatus.UNCERTAIN:
+            for candidate in (old_path, new_path):
+                if not ctx.is_path_blocked(candidate):
+                    ctx.block_path(candidate, reason)
         return OperationResult(operation_status, path, reason)

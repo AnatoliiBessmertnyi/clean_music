@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -56,6 +57,31 @@ class SessionContext:
     blocked_paths: dict[Path, str] = field(default_factory=dict)
     report: RunReport | None = None
     registry: FileRegistry = field(default_factory=FileRegistry)
+
+    def file_ids(self, paths: Iterable[Path]) -> list[int]:
+        """Фиксирует порядок входных файлов и устраняет повторы по ID."""
+        return list(dict.fromkeys(self.registry.track(path).id for path in paths))
+
+    def present_path(self, file_id: int) -> Path | None:
+        record = self.registry.record_of(file_id)
+        if not record.present:
+            return None
+        try:
+            self.registry.physical_path(record).lstat()
+        except FileNotFoundError:
+            self.registry.mark_missing(file_id)
+            return None
+        except OSError:
+            # Недоступность пути не подтверждает исчезновение.
+            pass
+        return record.path
+
+    def present_paths(self, file_ids: Iterable[int]) -> list[Path]:
+        return [
+            path
+            for file_id in file_ids
+            if (path := self.present_path(file_id)) is not None
+        ]
 
     def block_path(self, path: Path, reason: str) -> None:
         """Запрещает дальнейшие изменения по пути, сохраняя первую причину.

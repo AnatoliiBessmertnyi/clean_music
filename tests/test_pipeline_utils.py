@@ -10,6 +10,7 @@ import pytest
 
 import pipeline_utils as utils
 from context import SessionContext
+from file_state import OperationStatus
 from stages import process_rename_batch
 from tag_repository import AudioTags, TagRepository
 
@@ -42,11 +43,13 @@ class MemoryRepository(TagRepository):
     def _read_from_disk(self, filepath: Path) -> AudioTags | None:
         return None
 
-    def update_tags(self, filepath: Path, artist: str, title: str) -> bool:
+    def _write_to_disk(
+        self, filepath: Path, artist: str, title: str
+    ) -> tuple[OperationStatus, str]:
         self.writes.append((filepath, artist, title))
-        if self.succeed:
-            self.simulate_update_tags(filepath, artist, title)
-        return self.succeed
+        return (
+            OperationStatus.SUCCESS if self.succeed else OperationStatus.ERROR
+        ), 'test write'
 
 
 windows = pytest.mark.skipif(os.name != 'nt', reason='Реальная операция Windows/NTFS')
