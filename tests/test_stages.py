@@ -9,22 +9,64 @@ import pytest
 
 import stages
 from context import SessionContext
+from pipeline import AudioProcessingPipeline
 from tests.test_pipeline_utils import Interactor, MemoryRepository, windows
 
 
 @windows
+@pytest.mark.parametrize('conflict', [False, True])
 def test_junk_rename_failure_blocks_tag_cleanup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, conflict: bool
 ) -> None:
     path = tmp_path / 'Artist - Title (vksaver).mp3'
+    target = tmp_path / 'Artist - Title.mp3'
     path.write_bytes(b'original')
     repo, ctx, ui = MemoryRepository(), SessionContext(False, False), Interactor()
     repo.simulate_update_tags(path, 'Artist', 'Title (vksaver)')
-    monkeypatch.setattr(Path, 'rename', Mock(side_effect=PermissionError('locked')))
-    stages.JunkCleaningStage().execute([path], ctx, repo, ui)
-    assert ctx.is_path_blocked(path)
+    files = [path]
+    if conflict:
+        target.write_bytes(b'occupied')
+        files.append(target)
+    else:
+        monkeypatch.setattr(Path, 'rename', Mock(side_effect=PermissionError('locked')))
+    assert stages.JunkCleaningStage().execute(files, ctx, repo, ui) == files
+    assert ctx.get_block_reason(path) == (
+        'конфликт целевого имени; оба файла сохранены' if conflict else 'locked'
+    )
+    if conflict:
+        assert target.read_bytes() == b'occupied'
     assert not repo.writes and not ctx.get_stat('junk_removed')
     assert path.read_bytes() == b'original'
+
+
+@windows
+@pytest.mark.parametrize('dry_run', [False, True])
+def test_junk_then_normalization_preserves_file_id(
+    tmp_path: Path, dry_run: bool
+) -> None:
+    old = tmp_path / 'Artist \u2013 Title (vksaver).mp3'
+    middle = tmp_path / 'Artist \u2013 Title.mp3'
+    final = tmp_path / 'Artist - Title.mp3'
+    neighbor = tmp_path / 'Neighbor.mp3'
+    old.write_bytes(b'original')
+    neighbor.write_bytes(b'neighbor')
+    ctx, repo, ui = SessionContext(dry_run, False), MemoryRepository(), Interactor()
+    file_id = ctx.registry.register(old).id
+    pipeline = AudioProcessingPipeline(
+        [stages.JunkCleaningStage(), stages.NormalizationStage()]
+    )
+
+    assert pipeline.run([neighbor, old], ctx, repo, ui) == [neighbor, final]
+    assert ctx.registry.path_of(file_id) == final
+    assert ctx.registry.id_for(final) == file_id
+    assert ctx.registry.id_for(old) is None and ctx.registry.id_for(middle) is None
+    assert not middle.exists()
+    assert old.exists() == dry_run
+    assert final.exists() == (not dry_run)
+    assert (old if dry_run else final).read_bytes() == b'original'
+    assert neighbor.read_bytes() == b'neighbor'
+    assert ctx.get_stat('junk_removed') == int(not dry_run)
+    assert ctx.get_stat('dash_normalized') == int(not dry_run)
 
 
 @windows

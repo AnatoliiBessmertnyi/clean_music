@@ -72,6 +72,57 @@ def test_unknown_status_raises() -> None:
         )
 
 
+@windows
+def test_registered_missing_source_cannot_start_simulation(tmp_path: Path) -> None:
+    old, new = tmp_path / 'a.mp3', tmp_path / 'b.mp3'
+    ctx, repo, ui = SessionContext(True, False), MemoryRepository(), Interactor()
+    record = ctx.registry.register(old)
+    tags = AudioTags('Artist', 'Title')
+    repo.simulate_update_tags(old, tags.artist, tags.title)
+
+    result = FileExecutor().rename(old, new, ctx, repo, ui)
+
+    assert result.status is OperationStatus.ERROR
+    assert ctx.registry.path_of(record.id) == old
+    assert repo.get_tags(old) == tags and repo.get_tags(new) is None
+
+
+@windows
+@pytest.mark.parametrize('obstacle', ['blocked', 'disk', 'registry', 'directory'])
+def test_refused_model_step_preserves_path_and_cache(
+    tmp_path: Path, obstacle: str
+) -> None:
+    old, middle, new = (tmp_path / name for name in ('a.mp3', 'b.mp3', 'c.mp3'))
+    old.write_bytes(b'original')
+    ctx, repo, ui = SessionContext(True, False), MemoryRepository(), Interactor()
+    tags = AudioTags('Artist', 'Title')
+    repo.simulate_update_tags(old, tags.artist, tags.title)
+    executor = FileExecutor()
+    record = ctx.registry.register(old)
+    assert executor.rename(old, middle, ctx, repo, ui).is_model_change
+
+    if obstacle == 'blocked':
+        ctx.block_path(middle, 'test block')
+    elif obstacle == 'disk':
+        new.write_bytes(b'occupied')
+    elif obstacle == 'registry':
+        ctx.registry.register(new)
+    else:
+        new = tmp_path / 'other' / new.name
+
+    result = executor.rename(middle, new, ctx, repo, ui)
+
+    assert result.status is (
+        OperationStatus.CONFLICT
+        if obstacle in ('disk', 'registry')
+        else OperationStatus.ERROR
+    )
+    assert ctx.get_block_reason(middle) == result.reason
+    assert ctx.registry.path_of(record.id) == middle
+    assert repo.get_tags(middle) == tags and repo.get_tags(new) is None
+    assert old.read_bytes() == b'original' and not middle.exists()
+
+
 def test_lazy_registration_and_rename_chain() -> None:
     old, middle, new = Path('a.mp3'), Path('b.mp3'), Path('c.mp3')
     ctx, repo, ui = SessionContext(False, False), MemoryRepository(), Interactor()
