@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from file_state import FileRegistry
 from report_events import log_operation
 
 if TYPE_CHECKING:
@@ -54,6 +55,7 @@ class SessionContext:
     missing_files: list[Path] = field(default_factory=list)
     blocked_paths: dict[Path, str] = field(default_factory=dict)
     report: RunReport | None = None
+    registry: FileRegistry = field(default_factory=FileRegistry)
 
     def block_path(self, path: Path, reason: str) -> None:
         """Запрещает дальнейшие изменения по пути, сохраняя первую причину.
