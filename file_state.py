@@ -53,6 +53,7 @@ class FileRegistry:
         return Path(os.path.normcase(path.absolute()))
 
     def register(self, path: Path) -> FileRecord:
+        """Идемпотентно возвращает присутствующую запись или выдаёт новый id."""
         key = self._path_key(path)
         file_id = self._ids_by_path.get(key)
         if file_id is not None:
@@ -64,13 +65,18 @@ class FileRegistry:
         return record
 
     def id_for(self, path: Path) -> int | None:
+        """Возвращает id присутствующей записи по пути или None."""
         return self._ids_by_path.get(self._path_key(path))
 
     def path_of(self, file_id: int) -> Path:
+        """Возвращает последний известный путь или вызывает KeyError для неизвестного id."""
         return self._records[file_id][0].path
 
     def update_path(self, file_id: int, new_path: Path) -> None:
+        """Атомарно меняет путь (KeyError для неизвестного id, ValueError при отсутствии файла или конфликте путей)."""
         record, old_key = self._records[file_id]
+        if not record.present:
+            raise ValueError(f'Файл помечен как пропавший: {file_id}')
         new_key = self._path_key(new_path)
         owner = self._ids_by_path.get(new_key)
         if owner is not None and owner != file_id:
@@ -83,8 +89,12 @@ class FileRegistry:
         self._records[file_id] = (updated, new_key)
 
     def mark_missing(self, file_id: int) -> None:
+        """Идемпотентно освобождает ключ пути (KeyError для неизвестного id)."""
         record, key = self._records[file_id]
-        self._records[file_id] = (replace(record, present=False), key)
+        if record.present:
+            self._records[file_id] = (replace(record, present=False), key)
+            del self._ids_by_path[key]
 
     def current_paths(self) -> list[Path]:
+        """Возвращает пути присутствующих файлов в порядке регистрации."""
         return [record.path for record, _ in self._records.values() if record.present]
