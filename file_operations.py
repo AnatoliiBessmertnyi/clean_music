@@ -149,7 +149,7 @@ class FileExecutor:
                         target=new_path,
                         proposed=True,
                     )
-                    return OperationResult(OperationStatus.UNCERTAIN, None, reason)
+                    return OperationResult(OperationStatus.ERROR, None, reason)
                 else:
                     occupied = True
             if occupied:

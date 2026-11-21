@@ -1,14 +1,16 @@
 """Контракт исполнителя переименования и интеграция с Windows rename."""
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import pytest
 
+import pipeline_utils
 from context import SessionContext
 from file_operations import FileExecutor
-from file_state import OperationResult, OperationStatus
+from file_state import OperationResult, OperationStatus, inspect_file
 from tag_repository import AudioTags
 from tests.test_pipeline_utils import Interactor, MemoryRepository, admit, windows
 
@@ -217,8 +219,11 @@ def test_dry_run_case_change_preserves_identity() -> None:
 
 
 @windows
-def test_default_executor_reads_tags_from_renamed_file(tmp_path: Path) -> None:
-    old, new = tmp_path / 'old.mp3', tmp_path / 'new.mp3'
+@pytest.mark.parametrize('new_name', ['track.mp3', 'Track.MP3', 'Other.mp3'])
+def test_default_executor_reads_tags_from_renamed_file(
+    tmp_path: Path, new_name: str
+) -> None:
+    old, new = tmp_path / 'Track.mp3', tmp_path / new_name
     old.write_bytes(b'audio')
     ctx, repo, ui = SessionContext(False, False), MemoryRepository(), Interactor()
     source = admit(ctx, old)
@@ -227,13 +232,64 @@ def test_default_executor_reads_tags_from_renamed_file(tmp_path: Path) -> None:
     result = FileExecutor().rename(old, new, ctx, repo, ui)
 
     assert result.status is OperationStatus.SUCCESS, ui.messages
-    assert result.path == new
+    assert result.path is not None and result.path.name == new_name
+    assert [entry.name for entry in tmp_path.iterdir()] == [new_name]
     assert new.read_bytes() == b'audio'
-    assert not old.exists()
-    assert ctx.registry.id_for(new) == source.id
-    assert ctx.registry.id_for(old) is None
+    assert inspect_file(new) == source.identity
+    updated = ctx.registry.record_of(source.id)
+    assert updated.path.name == new_name
+    assert updated.identity == source.identity
     assert repo.get_tags(new).complete_tags == AudioTags('artist', 'title')
-    assert repo.get_tags(old).complete_tags is None
+
+
+@windows
+@pytest.mark.parametrize('observe_actual', [False, True])
+def test_unconfirmed_real_rename_blocks_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, observe_actual: bool
+) -> None:
+    old, new = tmp_path / 'old.mp3', tmp_path / 'new.mp3'
+    old.write_bytes(b'original')
+    ctx, repo, ui = SessionContext(False, False), MemoryRepository(), Interactor()
+    source = admit(ctx, old)
+    executor = FileExecutor()
+    real_iterdir = Path.iterdir
+    calls = Mock()
+
+    def inspect_directory(path: Path) -> Iterator[Path]:
+        if path == tmp_path:
+            calls()
+            if not observe_actual or calls.call_count == 1:
+                raise PermissionError('сбой чтения каталога после rename')
+        return real_iterdir(path)
+
+    monkeypatch.setattr(Path, 'iterdir', inspect_directory)
+    rename_call = create_autospec(Path.rename, side_effect=Path.rename)
+    monkeypatch.setattr(Path, 'rename', rename_call)
+    rename_event = Mock()
+    monkeypatch.setattr(pipeline_utils, 'log_operation', rename_event)
+
+    result = executor.rename(old, new, ctx, repo, ui)
+
+    assert result.status is OperationStatus.UNCERTAIN
+    assert result.path is None
+    assert f'Запрошено: {old} → {new}' in result.reason
+    observed = str(new) if observe_actual else 'не установлено'
+    assert f'Фактическое местонахождение исходного файла: {observed}' in result.reason
+    assert result.reason in ui.messages
+    rename_event.assert_called_once_with(
+        'rename', old, 'отказ', result.reason, target=new
+    )
+    assert ctx.registry.record_of(source.id) == source
+    assert ctx.is_path_blocked(old) and ctx.is_path_blocked(new)
+    assert not ctx.get_stat('renamed_by_tags')
+
+    for path in (old, new):
+        outcome = executor.rename(path, tmp_path / 'retry.mp3', ctx, repo, ui)
+        assert outcome.status is OperationStatus.ERROR
+    rename_call.assert_called_once_with(old, new)
+    assert list(real_iterdir(tmp_path)) == [new]
+    assert inspect_file(new) == source.identity
+    assert new.read_bytes() == b'original'
 
 
 @windows
