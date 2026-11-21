@@ -11,7 +11,7 @@ from config import (
 from context import SessionContext
 from file_operations import FileExecutor
 from file_state import OperationStatus
-from interactor import UserInteractor
+from interactor import UserInteractor, prompt_command
 from naming import (
     build_safe_filename,
     normalize_artist_separators,
@@ -678,7 +678,8 @@ class TagRenamingStage:
                     else 'обновить теги из имён'
                 )
 
-                choice = interactor.prompt(
+                choice = prompt_command(
+                    interactor,
                     f"\nПрименить '{action_name}' ко всей группе? (y/n) [y]: ",
                     default='y',
                 )
@@ -747,8 +748,10 @@ class TagRenamingStage:
                                 f'      → Если f: {parsed[0]} - {parsed[1]}'
                             )
 
-                    choice = interactor.prompt(
-                        f'      Действие [t/f/n] ({last_action}): ', default=last_action
+                    choice = prompt_command(
+                        interactor,
+                        f'      Действие [t/f/n] ({last_action}): ',
+                        default=last_action,
                     )
 
                     if choice == last_action and not choice:
@@ -885,12 +888,13 @@ class TagRenamingStage:
             interactor.display('  3. Ввести имя вручную для каждого файла')
             interactor.display('  4. Пропустить все файлы')
 
-            choice = interactor.prompt('  Выберите вариант [1]: ', default='1')
+            choice = prompt_command(interactor, '  Выберите вариант [1]: ', default='1')
 
             try:
-                idx = int(choice)
+                idx = int(choice or '1')
             except ValueError:
-                idx = 1
+                interactor.display_error('Некорректный вариант. Группа пропущена.')
+                return ('skip', {})
 
             if idx == 1:
                 return ('first_title', {})
@@ -905,12 +909,13 @@ class TagRenamingStage:
             interactor.display('  2. Ввести имя вручную для каждого файла')
             interactor.display('  3. Пропустить все файлы')
 
-            choice = interactor.prompt('  Выберите вариант [1]: ', default='1')
+            choice = prompt_command(interactor, '  Выберите вариант [1]: ', default='1')
 
             try:
-                idx = int(choice)
+                idx = int(choice or '1')
             except ValueError:
-                idx = 1
+                interactor.display_error('Некорректный вариант. Группа пропущена.')
+                return ('skip', {})
 
             if idx == 1:
                 return ('remove', {})
@@ -923,12 +928,13 @@ class TagRenamingStage:
         interactor.display('  3. Ввести имя вручную для каждого файла')
         interactor.display('  4. Пропустить все файлы')
 
-        choice = interactor.prompt('  Выберите вариант [1]: ', default='1')
+        choice = prompt_command(interactor, '  Выберите вариант [1]: ', default='1')
 
         try:
-            idx = int(choice)
+            idx = int(choice or '1')
         except ValueError:
-            idx = 1
+            interactor.display_error('Некорректный вариант. Группа пропущена.')
+            return ('skip', {})
 
         if idx == 1:
             return ('remove', {})
@@ -1105,7 +1111,9 @@ class ArtistNormalizationStage:
             for i, (artist, count) in enumerate(sorted_artists, 1):
                 interactor.display(f'  {i}. {artist} ({count} файлов)')
 
-            choice = interactor.prompt('Выберите номер варианта (n - пропустить) [1]: ')
+            choice = prompt_command(
+                interactor, 'Выберите номер варианта (n - пропустить) [1]: '
+            )
             if choice in ('n', 'no', 'н', 'нет'):
                 continue
 
@@ -1118,8 +1126,8 @@ class ArtistNormalizationStage:
                         interactor.display('Некорректный номер, пропускаю.')
                         continue
                 except ValueError:
-                    interactor.display('Некорректный ввод, выбираю вариант 1.')
-                    selected_idx = 0
+                    interactor.display_error('Некорректный ввод. Группа пропущена.')
+                    continue
 
             canonical = sorted_artists[selected_idx][0]
             ctx.log_debug(

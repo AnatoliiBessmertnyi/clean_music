@@ -15,7 +15,7 @@ from mutagen.oggvorbis import OggVorbis
 
 from config import FEAT_VARIANTS_PATTERN, INVALID_FILENAME_CHARS, LEADING_TRACK_PATTERN
 from context import SessionContext
-from interactor import UserInteractor
+from interactor import UserInteractor, prompt_command
 from naming import normalize_filename_stem, normalize_unicode
 from parsing import parse_artist_title
 from report_events import log_operation
@@ -30,8 +30,11 @@ def select_indices(
     for i, item in enumerate(items, 1):
         interactor.display(f'  [✓] {i}. {item}')
 
-    prompt = '(Enter - применить ко всем / номера - ИСКЛЮЧИТЬ из обработки / n - отменить все): '
-    choice = interactor.prompt(prompt, default='').strip().lower()
+    prompt = (
+        '(Enter - применить ко всем / номера через пробел или запятую - '
+        'ИСКЛЮЧИТЬ из обработки / n - отменить все): '
+    )
+    choice = prompt_command(interactor, prompt)
 
     if not choice or choice in ('y', 'yes', 'д', 'да'):
         return list(range(len(items)))
@@ -39,15 +42,20 @@ def select_indices(
         return []
 
     try:
-        excluded = {int(p) for p in re.split(r'[,\s]+', choice) if p}
-        selected = [i for i in range(len(items)) if (i + 1) not in excluded]
-        skipped = len(items) - len(selected)
-        if skipped:
-            interactor.display(f'Исключено {skipped} файлов.')
-        return selected
+        excluded = {int(part) for part in re.split(r'\s*,\s*|\s+', choice)}
     except ValueError:
-        interactor.display('Некорректный ввод, применяю ко всем.')
-        return list(range(len(items)))
+        interactor.display_error(
+            'Введите номера через пробел или запятую. Группа пропущена.'
+        )
+        return []
+    if any(not 1 <= number <= len(items) for number in excluded):
+        interactor.display_error(
+            f'Допустимые номера: от 1 до {len(items)}. Группа пропущена.'
+        )
+        return []
+
+    interactor.display(f'Исключено {len(excluded)} файлов.')
+    return [i for i in range(len(items)) if i + 1 not in excluded]
 
 
 def files_are_same(old_path: Path, new_path: Path) -> bool:
@@ -499,7 +507,7 @@ def sanitize_filename_interactive(
             f"  [Подсказка: вы уже {count} раз выбрали этот вариант. Нажмите 'a', чтобы запомнить.]"
         )
 
-    choice = interactor.prompt('  Выберите вариант [1]: ', default='1')
+    choice = prompt_command(interactor, '  Выберите вариант [1]: ', default='1')
 
     if choice == 'a':
         ctx.remembered_choices[chars_key] = 0

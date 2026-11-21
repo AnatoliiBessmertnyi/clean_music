@@ -236,7 +236,7 @@ def test_dialog_answers_and_errors_in_one_log(
         ui = ConsoleInteractor()
         ui.display('Список вариантов')
         assert ui.prompt('Выбор [y]: ', 'y') == 'y'
-        assert ui.prompt('Имя: ') == 'текст'
+        assert ui.prompt('Имя: ') == 'ТЕКСТ'
         ui.display_error('Не удалось выполнить действие')
     text = report.path.read_text(encoding='utf-8')
     for expected in (
