@@ -5,6 +5,8 @@ import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from file_state import regular_file_info
+
 logger = logging.getLogger('clean_music')
 
 
@@ -38,7 +40,7 @@ def log_operation(
     identity = None
     observed = target if kind == 'rename' and result == 'успех' and target else path
     try:
-        info = observed.lstat()
+        info = regular_file_info(observed)
         identity = (info.st_dev, info.st_ino)
     except OSError:
         pass

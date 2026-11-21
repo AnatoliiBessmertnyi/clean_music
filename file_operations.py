@@ -72,7 +72,15 @@ class FileExecutor:
             )
             return OperationResult(OperationStatus.ERROR, current, reason)
 
-        result = repo.apply_tags(current, artist, title, simulated=ctx.dry_run)
+        def before_save() -> None:
+            if not modification_allowed(current, ctx, interactor):
+                raise OSError(
+                    ctx.get_block_reason(current) or 'модификация не разрешена'
+                )
+
+        result = repo.apply_tags(
+            current, artist, title, simulated=ctx.dry_run, before_save=before_save
+        )
         if (
             result.is_confirmed_change or result.is_model_change
         ) and current in ctx.missing_files:

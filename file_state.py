@@ -1,9 +1,55 @@
 """Результаты операций и текущее состояние файлов в сессии."""
 
+import ctypes
 import os
+import stat
+import sys
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from pathlib import Path
+
+type FileIdentity = tuple[int, int]
+
+
+def entry_info(path: Path) -> os.stat_result:
+    """Проверяет запись каталога перед lstat, который может раскрыть reparse point."""
+    if sys.platform == 'win32':
+        attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+        if attributes == -1:
+            raise ctypes.WinError()
+        if attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise OSError(f'ссылка или reparse point: {path}')
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or (
+        getattr(info, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    ):
+        raise OSError(f'ссылка или reparse point: {path}')
+    return info
+
+
+def check_directory(directory: Path) -> None:
+    absolute = directory.absolute()
+    for entry in (*reversed(absolute.parents), absolute):
+        if not stat.S_ISDIR(entry_info(entry).st_mode):
+            raise OSError(f'не является каталогом: {entry}')
+
+
+def regular_file_info(path: Path) -> os.stat_result:
+    absolute = path.absolute()
+    check_directory(absolute.parent)
+    info = entry_info(absolute)
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError('не является обычным файлом')
+    if info.st_nlink != 1:
+        raise OSError('требуется ровно одна жёсткая ссылка')
+    return info
+
+
+def inspect_file(path: Path) -> FileIdentity:
+    info = regular_file_info(path)
+    if not info.st_ino:
+        raise OSError('физический идентификатор файла недоступен')
+    return info.st_dev, info.st_ino
 
 
 class OperationStatus(Enum):
@@ -39,6 +85,7 @@ class FileRecord:
     id: int
     path: Path
     present: bool
+    identity: FileIdentity | None = None
 
 
 class FileRegistry:
@@ -54,14 +101,18 @@ class FileRegistry:
     def _path_key(path: Path) -> Path:
         return Path(os.path.normcase(path.absolute()))
 
-    def register(self, path: Path) -> FileRecord:
+    def register(
+        self, path: Path, *, identity: FileIdentity | None = None
+    ) -> FileRecord:
         """Идемпотентно возвращает присутствующую запись или выдаёт новый id."""
         key = self._path_key(path)
         file_id = self._ids_by_path.get(key)
         if file_id is not None:
             return self._records[file_id][0]
 
-        record = FileRecord(len(self._records) + 1, path, present=True)
+        record = FileRecord(
+            len(self._records) + 1, path, present=True, identity=identity
+        )
         self._records[record.id] = (record, key)
         self._ids_by_path[key] = record.id
         return record

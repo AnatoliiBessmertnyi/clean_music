@@ -1,6 +1,7 @@
 """Репозиторий для работы с тегами аудиофайлов с кэшированием."""
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from os import stat_result
@@ -116,7 +117,13 @@ class TagRepository:
         return result
 
     def apply_tags(
-        self, filepath: Path, artist: str, title: str, *, simulated: bool
+        self,
+        filepath: Path,
+        artist: str,
+        title: str,
+        *,
+        simulated: bool,
+        before_save: Callable[[], None] | None = None,
     ) -> OperationResult:
         """Применяет запись тегов и публикует её результат."""
         tags = AudioTags(artist, title)
@@ -138,6 +145,7 @@ class TagRepository:
                 filepath,
                 artist if artist != before.tags.artist else None,
                 title if title != before.tags.title else None,
+                before_save=before_save,
             )
         if status in (OperationStatus.SUCCESS, OperationStatus.UNCERTAIN):
             self._cache.pop(key, None)
@@ -233,7 +241,12 @@ class TagRepository:
         self._model_sources.clear()
 
     def _write_to_disk(
-        self, filepath: Path, artist: str | None, title: str | None
+        self,
+        filepath: Path,
+        artist: str | None,
+        title: str | None,
+        *,
+        before_save: Callable[[], None] | None = None,
     ) -> tuple[OperationStatus, str]:
         """Записывает теги непосредственно на диск. None сохраняет поле целиком."""
         ext = filepath.suffix.lower()
@@ -251,9 +264,8 @@ class TagRepository:
                         audio.tags['TPE1'] = TPE1(encoding=3, text=artist)
                     if title is not None:
                         audio.tags['TIT2'] = TIT2(encoding=3, text=title)
-                    saving = True
-                    audio.save()
-                    return OperationStatus.SUCCESS, 'запись выбранных artist/title'
+                else:
+                    return OperationStatus.ERROR, 'запись тегов недоступна для файла'
             elif ext in ('.m4a', '.mp4'):
                 audio = MP4(filepath)  # type: ignore[assignment]
                 if audio.tags is None:
@@ -263,41 +275,37 @@ class TagRepository:
                         audio.tags['©ART'] = [artist]
                     if title is not None:
                         audio.tags['©nam'] = [title]
-                    saving = True
-                    audio.save()
-                    return OperationStatus.SUCCESS, 'запись выбранных artist/title'
+                else:
+                    return OperationStatus.ERROR, 'запись тегов недоступна для файла'
             elif ext == '.flac':
                 audio = FLAC(filepath)  # type: ignore[assignment]
                 if artist is not None:
                     audio['artist'] = [artist]
                 if title is not None:
                     audio['title'] = [title]
-                saving = True
-                audio.save()
-                return OperationStatus.SUCCESS, 'запись выбранных artist/title'
             elif ext == '.ogg':
                 audio = OggVorbis(filepath)  # type: ignore[assignment]
                 if artist is not None:
                     audio['artist'] = [artist]
                 if title is not None:
                     audio['title'] = [title]
-                saving = True
-                audio.save()
-                return OperationStatus.SUCCESS, 'запись выбранных artist/title'
             elif ext == '.wma':
                 audio = ASF(filepath)  # type: ignore[assignment]
                 if artist is not None:
                     audio['Author'] = [artist]
                 if title is not None:
                     audio['Title'] = [title]
-                saving = True
-                audio.save()
-                return OperationStatus.SUCCESS, 'запись выбранных artist/title'
+            else:
+                return OperationStatus.ERROR, 'запись тегов недоступна для файла'
+            if before_save is not None:
+                before_save()
+            saving = True
+            audio.save()
+            return OperationStatus.SUCCESS, 'запись выбранных artist/title'
         except (MutagenError, OSError, ValueError) as e:
             logger.error('Ошибка записи тегов %s: %s', filepath, e)
             status = OperationStatus.UNCERTAIN if saving else OperationStatus.ERROR
             return status, str(e) or 'запись тегов не подтверждена'
-        return OperationStatus.ERROR, 'запись тегов недоступна для файла'
 
     def simulate_update_tags(self, filepath: Path, artist: str, title: str) -> None:
         """Имитирует обновление тегов для dry-run режима."""

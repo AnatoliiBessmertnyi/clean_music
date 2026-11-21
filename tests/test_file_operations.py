@@ -10,7 +10,7 @@ from context import SessionContext
 from file_operations import FileExecutor
 from file_state import OperationResult, OperationStatus
 from tag_repository import AudioTags
-from tests.test_pipeline_utils import Interactor, MemoryRepository, windows
+from tests.test_pipeline_utils import Interactor, MemoryRepository, admit, windows
 
 
 @pytest.mark.parametrize(
@@ -101,7 +101,7 @@ def test_refused_model_step_preserves_path_and_cache(
     tags = AudioTags('Artist', 'Title')
     repo.simulate_update_tags(old, tags.artist, tags.title)
     executor = FileExecutor()
-    record = ctx.registry.register(old)
+    record = admit(ctx, old)
     assert executor.rename(old, middle, ctx, repo, ui).is_model_change
 
     if obstacle == 'blocked':
@@ -221,7 +221,7 @@ def test_default_executor_reads_tags_from_renamed_file(tmp_path: Path) -> None:
     old, new = tmp_path / 'old.mp3', tmp_path / 'new.mp3'
     old.write_bytes(b'audio')
     ctx, repo, ui = SessionContext(False, False), MemoryRepository(), Interactor()
-    source = ctx.registry.register(old)
+    source = admit(ctx, old)
     assert repo.update_tags(old, 'artist', 'title')
 
     result = FileExecutor().rename(old, new, ctx, repo, ui)
@@ -243,6 +243,7 @@ def test_default_executor_conflict_keeps_both_files(tmp_path: Path) -> None:
     new.write_bytes(b'occupied')
     ctx = SessionContext(False, False)
 
+    admit(ctx, old)
     result = FileExecutor().rename(old, new, ctx, MemoryRepository(), Interactor())
 
     assert result.status is OperationStatus.CONFLICT
@@ -258,6 +259,7 @@ def test_default_executor_same_path_is_noop(tmp_path: Path) -> None:
     path.write_bytes(b'audio')
     ctx = SessionContext(False, False)
 
+    admit(ctx, path)
     result = FileExecutor().rename(path, path, ctx, MemoryRepository(), Interactor())
 
     assert result.status is OperationStatus.NOOP

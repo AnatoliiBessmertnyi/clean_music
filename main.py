@@ -1,13 +1,17 @@
 """CLI-скрипт для очистки и переименования аудиофайлов."""
 
+import os
 import sys
 from collections import Counter
 from pathlib import Path
 
 from config import SUPPORTED_EXTENSIONS
 from context import SessionContext
-from interactor import ConsoleInteractor, logged_input
+from file_state import check_directory, inspect_file
+from interactor import ConsoleInteractor, UserInteractor, logged_input
 from pipeline import AudioProcessingPipeline
+from pipeline_utils import windows_local_ntfs
+from report_events import log_operation
 from run_report import RunReport
 from stages import (
     ArtistNormalizationStage,
@@ -33,9 +37,33 @@ def get_valid_path() -> Path:
         )
 
 
-def get_audio_files(directory: Path) -> list[Path]:
-    """Возвращает список всех аудиофайлов в заданной директории."""
-    return [f for f in directory.iterdir() if f.suffix.lower() in SUPPORTED_EXTENSIONS]
+def get_audio_files(
+    directory: Path, ctx: SessionContext, interactor: UserInteractor
+) -> list[Path] | None:
+    """Регистрирует физические объекты, допущенные при сканировании."""
+    try:
+        check_directory(directory)
+        if os.name == 'nt' and not windows_local_ntfs(directory):
+            raise OSError('требуется локальный NTFS в Windows')
+        entries = list(directory.iterdir())
+    except OSError as exc:
+        interactor.display_error(f'{directory}: сканирование пропущено: {exc}')
+        log_operation('scan', directory, 'отказ', str(exc))
+        return None
+
+    files = []
+    for path in entries:
+        if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            continue
+        try:
+            identity = inspect_file(path)
+        except OSError as exc:
+            interactor.display_error(f'{path.name}: пропущен при сканировании: {exc}')
+            log_operation('scan', path, 'отказ', str(exc))
+            continue
+        ctx.registry.register(path, identity=identity)
+        files.append(path)
+    return files
 
 
 def get_format_stats(files: list[Path]) -> dict[str, int]:
@@ -84,9 +112,11 @@ def _run(report: RunReport) -> None:
 
     target_dir = get_valid_path()
     ctx.target_dir = target_dir
+    files = get_audio_files(target_dir, ctx, interactor)
+    if files is None:
+        return
     interactor.display('Снимаю исходное состояние файлов (SHA-256 и теги)...')
     report.start(target_dir)
-    files = get_audio_files(target_dir)
 
     total = len(files)
     stats = get_format_stats(files)

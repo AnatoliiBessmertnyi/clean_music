@@ -12,6 +12,7 @@ from mutagen.id3 import ID3
 
 import main as cli
 from context import SessionContext
+from file_state import inspect_file
 from interactor import ConsoleInteractor
 from pipeline_utils import safe_rename
 from run_report import FileSnapshot, RunReport, snapshot_file
@@ -212,6 +213,7 @@ def test_safe_rename_records_only_real_success(tmp_path: Path, dry_run: bool) ->
     with RunReport(tmp_path / 'logs', dry_run) as report:
         report.start(folder)
         ctx = SessionContext(dry_run, False, report=report)
+        ctx.registry.register(old, identity=inspect_file(old))
         status, _ = safe_rename(old, new, ctx, TagRepository(), ConsoleInteractor())
     assert status == ('planned' if dry_run else 'renamed')
     text = report.path.read_text(encoding='utf-8')
