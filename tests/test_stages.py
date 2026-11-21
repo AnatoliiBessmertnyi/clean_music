@@ -1,4 +1,4 @@
-"""Только цепочки изменений, затронутые защитой Issue #9."""
+"""Проверки сохранности файлов и тегов в этапах конвейера."""
 
 import os
 from pathlib import Path
@@ -16,6 +16,100 @@ from pipeline import AudioProcessingPipeline
 from pipeline_utils import simulate_rename
 from tag_repository import AudioTags, TagRepository
 from tests.test_pipeline_utils import Interactor, MemoryRepository, windows
+
+
+@pytest.fixture
+def model_platform_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Подменяет проверку NTFS в WSL для тестов с dry-run и кэшем в памяти."""
+    if os.name != 'nt':
+        guard = Mock(return_value=True)
+        monkeypatch.setattr('file_operations.modification_allowed', guard)
+        monkeypatch.setattr('pipeline_utils.modification_allowed', guard)
+
+
+@pytest.mark.usefixtures('model_platform_guard')
+@pytest.mark.parametrize(
+    ('source_title', 'title'),
+    [
+        ('Песня (Live)', 'Песня (Live)'),
+        ('Песня (Ирина Remix)', 'Песня (Ирина Remix)'),
+        ('Песня (Acoustic)', 'Песня (Acoustic)'),
+        ('Песня (Instrumental)', 'Песня (Instrumental)'),
+        ('Песня [2024 Remaster]', 'Песня [2024 Remaster]'),
+        ('Песня (Radio Edit)', 'Песня (Radio Edit)'),
+        ('Песня (Album Version)', 'Песня (Album Version)'),
+        ('Песня (Архивная запись)', 'Песня (Архивная запись)'),
+        ('Песня (Live) [Ирина Remix]', 'Песня (Live) [Ирина Remix]'),
+        ('Песня (Live) (vksaver)', 'Песня (Live)'),
+        ('Песня (Live [vksaver])', 'Песня (Live)'),
+        ('Песня (Live) (ft. Ирина)', 'Песня (Live) (feat. Ирина)'),
+        ('Песня feat. Ирина (Live)', 'Песня feat. Ирина (Live)'),
+        ('Песня (Концерт feat. Ирина)', 'Песня (Концерт feat. Ирина)'),
+    ],
+)
+def test_tag_writing_preserves_annotations(
+    tmp_path: Path, source_title: str, title: str
+) -> None:
+    source = tmp_path / f'Исполнитель - {source_title}.mp3'
+    source.touch()
+    ctx, repo, ui = SessionContext(True, False), MemoryRepository(), Interactor('y')
+    [current] = stages.TagWritingStage().execute([source], ctx, repo, ui)
+    assert repo.get_tags(current) == AudioTags('Исполнитель', title)
+
+
+@pytest.mark.usefixtures('model_platform_guard')
+@pytest.mark.parametrize('dry_run', [True, pytest.param(False, marks=windows)])
+@pytest.mark.parametrize('artist', ['AC/DC', 'Исполнитель/Группа'])
+def test_tag_renaming_preserves_metadata_on_second_pass(
+    tmp_path: Path, dry_run: bool, artist: str
+) -> None:
+    source = tmp_path / 'Песня.mp3'
+    source.touch()
+    ctx, repo, ui = SessionContext(dry_run, False), MemoryRepository(), Interactor('y')
+    repo.simulate_update_tags(
+        source, f'{artist} featuring Ирина', 'Песня (Live) [A/B Remix]'
+    )
+    expected = AudioTags(artist, 'Песня (Live) [A/B Remix] (feat. Ирина)')
+    target = (
+        tmp_path
+        / f'{artist.replace("/", "")} - Песня (Live) [AB Remix] (feat. Ирина).mp3'
+    )
+    stage = stages.TagRenamingStage()
+
+    assert stage.execute([source], ctx, repo, ui) == [target]
+    assert repo.get_tags(target) == expected
+    assert stage.execute([target], ctx, repo, ui) == [target]
+    assert repo.get_tags(target) == expected
+    assert source.exists() == dry_run
+    assert target.exists() != dry_run
+    assert len(repo.writes) == int(not dry_run)
+
+
+@pytest.mark.usefixtures('model_platform_guard')
+@pytest.mark.parametrize('dry_run', [True, pytest.param(False, marks=windows)])
+def test_mismatch_write_retains_artist_sanitized_in_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry_run: bool
+) -> None:
+    source = tmp_path / 'ACDC - Correct title.mp3'
+    source.touch()
+    ctx, repo, ui = SessionContext(dry_run, False), MemoryRepository(), Interactor()
+    repo.simulate_update_tags(source, 'AC/DC', 'Old title')
+    monkeypatch.setattr(ui, 'prompt', Mock(side_effect=['1', 'f']))
+
+    stage = stages.TagRenamingStage()
+    assert stage.execute([source], ctx, repo, ui) == [source]
+    assert repo.get_tags(source) == AudioTags('AC/DC', 'Correct title')
+
+
+@pytest.mark.usefixtures('model_platform_guard')
+def test_encoding_repair_preserves_title_annotations(tmp_path: Path) -> None:
+    source = tmp_path / 'Исполнитель - Песня.mp3'
+    source.touch()
+    ctx, repo, ui = SessionContext(True, False), MemoryRepository(), Interactor('y')
+    repo.simulate_update_tags(source, 'ÐÐ', 'Песня (Live)')
+
+    assert stages.TagRenamingStage().execute([source], ctx, repo, ui) == [source]
+    assert repo.get_tags(source) == AudioTags('Исполнитель', 'Песня (Live)')
 
 
 @windows
