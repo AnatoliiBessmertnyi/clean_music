@@ -20,8 +20,6 @@ from types import TracebackType
 from typing import override
 from uuid import uuid4
 
-from mutagen import MutagenError
-
 from config import SUPPORTED_EXTENSIONS
 from report_events import Operation, log_operation
 from report_format import render_compact
@@ -122,10 +120,10 @@ def snapshot_file(path: Path, repo: TagRepository) -> FileSnapshot:
         result.identity = (before.st_dev, before.st_ino)
         with path.open('rb') as stream:
             result.sha256 = hashlib.file_digest(stream, 'sha256').hexdigest()
-        try:
-            result.tags = repo.read_tags_uncached(path)
-        except (OSError, MutagenError, ValueError) as exc:
-            result.errors.append(f'чтение тегов: {exc}')
+        metadata = repo.read_tags_uncached(path)
+        result.tags = metadata.tags
+        if metadata.error is not None:
+            result.errors.append(f'чтение тегов: {metadata.error}')
         after = path.lstat()
         if (
             before.st_dev,
