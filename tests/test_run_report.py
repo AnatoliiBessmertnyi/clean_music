@@ -12,7 +12,7 @@ from mutagen.id3 import ID3
 
 import main as cli
 from context import SessionContext
-from file_state import inspect_file
+from file_state import OperationStatus, inspect_file
 from interactor import ConsoleInteractor
 from pipeline_utils import safe_rename
 from run_report import FileSnapshot, RunReport, snapshot_file
@@ -22,8 +22,20 @@ from tag_repository import AudioTags, TagRepository
 def make_audio(path: Path) -> Path:
     # MPEG1 Layer III, 128kbps / 44100Hz: только синтетические кадры.
     path.write_bytes((b'\xff\xfb\x90\x64' + bytes(413)) * 5)
-    assert TagRepository().update_tags(path, 'Исполнитель', 'Название')
+    assert write_fixture_tags(path, 'Исполнитель', 'Название')
     return path
+
+
+def write_fixture_tags(path: Path, artist: str, title: str) -> bool:
+    repo = TagRepository()
+
+    def save(a: str | None, t: str | None) -> tuple[OperationStatus, str]:
+        with path.open('r+b') as stream:
+            repo.save_work_tags(path, stream, a, t)
+        return OperationStatus.SUCCESS, 'изменена синтетическая фикстура'
+
+    result = repo.apply_tags(path, artist, title, simulated=False, publish=save)
+    return result.status in (OperationStatus.SUCCESS, OperationStatus.NOOP)
 
 
 def file_records(path: Path) -> list[dict[str, object]]:
@@ -58,11 +70,11 @@ def test_actual_states_and_rename_chain(tmp_path: Path) -> None:
         lower = folder / 'final.mp3'
         final.rename(lower)
         report.record_rename(final, lower)
-        assert TagRepository().update_tags(modified, 'Новый', 'Тег')
+        assert write_fixture_tags(modified, 'Новый', 'Тег')
         new_combined = folder / 'new-combined.mp3'
         combined.rename(new_combined)
         report.record_rename(combined, new_combined)
-        assert TagRepository().update_tags(new_combined, 'Другой', 'Трек')
+        assert write_fixture_tags(new_combined, 'Другой', 'Трек')
         missing.unlink()
         make_audio(folder / 'added.mp3')
     records = file_records(report.path)
@@ -267,7 +279,7 @@ def test_cli_failure_still_compares_disk(
     def interrupted_run(
         self: cli.AudioProcessingPipeline, **kwargs: object
     ) -> list[Path]:
-        assert TagRepository().update_tags(path, 'Уже записано', 'До прерывания')
+        assert write_fixture_tags(path, 'Уже записано', 'До прерывания')
         raise failure('test interruption')
 
     monkeypatch.setattr(cli.AudioProcessingPipeline, 'run', interrupted_run)

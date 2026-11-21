@@ -59,6 +59,7 @@ class SessionContext:
     report: RunReport | None = None
     registry: FileRegistry = field(default_factory=FileRegistry)
     recovery: RecoveryStore | None = None
+    ffprobe_missing_reported: bool = False
 
     def file_ids(self, paths: Iterable[Path]) -> list[int]:
         """Фиксирует порядок входных файлов и устраняет повторы по ID."""

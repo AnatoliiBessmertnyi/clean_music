@@ -104,8 +104,8 @@ def test_filling_title_keeps_all_existing_artist_values(tmp_path: Path) -> None:
     repo = TagRepository()
     before = repo.get_tags(path).tags
     assert before is not None
-    result = repo.apply_tags(path, before.artist, 'Track', simulated=False)
-    assert result.status is OperationStatus.SUCCESS
+    with path.open('r+b') as stream:
+        repo.save_work_tags(path, stream, None, 'Track')
     after = ID3(path)
     assert after['TPE1'].text == artists
     assert str(after['TIT2']) == 'Track'
@@ -118,25 +118,23 @@ def test_write_failure_cache_lifetime(
     path = write_mp3(tmp_path / 'track.mp3', artist='AC/DC', title='Track')
     repo = TagRepository()
     original = repo.get_tags(path)
-    writer: SimpleNamespace | OSError
-    if uncertain:
-        audio = SimpleNamespace(tags={}, save=Mock(side_effect=OSError('save failed')))
-        writer = audio
-    else:
-        writer = OSError('open failed')
-    # The stat fields stay identical. The parser exposes different data on a new read.
-    parser = Mock(side_effect=[writer, SimpleNamespace(tags={'TPE1': 'Changed'})])
+    parser = Mock(return_value=SimpleNamespace(tags={'TPE1': 'Changed'}))
     monkeypatch.setattr('tag_repository.MP3', parser)
-    result = repo.apply_tags(path, 'Other', 'New track', simulated=False)
-    assert result.status is (
-        OperationStatus.UNCERTAIN if uncertain else OperationStatus.ERROR
+    status = OperationStatus.UNCERTAIN if uncertain else OperationStatus.ERROR
+    result = repo.apply_tags(
+        path,
+        'Other',
+        'New track',
+        simulated=False,
+        publish=lambda *_: (status, 'publication failed'),
     )
+    assert result.status is status
     if uncertain:
         assert repo.get_tags(path).tags == AudioTags('Changed', '')
-        assert parser.call_count == 2
+        assert parser.call_count == 1
     else:
         assert repo.get_tags(path) is original
-        assert parser.call_count == 1
+        assert parser.call_count == 0
 
 
 def test_model_rename_reads_physical_source_and_detects_change(tmp_path: Path) -> None:

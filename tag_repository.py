@@ -6,11 +6,12 @@ from dataclasses import dataclass, replace
 from enum import Enum, auto
 from os import stat_result
 from pathlib import Path
+from typing import Any, BinaryIO
 
-from mutagen import MutagenError
-from mutagen.asf import ASF
+from mutagen import FileType, MutagenError
+from mutagen.asf import ASF, ASFBaseAttribute
 from mutagen.flac import FLAC
-from mutagen.id3 import ID3, TIT2, TPE1, ID3NoHeaderError
+from mutagen.id3 import TIT2, TPE1
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
 from mutagen.oggvorbis import OggVorbis
@@ -83,6 +84,29 @@ def _fingerprint(stat: stat_result) -> tuple[int, ...]:
     return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
 
 
+def _tag_value(value: object) -> object:
+    """Сохраняет типы, кратность и свойства значений Mutagen."""
+    if isinstance(value, dict):
+        return {key: _tag_value(item) for key, item in value.items()}
+    if isinstance(value, ASFBaseAttribute):
+        # В профиле без таблицы языков ASF нулевые индексы эквивалентны
+        # отсутствующему языку и привязке ко всему файлу.
+        return type(value), value.value, value.language or 0, value.stream or 0
+    if isinstance(value, Enum):
+        return type(value), value.name
+    if isinstance(value, (str, int, bool, float)):
+        return type(value), value
+    fields = getattr(value, '__dict__', None)
+    state = _tag_value(fields) if fields else None
+    if isinstance(value, (list, tuple)):
+        payload: object = tuple(_tag_value(item) for item in value)
+    elif isinstance(value, bytes):
+        payload = bytes(value)
+    else:
+        payload = repr(value) if state is None else None
+    return type(value), payload, state
+
+
 class TagRepository:
     """Читает метаданные и хранит модельные изменения dry-run."""
 
@@ -123,7 +147,8 @@ class TagRepository:
         title: str,
         *,
         simulated: bool,
-        before_save: Callable[[], None] | None = None,
+        publish: Callable[[str | None, str | None], tuple[OperationStatus, str]]
+        | None = None,
     ) -> OperationResult:
         """Применяет запись тегов и публикует её результат."""
         tags = AudioTags(artist, title)
@@ -140,12 +165,12 @@ class TagRepository:
         if before.tags is None:
             status = OperationStatus.ERROR
             reason = before.error or 'чтение метаданных не подтверждено'
+        elif publish is None:
+            status, reason = OperationStatus.ERROR, 'требуется исполнитель публикации'
         else:
-            status, reason = self._write_to_disk(
-                filepath,
+            status, reason = publish(
                 artist if artist != before.tags.artist else None,
                 title if title != before.tags.title else None,
-                before_save=before_save,
             )
         if status in (OperationStatus.SUCCESS, OperationStatus.UNCERTAIN):
             self._cache.pop(key, None)
@@ -167,11 +192,6 @@ class TagRepository:
             proposed=simulated,
         )
         return OperationResult(status, filepath, reason)
-
-    def update_tags(self, filepath: Path, artist: str, title: str) -> bool:
-        """Записывает теги для вызывающих мест вне конвейера."""
-        result = self.apply_tags(filepath, artist, title, simulated=False)
-        return result.status in (OperationStatus.SUCCESS, OperationStatus.NOOP)
 
     def read_tags_uncached(self, filepath: Path) -> MetadataRead:
         """Читает физический файл в обход кэша и модели."""
@@ -240,72 +260,69 @@ class TagRepository:
         self._cache.clear()
         self._model_sources.clear()
 
-    def _write_to_disk(
-        self,
-        filepath: Path,
-        artist: str | None,
-        title: str | None,
-        *,
-        before_save: Callable[[], None] | None = None,
-    ) -> tuple[OperationStatus, str]:
-        """Записывает теги непосредственно на диск. None сохраняет поле целиком."""
-        ext = filepath.suffix.lower()
-        saving = False
+    @staticmethod
+    def _tag_parser(path: Path) -> tuple[type[FileType], str, str]:
+        return {
+            '.mp3': (MP3, 'TPE1', 'TIT2'),
+            '.m4a': (MP4, '©ART', '©nam'),
+            '.mp4': (MP4, '©ART', '©nam'),
+            '.flac': (FLAC, 'artist', 'title'),
+            '.ogg': (OggVorbis, 'artist', 'title'),
+            '.wma': (ASF, 'Author', 'Title'),
+        }[path.suffix.lower()]
+
+    def tag_snapshot(
+        self, path: Path, artist: str | None, title: str | None, *, result: bool = False
+    ) -> tuple[object, ...]:
+        parser, artist_key, title_key = self._tag_parser(path)
         try:
-            if ext == '.mp3':
-                try:
-                    audio = MP3(filepath)  # type: ignore[assignment]
-                except ID3NoHeaderError:
-                    audio = MP3(filepath, ID3=ID3)  # type: ignore[assignment]
-                if audio.tags is None:
-                    audio.add_tags()
-                if audio.tags is not None:
-                    if artist is not None:
-                        audio.tags['TPE1'] = TPE1(encoding=3, text=artist)
-                    if title is not None:
-                        audio.tags['TIT2'] = TIT2(encoding=3, text=title)
-                else:
-                    return OperationStatus.ERROR, 'запись тегов недоступна для файла'
-            elif ext in ('.m4a', '.mp4'):
-                audio = MP4(filepath)  # type: ignore[assignment]
-                if audio.tags is None:
-                    audio.add_tags()
-                if audio.tags is not None:
-                    if artist is not None:
-                        audio.tags['©ART'] = [artist]
-                    if title is not None:
-                        audio.tags['©nam'] = [title]
-                else:
-                    return OperationStatus.ERROR, 'запись тегов недоступна для файла'
-            elif ext == '.flac':
-                audio = FLAC(filepath)  # type: ignore[assignment]
-                if artist is not None:
-                    audio['artist'] = [artist]
-                if title is not None:
-                    audio['title'] = [title]
-            elif ext == '.ogg':
-                audio = OggVorbis(filepath)  # type: ignore[assignment]
-                if artist is not None:
-                    audio['artist'] = [artist]
-                if title is not None:
-                    audio['title'] = [title]
-            elif ext == '.wma':
-                audio = ASF(filepath)  # type: ignore[assignment]
-                if artist is not None:
-                    audio['Author'] = [artist]
-                if title is not None:
-                    audio['Title'] = [title]
-            else:
-                return OperationStatus.ERROR, 'запись тегов недоступна для файла'
-            if before_save is not None:
-                before_save()
-            saving = True
-            audio.save()
-            return OperationStatus.SUCCESS, 'запись выбранных artist/title'
-        except (MutagenError, OSError, ValueError) as e:
-            logger.error('Ошибка записи тегов %s: %s', filepath, e)
-            status = OperationStatus.UNCERTAIN if saving else OperationStatus.ERROR
-            return status, str(e) or 'запись тегов не подтверждена'
+            audio = parser(path)
+            tags = audio.tags
+            values: dict[str, Any] = dict(tags.items()) if tags is not None else {}
+            for key, proposed in ((artist_key, artist), (title_key, title)):
+                if proposed is None:
+                    continue
+                if result:
+                    value = values.get(key)
+                    if path.suffix.lower() == '.mp3':
+                        actual = getattr(value, 'text', None)
+                    else:
+                        actual = (
+                            [str(item) for item in value] if value is not None else None
+                        )
+                    if actual != [proposed]:
+                        raise OSError(f'записанное поле {key} отличается')
+                values.pop(key, None)
+            pictures = [picture.write() for picture in getattr(audio, 'pictures', [])]
+            unknown = tuple(getattr(tags, 'unknown_frames', ()))
+            return _tag_value(values), tuple(pictures), unknown
+        except (MutagenError, ValueError) as exc:
+            raise OSError('не удалось перечитать теги для проверки') from exc
+
+    def save_work_tags(
+        self, path: Path, stream: BinaryIO, artist: str | None, title: str | None
+    ) -> None:
+        """Редактирует открытый дескриптор отдельной рабочей копии."""
+        parser, artist_key, title_key = self._tag_parser(path)
+        try:
+            stream.seek(0)
+            audio = parser(stream)
+            if audio.tags is None:
+                audio.add_tags()
+            if audio.tags is None:
+                raise OSError('запись тегов недоступна для контейнера')
+            for key, value, frame in (
+                (artist_key, artist, TPE1),
+                (title_key, title, TIT2),
+            ):
+                if value is not None:
+                    audio.tags[key] = (
+                        frame(encoding=3, text=[value]) if parser is MP3 else [value]
+                    )
+            stream.seek(0)
+            audio.save(stream)
+        except (MutagenError, ValueError) as exc:
+            raise OSError('Mutagen не смог сохранить рабочую копию') from exc
 
     def simulate_update_tags(self, filepath: Path, artist: str, title: str) -> None:
         """Имитирует обновление тегов для dry-run режима."""
