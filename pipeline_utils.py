@@ -13,6 +13,8 @@ from duplicate_analysis import Candidate, compare_candidates, find_candidate_gro
 from file_state import FileIdentity, entry_info, inspect_file
 from interactor import UserInteractor, prompt_command
 from parsing import parse_artist_title
+from recovery import begin_rename, recover_renames, settle_rename
+from recovery_store import RecoveryStore
 from report_events import log_operation
 from tag_repository import TagRepository
 
@@ -265,10 +267,64 @@ def safe_rename(
         )
         return 'skipped', None
 
+    if ctx.recovery is not None:
+        return _execute_rename(
+            old_path, new_path, identity, ctx.recovery, ctx, repo, interactor
+        )
+    try:
+        store = RecoveryStore(old_path.absolute().parent)
+        with store.session():
+            recover_renames(store, ctx, interactor)
+            return _execute_rename(
+                old_path, new_path, identity, store, ctx, repo, interactor
+            )
+    except OSError as exc:
+        ctx.block_path(old_path, str(exc))
+        ctx.block_path(new_path, str(exc))
+        interactor.display_error(f'Переименование {old_path.name} отклонено: {exc}')
+        return 'skipped', None
+
+
+def _execute_rename(
+    old_path: Path,
+    new_path: Path,
+    identity: FileIdentity,
+    store: RecoveryStore,
+    ctx: SessionContext,
+    repo: TagRepository,
+    interactor: UserInteractor,
+) -> tuple[str, Path | None]:
+    if ctx.is_path_blocked(old_path) or ctx.is_path_blocked(new_path):
+        return 'skipped', None
+    try:
+        record, intent = begin_rename(store, old_path, new_path, identity)
+        if inspect_file(old_path) != identity:
+            raise OSError('физический объект подменён перед rename')
+    except (OSError, ValueError) as exc:
+        ctx.block_path(old_path, str(exc))
+        ctx.block_path(new_path, str(exc))
+        interactor.display_error(
+            f'Не удалось подготовить rename {old_path.name}: {exc}'
+        )
+        return 'skipped', None
+
     try:
         # Windows отказывает при появлении цели, в том числе после lstat.
         old_path.rename(new_path)
     except FileExistsError:
+        try:
+            if (
+                settle_rename(
+                    store, record, intent, ctx, interactor, expected='original'
+                )
+                is None
+            ):
+                return 'failed', None
+        except OSError as exc:
+            ctx.block_path(old_path, str(exc))
+            ctx.block_path(new_path, str(exc))
+            interactor.display_error(f'Не удалось завершить запись rename: {exc}')
+            return 'failed', None
         ctx.block_path(old_path, 'целевой путь занят; переименование отклонено')
         interactor.display_error(f'Целевой путь занят: {new_path.name}')
         log_operation(
@@ -289,6 +345,11 @@ def safe_rename(
     try:
         if not _matches_rename_entry(new_path, identity):
             raise OSError('целевое имя или физическая идентичность не подтверждены')
+        if (
+            settle_rename(store, record, intent, ctx, interactor, expected='renamed')
+            is None
+        ):
+            raise OSError('содержимое или состояние путей не подтверждены')
     except OSError as exc:
         actual = _observed_rename_path(old_path, new_path, identity)
         observed = str(actual) if actual is not None else 'не установлено'

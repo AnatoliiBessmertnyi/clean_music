@@ -3,6 +3,7 @@
 import os
 import sys
 from collections import Counter
+from contextlib import ExitStack
 from pathlib import Path
 
 from config import SUPPORTED_EXTENSIONS
@@ -11,6 +12,8 @@ from file_state import check_directory, inspect_file
 from interactor import ConsoleInteractor, UserInteractor, logged_input
 from pipeline import AudioProcessingPipeline
 from pipeline_utils import windows_local_ntfs
+from recovery import recover_renames
+from recovery_store import RecoveryStore
 from report_events import log_operation
 from run_report import RunReport
 from stages import (
@@ -88,12 +91,12 @@ def main() -> None:
     except OSError as exc:
         sys.stderr.write(f'Не удалось создать журнал; обработка не начата: {exc}\n')
         raise SystemExit(1) from exc
-    with report:
+    with ExitStack() as recovery_session, report:
         ConsoleInteractor().display(f'Отчёт запуска: {report.path}')
-        _run(report)
+        _run(report, recovery_session)
 
 
-def _run(report: RunReport) -> None:
+def _run(report: RunReport, recovery_session: ExitStack) -> None:
     """Выполняет прежний конвейер внутри журнала запуска."""
     # 1. Инициализация зависимостей
     ctx = SessionContext(
@@ -112,6 +115,29 @@ def _run(report: RunReport) -> None:
 
     target_dir = get_valid_path()
     ctx.target_dir = target_dir
+    diagnostic = ctx.dry_run or os.name != 'nt'
+    try:
+        if os.name == 'nt' and not windows_local_ntfs(target_dir.absolute()):
+            raise OSError('требуется локальный NTFS в Windows')
+        recovery = RecoveryStore(target_dir, diagnostic=diagnostic)
+        if recovery_session.enter_context(recovery.session()):
+            recover_renames(recovery, ctx, interactor, diagnostic=diagnostic)
+        if not diagnostic:
+            ctx.recovery = recovery
+    except OSError as exc:
+        interactor.display_error(f'{target_dir}: обработка остановлена: {exc}')
+        log_operation('recovery', target_dir, 'отказ', str(exc), proposed=diagnostic)
+        return
+    _process(target_dir, ctx, report, repo, interactor)
+
+
+def _process(
+    target_dir: Path,
+    ctx: SessionContext,
+    report: RunReport,
+    repo: TagRepository,
+    interactor: UserInteractor,
+) -> None:
     files = get_audio_files(target_dir, ctx, interactor)
     if files is None:
         return
