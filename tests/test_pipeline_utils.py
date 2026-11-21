@@ -11,6 +11,7 @@ import pytest
 import pipeline_utils as utils
 from context import SessionContext
 from file_state import OperationStatus
+from interactor import ConsoleInteractor
 from stages import process_rename_batch
 from tag_repository import AudioTags, TagRepository
 
@@ -53,6 +54,76 @@ class MemoryRepository(TagRepository):
 
 
 windows = pytest.mark.skipif(os.name != 'nt', reason='Реальная операция Windows/NTFS')
+
+
+@pytest.mark.parametrize(
+    ('answer', 'selected', 'error'),
+    [
+        ('2', [0, 2], False),
+        ('1, 3', [1], False),
+        ('1 2 3', [], False),
+        ('', [0, 1, 2], False),
+        ('Y', [0, 1, 2], False),
+        ('N', [], False),
+        ('ошибка', [], True),
+        ('-1', [], True),
+        ('0', [], True),
+        ('4', [], True),
+        ('1,4', [], True),
+        ('1;2', [], True),
+        ('1-3', [], True),
+        ('1,ошибка', [], True),
+        (',', [], True),
+    ],
+)
+def test_select_indices(answer: str, selected: list[int], error: bool) -> None:
+    ui = Interactor(answer)
+    assert utils.select_indices(['a', 'b', 'c'], 'Выбор файлов', ui) == selected
+    assert any('Группа пропущена' in message for message in ui.messages) == error
+
+
+@pytest.mark.parametrize('answer', ['N', '1,ошибка', EOFError(), KeyboardInterrupt()])
+def test_batch_rename_skips_files_when_group_is_not_confirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: str | BaseException
+) -> None:
+    reply = Mock(side_effect=[answer])
+    monkeypatch.setattr('builtins.input', reply)
+    rename = Mock()
+    monkeypatch.setattr('stages._file_executor.rename', rename)
+    files = [tmp_path / 'a.mp3', tmp_path / 'b.mp3']
+
+    def run_batch() -> list[Path]:
+        return process_rename_batch(
+            files,
+            files,
+            str.upper,
+            'файлы на переименование',
+            SessionContext(False, False),
+            MemoryRepository(),
+            ConsoleInteractor(),
+            'renamed_by_tags',
+        )
+
+    if isinstance(answer, BaseException):
+        with pytest.raises(type(answer)):
+            run_batch()
+    else:
+        assert run_batch() == files
+    reply.assert_called_once()
+    rename.assert_not_called()
+
+
+def test_manual_filename_keeps_case_through_console(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reply = Mock(side_effect=['N', '3', 'McCartney', 'A'])
+    monkeypatch.setattr('builtins.input', reply)
+    ctx = SessionContext(False, False)
+    ui = ConsoleInteractor()
+
+    assert utils.sanitize_filename_interactive('A:B', 'old', ctx, ui) == 'SKIP'
+    assert utils.sanitize_filename_interactive('A:B', 'old', ctx, ui) == 'McCartney'
+    assert utils.sanitize_filename_interactive('A:B', 'old', ctx, ui) == 'AB'
 
 
 def test_context_blocking(tmp_path: Path) -> None:

@@ -11,7 +11,7 @@ import stages
 from context import SessionContext
 from file_operations import FileExecutor
 from file_state import OperationStatus
-from interactor import UserInteractor
+from interactor import ConsoleInteractor, UserInteractor
 from pipeline import AudioProcessingPipeline
 from pipeline_utils import simulate_rename
 from tag_repository import AudioTags, TagRepository
@@ -65,7 +65,7 @@ def test_tag_renaming_preserves_metadata_on_second_pass(
 ) -> None:
     source = tmp_path / 'Песня.mp3'
     source.touch()
-    ctx, repo, ui = SessionContext(dry_run, False), MemoryRepository(), Interactor('y')
+    ctx, repo, ui = SessionContext(dry_run, False), MemoryRepository(), Interactor()
     repo.simulate_update_tags(
         source, f'{artist} featuring Ирина', 'Песня (Live) [A/B Remix]'
     )
@@ -83,6 +83,41 @@ def test_tag_renaming_preserves_metadata_on_second_pass(
     assert source.exists() == dry_run
     assert target.exists() != dry_run
     assert len(repo.writes) == int(not dry_run)
+
+
+@pytest.mark.usefixtures('model_platform_guard')
+def test_manual_artist_keeps_case_through_console(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / 'Song.mp3'
+    source.touch()
+    ctx, repo = SessionContext(True, False), MemoryRepository()
+    ctx.missing_files = [source]
+    monkeypatch.setattr(stages, 'modification_allowed', Mock(return_value=True))
+    monkeypatch.setattr('builtins.input', Mock(side_effect=['Y', 'McCartney']))
+
+    [current] = stages.ManualInputStage().execute(
+        [source], ctx, repo, ConsoleInteractor()
+    )
+
+    assert current.name == 'McCartney - Song.mp3'
+
+
+@pytest.mark.parametrize('answer', ['N', 'ошибка'])
+def test_invalid_filename_group_skip_never_calls_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: str
+) -> None:
+    files = [tmp_path / 'First.mp3', tmp_path / 'Second.mp3']
+    ctx, repo, ui = SessionContext(False, False), MemoryRepository(), Interactor(answer)
+    for source in files:
+        source.touch()
+        repo.simulate_update_tags(source, 'AC/DC', source.stem)
+    rename = Mock()
+    monkeypatch.setattr(stages._file_executor, 'rename', rename)
+
+    assert stages.TagRenamingStage().execute(files, ctx, repo, ui) == files
+    assert len(ui.prompts) == 1
+    rename.assert_not_called()
 
 
 @pytest.mark.usefixtures('model_platform_guard')

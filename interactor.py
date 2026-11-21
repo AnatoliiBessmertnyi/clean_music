@@ -21,7 +21,7 @@ class UserInteractor(Protocol):
     """
 
     def prompt(self, message: str, default: str = '') -> str:
-        """Запрашивает ввод у пользователя."""
+        """Читает ответ с исходным регистром и пропускает исключения ввода."""
         ...
 
     def display(self, message: str) -> None:
@@ -33,11 +33,16 @@ class UserInteractor(Protocol):
         ...
 
 
+def prompt_command(interactor: UserInteractor, message: str, default: str = '') -> str:
+    """Читает команду меню без учёта регистра."""
+    return interactor.prompt(message, default=default).strip().lower()
+
+
 class ConsoleInteractor:
     """Стандартная консольная реализация UserInteractor."""
 
     def prompt(self, message: str, default: str = '') -> str:
-        choice = logged_input(message).strip().lower()
+        choice = logged_input(message).strip()
         if not choice and default:
             self.display(f'  [Выбран вариант {default} по умолчанию]')
             return default
