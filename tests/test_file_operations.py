@@ -233,7 +233,8 @@ def test_default_executor_reads_tags_from_renamed_file(
 
     assert result.status is OperationStatus.SUCCESS, ui.messages
     assert result.path is not None and result.path.name == new_name
-    assert [entry.name for entry in tmp_path.iterdir()] == [new_name]
+    assert [entry.name for entry in tmp_path.iterdir() if entry.is_file()] == [new_name]
+    assert not list((tmp_path / '.clean_music-recovery').glob('*.json'))
     assert new.read_bytes() == b'audio'
     assert inspect_file(new) == source.identity
     updated = ctx.registry.record_of(source.id)
@@ -287,7 +288,8 @@ def test_unconfirmed_real_rename_blocks_retries(
         outcome = executor.rename(path, tmp_path / 'retry.mp3', ctx, repo, ui)
         assert outcome.status is OperationStatus.ERROR
     rename_call.assert_called_once_with(old, new)
-    assert list(real_iterdir(tmp_path)) == [new]
+    assert [entry for entry in real_iterdir(tmp_path) if entry.is_file()] == [new]
+    assert len(list((tmp_path / '.clean_music-recovery').glob('*.json'))) == 1
     assert inspect_file(new) == source.identity
     assert new.read_bytes() == b'original'
 

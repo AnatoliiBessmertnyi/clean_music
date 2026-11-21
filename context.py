@@ -13,6 +13,7 @@ from file_state import FileRegistry
 from report_events import log_operation
 
 if TYPE_CHECKING:
+    from recovery_store import RecoveryStore
     from run_report import RunReport
 
 logger = logging.getLogger('clean_music')
@@ -57,6 +58,7 @@ class SessionContext:
     blocked_paths: dict[Path, str] = field(default_factory=dict)
     report: RunReport | None = None
     registry: FileRegistry = field(default_factory=FileRegistry)
+    recovery: RecoveryStore | None = None
 
     def file_ids(self, paths: Iterable[Path]) -> list[int]:
         """Фиксирует порядок входных файлов и устраняет повторы по ID."""

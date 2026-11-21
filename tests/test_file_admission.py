@@ -194,7 +194,7 @@ def test_case_rename_then_write_preserves_identity(tmp_path: Path) -> None:
     assert executor.rename(source, target, ctx, repo, ui).is_confirmed_change, (
         ui.messages
     )
-    assert [path.name for path in tmp_path.iterdir()] == [target.name]
+    assert [path.name for path in tmp_path.iterdir() if path.is_file()] == [target.name]
     assert ctx.registry.id_for(target) == record.id
     assert ctx.registry.track(target).identity == record.identity
     assert executor.write_tags(target, 'New', 'Song', ctx, repo, ui).is_confirmed_change
