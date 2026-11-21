@@ -227,6 +227,7 @@ def test_failed_rename_blocks_without_success(
     monkeypatch.setattr(Path, 'rename', Mock(side_effect=PermissionError('locked')))
     admit(ctx, old)
     status, result = utils.safe_rename(old, new, ctx, repo, ui)
+    assert status == 'skipped' and result is None
     assert (
         utils.handle_rename_result(status, old, result, ctx, 'renamed_by_tags') is None
     )
@@ -246,9 +247,11 @@ def test_case_rename_without_actual_change_is_not_success(
     ctx = SessionContext(False, False)
     monkeypatch.setattr(Path, 'rename', Mock(return_value=new))
     admit(ctx, old)
-    status, result = utils.safe_rename(old, new, ctx, MemoryRepository(), Interactor())
+    ui = Interactor()
+    status, result = utils.safe_rename(old, new, ctx, MemoryRepository(), ui)
     assert status == 'failed' and result is None
     assert ctx.is_path_blocked(old) and ctx.is_path_blocked(new)
+    assert f'Фактическое местонахождение исходного файла: {old}' in ui.messages[-1]
     assert old.read_bytes() == b'original'
 
 

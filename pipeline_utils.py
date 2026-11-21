@@ -10,7 +10,7 @@ from pathlib import Path
 from config import FEAT_VARIANTS_PATTERN, INVALID_FILENAME_CHARS, LEADING_TRACK_PATTERN
 from context import SessionContext
 from duplicate_analysis import Candidate, compare_candidates, find_candidate_groups
-from file_state import entry_info, inspect_file
+from file_state import FileIdentity, entry_info, inspect_file
 from interactor import UserInteractor, prompt_command
 from parsing import parse_artist_title
 from report_events import log_operation
@@ -116,25 +116,24 @@ def modification_allowed(
     return True
 
 
-def rename_case_sensitive(old_path: Path, new_path: Path, ctx: SessionContext) -> bool:
-    """Один Windows rename; написание проверяется по записи каталога."""
-    try:
-        old_path.rename(new_path)
-        actual = next(
-            (
-                entry
-                for entry in new_path.parent.iterdir()
-                if entry.name == new_path.name
-            ),
-            None,
-        )
-        if actual is None or not actual.samefile(new_path):
-            raise OSError('фактическое написание имени после rename не подтверждено')
-    except OSError as exc:
-        ctx.block_path(old_path, str(exc))
-        ctx.block_path(new_path, str(exc))
-        return False
-    return True
+def _matches_rename_entry(path: Path, identity: FileIdentity) -> bool:
+    """Проверяет точное написание записи и идентичность исходного файла."""
+    return any(
+        entry.name == path.name and inspect_file(entry) == identity
+        for entry in path.parent.iterdir()
+    )
+
+
+def _observed_rename_path(
+    old_path: Path, new_path: Path, identity: FileIdentity
+) -> Path | None:
+    for candidate in (new_path, old_path):
+        try:
+            if _matches_rename_entry(candidate, identity):
+                return candidate.absolute()
+        except OSError:
+            continue
+    return None
 
 
 def simple_rename(
@@ -255,22 +254,20 @@ def safe_rename(
         if ctx.dry_run:
             simulate_rename(old_path, new_path, repo, interactor)
             return 'planned', new_path
-        if case_change:
-            if not rename_case_sensitive(old_path, new_path, ctx):
-                interactor.display_error(
-                    f'{old_path.name}: {ctx.get_block_reason(old_path)}'
-                )
-                log_operation(
-                    'rename',
-                    old_path,
-                    'отказ',
-                    ctx.get_block_reason(old_path) or 'переименование не подтверждено',
-                    target=new_path,
-                )
-                return 'failed', None
-        else:
-            # Windows отказывает при появлении цели, в том числе после lstat.
-            old_path.rename(new_path)
+        identity = ctx.registry.track(old_path).identity
+        if identity is None:
+            raise OSError('исходная физическая идентичность файла неизвестна')
+    except OSError as exc:
+        ctx.block_path(old_path, str(exc))
+        interactor.display_error(f'{old_path.name}: {exc}')
+        log_operation(
+            'rename', old_path, 'отказ', str(exc), target=new_path, proposed=ctx.dry_run
+        )
+        return 'skipped', None
+
+    try:
+        # Windows отказывает при появлении цели, в том числе после lstat.
+        old_path.rename(new_path)
     except FileExistsError:
         ctx.block_path(old_path, 'целевой путь занят; переименование отклонено')
         interactor.display_error(f'Целевой путь занят: {new_path.name}')
@@ -285,10 +282,25 @@ def safe_rename(
     except OSError as exc:
         ctx.block_path(old_path, str(exc))
         ctx.block_path(new_path, str(exc))
-        interactor.display_error(
-            f'Переименование {old_path.name} не подтверждено: {exc}'
-        )
+        interactor.display_error(f'Переименование {old_path.name} отклонено: {exc}')
         log_operation('rename', old_path, 'отказ', str(exc), target=new_path)
+        return 'skipped', None
+
+    try:
+        if not _matches_rename_entry(new_path, identity):
+            raise OSError('целевое имя или физическая идентичность не подтверждены')
+    except OSError as exc:
+        actual = _observed_rename_path(old_path, new_path, identity)
+        observed = str(actual) if actual is not None else 'не установлено'
+        reason = (
+            f'Переименование не подтверждено ({exc}). '
+            f'Запрошено: {old_path.absolute()} → {new_path.absolute()}. '
+            f'Фактическое местонахождение исходного файла: {observed}'
+        )
+        ctx.block_path(old_path, reason)
+        ctx.block_path(new_path, reason)
+        interactor.display_error(reason)
+        log_operation('rename', old_path, 'отказ', reason, target=new_path)
         return 'failed', None
     if ctx.report is not None:
         ctx.report.record_rename(old_path, new_path)
