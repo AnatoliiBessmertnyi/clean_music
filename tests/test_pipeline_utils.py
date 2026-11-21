@@ -256,19 +256,30 @@ def test_case_rename_without_actual_change_is_not_success(
 def test_target_appears_after_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from file_operations import FileExecutor
+
     old, new = tmp_path / 'old.mp3', tmp_path / 'new.mp3'
     old.write_bytes(b'source')
     original_rename = Path.rename
+    calls = Mock()
 
     def competing_rename(source: Path, target: Path) -> Path:
-        target.write_bytes(b'competitor')
+        calls(source, target)
+        with target.open('xb') as stream:
+            stream.write(b'competitor')
         return original_rename(source, target)
 
     monkeypatch.setattr(Path, 'rename', competing_rename)
     ctx = SessionContext(False, False)
-    admit(ctx, old)
-    status, _ = utils.safe_rename(old, new, ctx, MemoryRepository(), Interactor())
-    assert status == 'duplicate_exists'
+    record = admit(ctx, old)
+    result = FileExecutor().rename(old, new, ctx, MemoryRepository(), Interactor())
+    calls.assert_called_once_with(old, new)
+    assert result.status is OperationStatus.CONFLICT
+    assert result.path == new
+    assert ctx.registry.id_for(old) == record.id
+    assert ctx.registry.id_for(new) is None
+    assert ctx.is_path_blocked(old) and not ctx.is_path_blocked(new)
+    assert not ctx.get_stat('renamed_by_tags')
     assert old.read_bytes() == b'source' and new.read_bytes() == b'competitor'
 
 
