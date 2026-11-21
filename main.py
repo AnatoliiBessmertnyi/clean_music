@@ -9,7 +9,7 @@ from pathlib import Path
 from config import SUPPORTED_EXTENSIONS
 from context import SessionContext
 from file_state import check_directory, inspect_file
-from interactor import ConsoleInteractor, UserInteractor, logged_input
+from interactor import ConsoleInteractor, UserInteractor, choose_safe_mode, logged_input
 from pipeline import AudioProcessingPipeline
 from pipeline_utils import windows_local_ntfs
 from recovery import recover_renames
@@ -104,15 +104,20 @@ def _run(report: RunReport, recovery_session: ExitStack) -> None:
         debug='--debug' in sys.argv,
         report=report,
     )
-    repo = TagRepository()
     interactor = ConsoleInteractor()
 
     interactor.display('=== Обработчик аудиофайлов ===')
     if ctx.dry_run:
         interactor.display(
-            '*** СУХОЙ РЕЖИМ: действия конвейера — предложения; итог сверяется с диском ***'
+            '*** СУХОЙ РЕЖИМ: действия конвейера — предложения. '
+            'Проверки записи и восстановления выполняются не полностью, '
+            'итог отчёта сверяется с диском. ***'
         )
 
+    if not choose_safe_mode(interactor, dry_run=ctx.dry_run):
+        return
+    interactor.display('Выбран безопасный режим (safe).')
+    repo = TagRepository()
     target_dir = get_valid_path()
     ctx.target_dir = target_dir
     diagnostic = ctx.dry_run or os.name != 'nt'
@@ -195,7 +200,7 @@ def _process(
     still_missing: list[Path] = getattr(ctx, '_still_missing', [])
     if still_missing:
         interactor.display(
-            f'\nВнимание! {len(still_missing)} файлов осталось без метаданных:'
+            f'\nВнимание! Остались файлы с незаполненными тегами: {len(still_missing)}'
         )
         for f in still_missing:
             interactor.display(f'  - {f.name}')

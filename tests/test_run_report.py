@@ -274,7 +274,7 @@ def test_cli_failure_still_compares_disk(
     folder.mkdir()
     path = make_audio(folder / 'track.mp3')
     monkeypatch.setattr(cli, '__file__', str(tmp_path / 'main.py'))
-    monkeypatch.setattr('builtins.input', lambda _: str(folder))
+    monkeypatch.setattr('builtins.input', Mock(side_effect=['', str(folder)]))
 
     def interrupted_run(
         self: cli.AudioProcessingPipeline, **kwargs: object
@@ -300,7 +300,7 @@ def test_cli_empty_folder_and_unique_logs(
     folder = tmp_path / 'empty'
     folder.mkdir()
     monkeypatch.setattr(cli, '__file__', str(tmp_path / 'main.py'))
-    monkeypatch.setattr('builtins.input', lambda _: str(folder))
+    monkeypatch.setattr('builtins.input', Mock(side_effect=['', str(folder)] * 2))
     cli.main()
     cli.main()
     logs = list((tmp_path / 'logs').glob('*.log'))
@@ -315,7 +315,7 @@ def test_cli_eof_before_path_is_logged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(cli, '__file__', str(tmp_path / 'main.py'))
-    monkeypatch.setattr('builtins.input', Mock(side_effect=EOFError))
+    monkeypatch.setattr('builtins.input', Mock(side_effect=['', EOFError]))
     with pytest.raises(EOFError):
         cli.main()
     log = next((tmp_path / 'logs').glob('*.log'))

@@ -373,7 +373,7 @@ def test_cli_write_then_rename_or_read_only(tmp_path: Path, dry_run: bool) -> No
         argv.append('--dry-run')
     result = subprocess.run(
         argv,
-        input=f'{root}\ny\nn\nn\n',
+        input=f'\n{root}\ny\nn\nn\n',
         capture_output=True,
         text=True,
         encoding='utf-8',
