@@ -183,6 +183,20 @@ def test_manual_artist_keeps_case_through_console(
     )
 
     assert current.name == 'McCartney - Song.mp3'
+    assert repo.get_tags(current).tags == AudioTags('McCartney', 'Song')
+
+
+def test_manual_input_skips_metadata_read_error(tmp_path: Path) -> None:
+    source = tmp_path / 'Unreadable.mp3'
+    source.write_bytes(b'corrupt')
+    ui = Interactor()
+    ctx = SessionContext(False, False)
+    assert stages.ManualInputStage().execute([source], ctx, TagRepository(), ui) == [
+        source
+    ]
+    assert not ui.prompts
+    assert not ctx.missing_files
+    assert any('обработка тегов пропущена' in message for message in ui.messages)
 
 
 @pytest.mark.parametrize('answer', ['N', 'ошибка'])
@@ -557,7 +571,7 @@ def test_missing_file_uses_model_path_and_disappeared_file_stays_out(
     assert stages.ManualInputStage().execute(
         [original, current, gone], ctx, repo, ui
     ) == [final]
-    assert ctx.missing_files == [final]
+    assert not ctx.missing_files
     assert ctx.registry.id_for(final) == original_id
     assert not repo.writes and not ctx.get_stat('manual_input')
     assert (

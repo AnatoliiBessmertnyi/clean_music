@@ -200,7 +200,7 @@ def _process(
     still_missing: list[Path] = getattr(ctx, '_still_missing', [])
     if still_missing:
         interactor.display(
-            f'\nВнимание! {len(still_missing)} файлов осталось без метаданных:'
+            f'\nВнимание! Остались файлы с незаполненными тегами: {len(still_missing)}'
         )
         for f in still_missing:
             interactor.display(f'  - {f.name}')

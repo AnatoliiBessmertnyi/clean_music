@@ -464,15 +464,19 @@ class TagRenamingStage:
                                             current_parts[0] != proposed_parts[0]
                                         )
                             else:
-                                ctx.log_debug(
-                                    f'Пропущен (стратегия вернула None): {f.name}'
+                                interactor.display(
+                                    f'{f.name}: новое имя не выбрано, файл пропущен.'
                                 )
                                 continue
                         else:
-                            ctx.log_debug(f'Пропущен (стратегия skip): {f.name}')
+                            interactor.display(
+                                f'{f.name}: выбрано пропустить переименование.'
+                            )
                             continue
                     else:
-                        ctx.log_debug(f'Пропущен (нет стратегии): {f.name}')
+                        interactor.display_error(
+                            f'{f.name}: способ исправления имени не выбран.'
+                        )
                         continue
                 else:
                     base_name = raw_name
@@ -1030,7 +1034,10 @@ class TagWritingStage:
 
         for i in selected_indices:
             f, metadata, artist, title = tags_to_write[i]
-            if repo.get_tags(f) != metadata:
+            current_metadata = repo.get_tags(f)
+            if current_metadata != metadata:
+                reason = current_metadata.error or 'метаданные изменились после выбора'
+                interactor.display_error(f'{f.name}: запись тегов пропущена: {reason}')
                 continue
 
             result = _file_executor.write_tags(f, artist, title, ctx, repo, interactor)
@@ -1193,11 +1200,11 @@ class ArtistNormalizationStage:
 
 
 class ManualInputStage:
-    """Этап 7: Ручной ввод для файлов без метаданных."""
+    """Этап 7: Заполнение отсутствующих полей тегов."""
 
     @property
     def name(self) -> str:
-        return 'Ручной ввод для файлов без метаданных'
+        return 'Ручное заполнение отсутствующих тегов'
 
     def execute(
         self,
@@ -1209,54 +1216,64 @@ class ManualInputStage:
         file_ids = ctx.file_ids(files)
         files = ctx.present_paths(file_ids)
 
-        still_missing: list[Path] = []
+        candidates: list[tuple[Path, MetadataRead]] = []
+        for f in files:
+            metadata = repo.get_tags(f)
+            if metadata.tags is None:
+                interactor.display_error(
+                    f'{f.name}: обработка тегов пропущена: '
+                    f'{metadata.error or "чтение метаданных не подтверждено"}'
+                )
+            elif metadata.status is not ReadStatus.COMPLETE:
+                candidates.append((f, metadata))
+        ctx.missing_files = [f for f, _ in candidates]
 
-        missing_count = len(ctx.missing_files)
-        present_ids = set(file_ids)
-        missing_ids = [
-            file_id
-            for file_id in ctx.file_ids(ctx.missing_files)
-            if file_id in present_ids
-        ]
-        actually_missing = [
-            f
-            for f in ctx.present_paths(missing_ids)
-            if repo.get_tags(f).status is ReadStatus.EMPTY
-        ]
-        ctx.missing_files = actually_missing
-        ctx.log_debug(
-            f'Файлов без тегов после Этапа 6: {len(actually_missing)} '
-            f'(было {missing_count})'
-        )
-
-        if not actually_missing:
-            ctx._still_missing = still_missing  # type: ignore[attr-defined]
+        if not candidates:
+            ctx._still_missing = []  # type: ignore[attr-defined]
             return files
 
-        labels = [f.name for f in actually_missing]
         selected_indices = select_indices(
-            labels,
-            f'Найдено {len(actually_missing)} файлов без тегов и формата. Ввести исполнителя вручную?',
+            [f.name for f, _ in candidates],
+            f'Найдено {len(candidates)} файлов с незаполненными тегами. Заполнить вручную?',
             interactor,
         )
 
         for i in selected_indices:
-            f = actually_missing[i]
-            if repo.get_tags(f).status is not ReadStatus.EMPTY:
-                continue
+            f, metadata = candidates[i]
+            tags = metadata.tags
+            assert tags is not None
             record = ctx.registry.track(f)
             physical = ctx.registry.physical_path(record) if ctx.dry_run else f
             checked_path = f if ctx.is_path_blocked(f) else physical
             if not modification_allowed(checked_path, ctx, interactor):
                 continue
-            title = extract_title_from_filename(f.stem)
+            title = tags.title or extract_title_from_filename(f.stem)
             interactor.display(f'\n  Файл: {f.name}')
-            interactor.display(f'  Предполагаемое название: {title}')
-            artist = interactor.prompt(
-                '  Введите исполнителя (Enter - пропустить): '
-            ).strip()
+            artist = tags.artist
             if not artist:
-                still_missing.append(f)
+                title_label = 'Название из тега' if tags.title else 'Название из имени'
+                interactor.display(f'  {title_label}: {title}')
+                artist = interactor.prompt(
+                    '  Введите исполнителя (Enter - пропустить): '
+                ).strip()
+            if not artist:
+                continue
+            if not tags.title and (tags.artist or not title):
+                title = interactor.prompt(
+                    '  Введите название (Enter - пропустить): '
+                ).strip()
+            if not title:
+                continue
+
+            current_metadata = repo.get_tags(f)
+            if current_metadata != metadata:
+                reason = current_metadata.error or 'метаданные изменились после выбора'
+                interactor.display_error(f'{f.name}: запись тегов пропущена: {reason}')
+                continue
+            result = _file_executor.write_tags(f, artist, title, ctx, repo, interactor)
+            if result.is_confirmed_change:
+                ctx.increment_stat('manual_input')
+            if not (result.is_confirmed_change or result.is_model_change):
                 continue
 
             raw_name = f'{artist} - {title}'
@@ -1264,16 +1281,15 @@ class ManualInputStage:
             if INVALID_FILENAME_CHARS.search(raw_name):
                 base_name = clean_filename_safely(raw_name, f.name, ctx, interactor)
                 if base_name == 'SKIP':
-                    interactor.display(f'  Оставлен без изменений: {f.name}')
+                    interactor.display(f'  Переименование пропущено: {f.name}')
                     continue
             else:
                 base_name = raw_name
 
             new_name = f'{base_name}{f.suffix}'
             new_path = f.with_name(new_name)
-            result = _file_executor.rename(f, new_path, ctx, repo, interactor)
-            if result.is_confirmed_change:
-                ctx.increment_stat('manual_input')
+            if new_path.name != f.name:
+                _file_executor.rename(f, new_path, ctx, repo, interactor)
 
-        ctx._still_missing = still_missing  # type: ignore[attr-defined]
+        ctx._still_missing = ctx.missing_files.copy()  # type: ignore[attr-defined]
         return ctx.present_paths(file_ids)

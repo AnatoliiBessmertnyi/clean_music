@@ -1,12 +1,18 @@
 """Выбор режима через обычную консольную точку входа."""
 
+import os
 import sys
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+from mutagen.id3 import ID3, TALB
 
 import main as cli
+from audio_verification import audio_signature, find_ffprobe
+from recovery_store import DIRECTORY_NAME
+from tag_repository import AudioTags, TagRepository
+from tests.test_tag_publication import synthetic_audio, windows
 from user_settings import load_mode, save_mode, settings_path
 
 
@@ -129,3 +135,67 @@ def test_dry_run_does_not_create_settings(
     cli_prompts.side_effect = ['deep', 'deep']
     cli.main()
     assert not settings_path().parent.exists()
+
+
+@windows
+@pytest.mark.parametrize('refuse_write', [False, True])
+def test_safe_manual_tags_on_disk(
+    refuse_write: bool,
+    tmp_path: Path,
+    cli_prompts: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / 'music'
+    root.mkdir()
+    source = root / 'Track.mp3'
+    synthetic_audio(source, artist='', title='Original (Live)')
+    album = ID3(source)
+    album.add(TALB(encoding=3, text=['Album']))
+    album.save(source)
+    original = source.read_bytes()
+    signature = audio_signature(find_ffprobe(), source)
+    cli_prompts.side_effect = ['', str(root), 'y', 'McCartney']
+    if refuse_write:
+        monkeypatch.setattr(
+            TagRepository, 'save_work_tags', Mock(side_effect=PermissionError('denied'))
+        )
+
+    cli.main()
+
+    files = list(root.glob('*.mp3'))
+    assert not list((root / DIRECTORY_NAME).glob('*.json'))
+    if refuse_write:
+        assert files == [source]
+        assert source.read_bytes() == original
+        assert 'denied' in capsys.readouterr().out
+        return
+    target = root / 'McCartney - Original (Live).mp3'
+    assert files == [target]
+    assert TagRepository().read_tags_uncached(target).tags == AudioTags(
+        'McCartney', 'Original (Live)'
+    )
+    assert str(ID3(target)['TALB']) == 'Album'
+    assert audio_signature(find_ffprobe(), target) == signature
+
+
+def test_safe_dry_run_keeps_collection_and_settings(
+    tmp_path: Path, cli_prompts: Mock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / 'music'
+    root.mkdir()
+    source = root / 'Track.mp3'
+    synthetic_audio(source, artist='', title='Original (Live)')
+    original = source.read_bytes()
+    path = settings_path()
+    save_mode(path, 'deep')
+    settings_before = path.read_bytes()
+    monkeypatch.setattr(sys, 'argv', ['main.py', '--dry-run'])
+    cli_prompts.side_effect = ['safe', str(root), 'y']
+    if os.name == 'nt':
+        cli_prompts.side_effect = ['safe', str(root), 'y', 'McCartney']
+    cli.main()
+    assert list(root.iterdir()) == [source]
+    assert source.read_bytes() == original
+    assert list(path.parent.iterdir()) == [path]
+    assert path.read_bytes() == settings_before
