@@ -54,6 +54,7 @@ class SessionContext:
             'manual_input': 0,
         }
     )
+    planned_stats: dict[str, int] = field(default_factory=dict)
     missing_files: list[Path] = field(default_factory=list)
     blocked_paths: dict[Path, str] = field(default_factory=dict)
     report: RunReport | None = None
@@ -125,7 +126,8 @@ class SessionContext:
             key: Ключ статистики
             amount: На сколько увеличить (по умолчанию 1)
         """
-        self.stats[key] = self.stats.get(key, 0) + amount
+        counts = self.planned_stats if self.dry_run else self.stats
+        counts[key] = counts.get(key, 0) + amount
 
     def get_stat(self, key: str) -> int:
         """Возвращает значение счетчика статистики.

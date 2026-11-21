@@ -609,7 +609,7 @@ def test_modeled_tag_write_after_rename_uses_current_path(
     assert ctx.registry.current_paths() == [current]
     assert ctx.registry.track(original).id == ctx.registry.id_for(current)
     assert repo.get_tags(current).complete_tags == AudioTags('Artist', 'Title')
-    assert all(call.args[0] == original for call in guard.call_args_list)
+    assert all(call.args[0] == current for call in guard.call_args_list)
     assert (
         not repo.writes
         and original.read_bytes() == b'original'

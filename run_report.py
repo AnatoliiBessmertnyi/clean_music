@@ -20,7 +20,7 @@ from typing import override
 from uuid import uuid4
 
 from config import SUPPORTED_EXTENSIONS
-from file_state import check_directory, regular_file_info
+from file_state import FileIdentity, check_directory, regular_file_info
 from report_events import Operation, log_operation
 from report_format import render_compact
 from tag_repository import AudioTags, TagRepository
@@ -175,6 +175,7 @@ class RunReport:
         self.verification_seconds = 0.0
         self._started = time.perf_counter()
         self._proposed_paths: dict[str, tuple[str, ...]] = {}
+        self._published_identities: dict[str, FileIdentity] = {}
         self._handler.observe = self._observe
 
     @property
@@ -208,6 +209,8 @@ class RunReport:
             snapshot = snapshot_file(path, TagRepository())
             self._before[snapshot.path] = snapshot
             self._current_paths[snapshot.path] = snapshot.path
+            if self.dry_run:
+                self._proposed_paths[os.path.normcase(snapshot.path)] = (snapshot.path,)
             self._write_json('ДО', _snapshot_data(snapshot))
         self._initial_complete = True
 
@@ -239,22 +242,30 @@ class RunReport:
                 self._current_paths[original] = new
         self._write_json('ПЕРЕИМЕНОВАНИЕ ВЫПОЛНЕНО', {'old': old, 'new': new})
 
+    def record_tag_publication(self, path: Path, identity: FileIdentity) -> None:
+        current = path.absolute()
+        for original, name in self._current_paths.items():
+            if Path(name) == current:
+                self._published_identities[original] = identity
+                break
+
     def _observe(self, operation: Operation) -> None:
         """Связывает наблюдение с исходным файлом, не управляя обработкой."""
         path = os.path.normcase(operation.path)
-        originals = tuple(
-            original
-            for original, current in self._current_paths.items()
-            if os.path.normcase(current) == path
-        )
-        if not originals and self.dry_run:
+        if self.dry_run:
             originals = self._proposed_paths.get(path, ())
-        if not originals and operation.identity is not None:
+        else:
             originals = tuple(
                 original
-                for original, snapshot in self._before.items()
-                if snapshot.identity == operation.identity
+                for original, current in self._current_paths.items()
+                if os.path.normcase(current) == path
             )
+            if not originals and operation.identity is not None:
+                originals = tuple(
+                    original
+                    for original, snapshot in self._before.items()
+                    if snapshot.identity == operation.identity
+                )
         self.operations.append(
             replace(operation, originals=originals, stage=self.stage)
         )
@@ -263,6 +274,7 @@ class RunReport:
             and operation.result == 'ПРЕДЛОЖЕНИЕ'
             and operation.target is not None
         ):
+            self._proposed_paths.pop(path, None)
             self._proposed_paths[os.path.normcase(operation.target)] = originals
 
     def _write_json(self, label: str, data: object) -> None:
@@ -303,7 +315,10 @@ class RunReport:
             elif before.errors or final.errors:
                 status = 'ошибка проверки'
                 verification_complete = False
-            elif before.identity != final.identity:
+            elif (
+                self._published_identities.get(original, before.identity)
+                != final.identity
+            ):
                 status = 'ошибка проверки: файловый объект заменён'
                 verification_complete = False
             else:

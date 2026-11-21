@@ -7,7 +7,7 @@ from audio_verification import find_ffprobe
 from context import SessionContext
 from file_state import FileRecord, OperationResult, OperationStatus
 from interactor import UserInteractor
-from pipeline_utils import modification_allowed, safe_rename, simulate_rename
+from pipeline_utils import modification_allowed, safe_rename
 from report_events import log_operation
 from tag_publication import PublicationError, publish_tags
 from tag_repository import TagRepository
@@ -55,14 +55,8 @@ class FileExecutor:
             )
             return OperationResult(OperationStatus.ERROR, None, reason)
 
-        physical = ctx.registry.physical_path(record) if ctx.dry_run else current
-        checked_path = current if ctx.is_path_blocked(current) else physical
-        if not modification_allowed(checked_path, ctx, interactor):
-            reason = (
-                ctx.get_block_reason(current)
-                or ctx.get_block_reason(physical)
-                or 'модификация не разрешена'
-            )
+        if not modification_allowed(current, ctx, interactor):
+            reason = ctx.get_block_reason(current) or '??????????? ?? ?????????'
             log_operation(
                 'tags',
                 current,
@@ -84,6 +78,8 @@ class FileExecutor:
         result = repo.apply_tags(
             current, artist, title, simulated=ctx.dry_run, publish=publish
         )
+        if result.is_model_change:
+            ctx.registry.mark_content_modeled(record.id)
         if (
             result.is_confirmed_change or result.is_model_change
         ) and current in ctx.missing_files:
@@ -130,6 +126,8 @@ class FileExecutor:
             if exc.confirmed is None:
                 return OperationStatus.UNCERTAIN, str(exc)
             ctx.registry.confirm_replacement(record.id, exc.confirmed)
+            if ctx.report is not None:
+                ctx.report.record_tag_publication(current, exc.confirmed)
             ctx.block_path(current, str(exc))
             interactor.display_error(
                 f'{current.name}: теги записаны, очистка не завершена: {exc}'
@@ -141,6 +139,8 @@ class FileExecutor:
         except OSError as exc:
             return OperationStatus.ERROR, str(exc)
         ctx.registry.confirm_replacement(record.id, identity)
+        if ctx.report is not None:
+            ctx.report.record_tag_publication(current, identity)
         return OperationStatus.SUCCESS, 'запись выбранных artist/title подтверждена'
 
     def rename(
@@ -158,75 +158,7 @@ class FileExecutor:
         if str(record.path.absolute()) != str(old_path.absolute()):
             old_path = record.path
         target = new_path.absolute()
-        physical = registry.physical_path(record)
-        is_model_source = ctx.dry_run and str(physical) != str(record.path)
-
-        if is_model_source:
-            reason = ctx.get_block_reason(old_path)
-            if reason is None and not modification_allowed(physical, ctx, interactor):
-                reason = ctx.get_block_reason(physical) or 'модификация не разрешена'
-            if reason is None and ctx.is_path_blocked(new_path):
-                reason = 'целевой путь заблокирован'
-            if reason is None and old_path.absolute().parent != target.parent:
-                reason = 'переименование между каталогами не поддерживается'
-            if reason is not None:
-                ctx.block_path(old_path, reason)
-                interactor.display_error(f'{old_path.name}: {reason}')
-                log_operation(
-                    'rename', old_path, 'отказ', reason, target=new_path, proposed=True
-                )
-                return OperationResult(OperationStatus.ERROR, None, reason)
-
-        if ctx.dry_run:
-            owner = registry.id_for(target)
-            occupied = owner is not None and owner != record.id
-            if is_model_source:
-                if str(old_path.absolute()) == str(target):
-                    return OperationResult(
-                        OperationStatus.NOOP, old_path, 'имя файла не изменилось'
-                    )
-                try:
-                    target.lstat()
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:
-                    reason = str(exc)
-                    ctx.block_path(old_path, reason)
-                    ctx.block_path(new_path, reason)
-                    interactor.display_error(f'{old_path.name}: {reason}')
-                    log_operation(
-                        'rename',
-                        old_path,
-                        'отказ',
-                        reason,
-                        target=new_path,
-                        proposed=True,
-                    )
-                    return OperationResult(OperationStatus.ERROR, None, reason)
-                else:
-                    occupied = True
-            if occupied:
-                ctx.block_path(old_path, _CONFLICT_REASON)
-                interactor.display(
-                    f'  Конфликт имени: {new_path.name}; оба файла сохранены.'
-                )
-                log_operation(
-                    'rename',
-                    old_path,
-                    'конфликт',
-                    _CONFLICT_REASON,
-                    target=new_path,
-                    proposed=True,
-                )
-                reason = ctx.get_block_reason(old_path) or _CONFLICT_REASON
-                return OperationResult(OperationStatus.CONFLICT, new_path, reason)
-
-        path: Path | None
-        if is_model_source:
-            simulate_rename(old_path, new_path, repo, interactor)
-            status, path = 'planned', new_path
-        else:
-            status, path = self._rename_fn(old_path, new_path, ctx, repo, interactor)
+        status, path = self._rename_fn(old_path, new_path, ctx, repo, interactor)
         try:
             operation_status, default_reason = _RENAME_RESULTS[status]
         except KeyError:

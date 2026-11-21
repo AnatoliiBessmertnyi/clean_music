@@ -173,13 +173,17 @@ def test_real_success_replaces_stale_registry_owner() -> None:
         ctx.registry.update_path(stale.id, old.absolute())
 
 
-def test_dry_run_conflict_in_registry(monkeypatch: pytest.MonkeyPatch) -> None:
-    first, second, target = Path('first.mp3'), Path('second.mp3'), Path('target.mp3')
+def test_dry_run_conflict_in_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, second, target = (
+        tmp_path / name for name in ('first.mp3', 'second.mp3', 'target.mp3')
+    )
     ctx, repo, ui = SessionContext(True, False), MemoryRepository(), Interactor()
-    rename_fn = Mock(return_value=('planned', target))
+    monkeypatch.setattr(pipeline_utils, 'modification_allowed', Mock(return_value=True))
     log_operation = Mock()
-    monkeypatch.setattr('file_operations.log_operation', log_operation)
-    executor = FileExecutor(rename_fn)
+    monkeypatch.setattr(pipeline_utils, 'log_operation', log_operation)
+    executor = FileExecutor()
     assert (
         executor.rename(first, target, ctx, repo, ui).status
         is OperationStatus.SIMULATED
@@ -187,12 +191,13 @@ def test_dry_run_conflict_in_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     source = ctx.registry.register(second.absolute())
     target_id = ctx.registry.id_for(target)
     before = ctx.registry.current_paths()
+    log_operation.reset_mock()
+    ui.messages.clear()
 
     result = executor.rename(second, target, ctx, repo, ui)
 
     reason = 'конфликт целевого имени; оба файла сохранены'
     assert result == OperationResult(OperationStatus.CONFLICT, target, reason)
-    rename_fn.assert_called_once_with(first, target, ctx, repo, ui)
     assert ctx.get_block_reason(second) == reason
     assert ui.messages == ['  Конфликт имени: target.mp3; оба файла сохранены.']
     log_operation.assert_called_once_with(
@@ -201,6 +206,37 @@ def test_dry_run_conflict_in_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ctx.registry.current_paths() == before
     assert ctx.registry.id_for(second) == source.id
     assert ctx.registry.id_for(target) == target_id
+
+
+@windows
+def test_dry_run_reuses_vacated_source_and_keeps_each_identity(tmp_path: Path) -> None:
+    first, second, renamed, final = (
+        tmp_path / name
+        for name in ('First.mp3', 'Second.mp3', 'Renamed.mp3', 'End.mp3')
+    )
+    first.write_bytes(b'first')
+    second.write_bytes(b'second')
+    ctx, repo, ui = SessionContext(True, False), MemoryRepository(), Interactor()
+    first_record = admit(ctx, first)
+    second_record = admit(ctx, second)
+    executor = FileExecutor()
+
+    assert executor.rename(first, renamed, ctx, repo, ui).is_model_change
+    assert executor.rename(second, first, ctx, repo, ui).is_model_change
+    assert executor.write_tags(first, 'Second', 'Song', ctx, repo, ui).is_model_change
+    assert executor.write_tags(renamed, 'First', 'Song', ctx, repo, ui).is_model_change
+    assert executor.rename(
+        renamed, renamed.with_name('renamed.mp3'), ctx, repo, ui
+    ).is_model_change
+    assert executor.rename(renamed, final, ctx, repo, ui).is_model_change
+    assert ctx.present_path(first_record.id) == final
+    assert ctx.present_path(second_record.id) == first
+    assert repo.get_tags(final).complete_tags == AudioTags('First', 'Song')
+    assert repo.get_tags(first).complete_tags == AudioTags('Second', 'Song')
+    assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == {
+        first.name: b'first',
+        second.name: b'second',
+    }
 
 
 def test_dry_run_case_change_preserves_identity() -> None:

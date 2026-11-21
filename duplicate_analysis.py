@@ -25,6 +25,7 @@ class ByteStatus(StrEnum):
     IDENTICAL = 'Побайтовое совпадение подтверждено'
     DIFFERENT = 'Байты различаются. Совпадение музыкальной записи не установлено'
     ERROR = 'Побайтовое сравнение не завершено'
+    UNKNOWN = 'Будущие размер и байты неизвестны после запланированной записи тегов'
 
 
 @dataclass(frozen=True)
@@ -147,9 +148,8 @@ def compare_candidates(
     group: CandidateGroup, registry: FileRegistry
 ) -> Iterator[PairAnalysis]:
     """Сравнивает только пары внутри найденной группы."""
-    physical_paths = {
-        candidate.path: registry.physical_path(registry.track(candidate.path))
-        for candidate in group.candidates
+    records = {
+        candidate.path: registry.track(candidate.path) for candidate in group.candidates
     }
     for left, right in combinations(group.candidates, 2):
         differences = []
@@ -161,9 +161,14 @@ def compare_candidates(
                 missing.append(field)
             elif left_value != right_value:
                 differences.append(field)
-        status, error = _compare_bytes(
-            physical_paths[left.path], physical_paths[right.path]
-        )
+        left_record, right_record = records[left.path], records[right.path]
+        if left_record.modeled_content or right_record.modeled_content:
+            status, error = ByteStatus.UNKNOWN, None
+        else:
+            status, error = _compare_bytes(
+                registry.physical_path(left_record),
+                registry.physical_path(right_record),
+            )
         yield PairAnalysis(
             left, right, tuple(differences), tuple(missing), status, error
         )

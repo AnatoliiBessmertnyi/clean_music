@@ -39,11 +39,12 @@ def log_operation(
     """Записывает факт/предложение, не меняя пути, теги и решения обработки."""
     identity = None
     observed = target if kind == 'rename' and result == 'успех' and target else path
-    try:
-        info = regular_file_info(observed)
-        identity = (info.st_dev, info.st_ino)
-    except OSError:
-        pass
+    if not proposed and result != 'ПРЕДЛОЖЕНИЕ':
+        try:
+            info = regular_file_info(observed)
+            identity = (info.st_dev, info.st_ino)
+        except OSError:
+            pass
     operation = Operation(
         kind=kind,
         path=str(path.absolute()),

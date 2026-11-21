@@ -116,6 +116,27 @@ def test_update_path_can_claim_missing_path() -> None:
     assert registry.current_paths() == [missing.path]
 
 
+def test_modeled_exclusion_releases_path_without_removing_source(
+    tmp_path: Path,
+) -> None:
+    source, other = (tmp_path / name for name in ('source.mp3', 'other.mp3'))
+    source.write_bytes(b'source')
+    other.write_bytes(b'other')
+    ctx = SessionContext(dry_run=True, debug=False)
+    removed = ctx.registry.register(source)
+    replacement = ctx.registry.register(other)
+    ctx.registry.mark_missing(removed.id, simulated=True)
+    assert ctx.registry.source_vacated(source)
+    assert ctx.present_path(removed.id) is None
+
+    ctx.registry.update_path(replacement.id, source, simulated=True)
+    assert ctx.registry.id_for(source) == replacement.id
+    assert ctx.registry.physical_path(ctx.registry.record_of(replacement.id)) == other
+    assert ctx.present_paths([removed.id, replacement.id]) == [source]
+    assert source.read_bytes() == b'source'
+    assert other.read_bytes() == b'other'
+
+
 def test_update_path_rejects_missing_id_atomically() -> None:
     registry = FileRegistry()
     missing = registry.register(Path('missing.mp3'))

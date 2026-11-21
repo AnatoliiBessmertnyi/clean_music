@@ -66,7 +66,7 @@ def process_rename_batch(
             continue
         new_path = f.with_name(transform(f.stem) + f.suffix)
         result = _file_executor.rename(f, new_path, ctx, repo, interactor)
-        if result.is_confirmed_change:
+        if result.is_confirmed_change or result.is_model_change:
             ctx.increment_stat(stat_key)
         if (
             result.is_confirmed_change or result.is_model_change
@@ -75,8 +75,10 @@ def process_rename_batch(
         else:
             new_files.append(f)
 
-    if ctx.get_stat(stat_key) > 0:
-        interactor.display(f'  Обработано файлов: {ctx.get_stat(stat_key)}')
+    count = (ctx.planned_stats if ctx.dry_run else ctx.stats).get(stat_key, 0)
+    if count:
+        label = 'Запланировано переименований' if ctx.dry_run else 'Обработано файлов'
+        interactor.display(f'  {label}: {count}')
 
     return new_files
 
@@ -169,12 +171,12 @@ class JunkCleaningStage:
         for i in idx:
             f, _, _, new_artist, new_title = candidates[i]
             if _update_tags(f, new_artist, new_title, ctx, repo, interactor):
-                interactor.display(f'  Теги очищены: {f.name}')
+                label = 'Запланирована очистка тегов' if ctx.dry_run else 'Теги очищены'
+                interactor.display(f'  {label}: {f.name}')
                 cleaned_count += 1
 
         if cleaned_count:
-            ctx.stats['tags_cleaned'] = cleaned_count
-            interactor.display(f'  Очищено тегов: {cleaned_count}')
+            ctx.increment_stat('tags_cleaned', cleaned_count)
 
 
 class NormalizationStage:
@@ -516,14 +518,19 @@ class TagRenamingStage:
                     result.is_confirmed_change or result.is_model_change
                 ) and result.path is not None:
                     resulting_files[position] = result.path
-                if result.is_confirmed_change:
+                if result.is_confirmed_change or result.is_model_change:
                     ctx.increment_stat('renamed_by_tags')
                     renamed_count += 1
                 elif result.status is OperationStatus.CONFLICT:
                     duplicates_found.append((old_path, new_path))
 
             if renamed_count:
-                interactor.display(f'  Переименовано файлов: {renamed_count}')
+                label = (
+                    'Запланировано переименований'
+                    if ctx.dry_run
+                    else 'Переименовано файлов'
+                )
+                interactor.display(f'  {label}: {renamed_count}')
 
             if duplicates_found:
                 self._handle_rename_duplicates(duplicates_found, ctx, repo, interactor)
@@ -585,7 +592,7 @@ class TagRenamingStage:
             result = _file_executor.rename(
                 path, path.with_name(new_name), ctx, repo, interactor
             )
-            if result.is_confirmed_change:
+            if result.is_confirmed_change or result.is_model_change:
                 ctx.increment_stat('renamed_by_tags')
             if (
                 result.is_confirmed_change or result.is_model_change
@@ -1044,21 +1051,26 @@ class TagWritingStage:
             if not (result.is_confirmed_change or result.is_model_change):
                 continue
             written_count += 1
-            if result.is_confirmed_change:
-                ctx.increment_stat('tags_written')
+            ctx.increment_stat('tags_written')
             new_filename = build_safe_filename(artist, title, f.suffix)
             if new_filename != f.name:
                 renamed = _file_executor.rename(
                     f, f.with_name(new_filename), ctx, repo, interactor
                 )
-                if renamed.is_confirmed_change:
+                if renamed.is_confirmed_change or renamed.is_model_change:
                     ctx.increment_stat('renamed_by_tags')
                     renamed_count += 1
 
         if written_count:
-            interactor.display(f'  Записано тегов: {written_count}')
+            label = 'Запланировано записей тегов' if ctx.dry_run else 'Записано тегов'
+            interactor.display(f'  {label}: {written_count}')
         if renamed_count:
-            interactor.display(f'  Переименовано файлов: {renamed_count}')
+            label = (
+                'Запланировано переименований'
+                if ctx.dry_run
+                else 'Переименовано файлов'
+            )
+            interactor.display(f'  {label}: {renamed_count}')
 
         return ctx.present_paths(file_ids)
 
@@ -1192,10 +1204,10 @@ class ArtistNormalizationStage:
                     new_name = f'{base_name}{f.suffix}'
                     new_path = f.with_name(new_name)
                     renamed = _file_executor.rename(f, new_path, ctx, repo, interactor)
-                    if renamed.is_confirmed_change:
+                    if renamed.is_confirmed_change or renamed.is_model_change:
                         ctx.increment_stat('renamed_by_tags')
 
-        ctx.stats['artists_normalized_unique'] = len(unique_normalized)
+        ctx.increment_stat('artists_normalized_unique', len(unique_normalized))
         return ctx.present_paths(file_ids)
 
 
@@ -1242,10 +1254,7 @@ class ManualInputStage:
             f, metadata = candidates[i]
             tags = metadata.tags
             assert tags is not None
-            record = ctx.registry.track(f)
-            physical = ctx.registry.physical_path(record) if ctx.dry_run else f
-            checked_path = f if ctx.is_path_blocked(f) else physical
-            if not modification_allowed(checked_path, ctx, interactor):
+            if not modification_allowed(f, ctx, interactor):
                 continue
             title = tags.title or extract_title_from_filename(f.stem)
             interactor.display(f'\n  Файл: {f.name}')
@@ -1271,10 +1280,9 @@ class ManualInputStage:
                 interactor.display_error(f'{f.name}: запись тегов пропущена: {reason}')
                 continue
             result = _file_executor.write_tags(f, artist, title, ctx, repo, interactor)
-            if result.is_confirmed_change:
-                ctx.increment_stat('manual_input')
             if not (result.is_confirmed_change or result.is_model_change):
                 continue
+            ctx.increment_stat('manual_input')
 
             raw_name = f'{artist} - {title}'
 
