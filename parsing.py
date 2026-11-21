@@ -3,10 +3,12 @@
 import re
 
 from config import (
+    INVALID_FILENAME_CHARS,
     LEADING_TRACK_PATTERN,
     NAME_PATTERN,
     TRACK_NUMBER_PATTERN,
 )
+from naming import normalize_title_spacing
 
 
 def is_track_number(text: str) -> bool:
@@ -130,3 +132,35 @@ def clean_extracted_tags(artist: str, title: str) -> tuple[str, str]:
         return re.sub(r'\s*[-–—]\s*', ' - ', text)
 
     return clean_text(artist), clean_text(title)
+
+
+def tags_from_filename(
+    stem: str, artist: str, title: str, *, repair_brackets: bool = True
+) -> tuple[str, str] | None:
+    """Восстанавливает теги из имени, сохраняя исходные значения при санитизации."""
+    parsed = parse_artist_title(stem)
+    if parsed is None:
+        return None
+
+    def keep_original(extracted: str, original: str) -> bool:
+        sanitized = INVALID_FILENAME_CHARS.sub('', original)
+        replaced = INVALID_FILENAME_CHARS.sub('-', original)
+        candidate = normalize_title_spacing(extracted)
+        if candidate in {
+            normalize_title_spacing(original),
+            normalize_title_spacing(sanitized),
+            normalize_title_spacing(replaced),
+            *(normalize_title_spacing(part) for part in original.split('/')),
+        }:
+            return True
+        sanitized = normalize_title_spacing(sanitized)
+        return sanitized.startswith((f'{candidate} (', f'{candidate} ['))
+
+    extracted_artist, extracted_title = parsed
+    cleaned_artist, cleaned_title = (
+        clean_extracted_tags(*parsed) if repair_brackets else parsed
+    )
+    return (
+        artist if keep_original(extracted_artist, artist) else cleaned_artist,
+        title if keep_original(extracted_title, title) else cleaned_title,
+    )

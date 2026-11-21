@@ -3,12 +3,10 @@
 import re
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 from config import (
     FEAT_VARIANTS_PATTERN,
     INVALID_FILENAME_CHARS,
-    JUNK_PATTERN,
 )
 from context import SessionContext
 from file_operations import FileExecutor
@@ -21,14 +19,13 @@ from naming import (
     normalize_feat_pair,
     normalize_filename_stem,
     normalize_title_spacing,
-    remove_annotation_from_text,
     remove_feat_guests_from_artist,
     remove_junk,
 )
 from parsing import (
-    clean_extracted_tags,
     extract_title_from_filename,
     parse_artist_title,
+    tags_from_filename,
 )
 from pipeline_utils import (
     categorize_mismatch,
@@ -112,7 +109,7 @@ class JunkCleaningStage:
     ) -> list[Path]:
         files = ctx.present_paths(ctx.file_ids(files))
         # Подэтап 1.1: Очистка имён файлов
-        junk_files = [f for f in files if JUNK_PATTERN.search(f.stem)]
+        junk_files = [f for f in files if remove_junk(f.stem) != f.stem.strip()]
         current_files = process_rename_batch(
             files=files,
             candidates=junk_files,
@@ -237,19 +234,14 @@ class TagRenamingStage:
 
         interactor.display('\n  [Подэтап 3.2] Нормализация разделителей исполнителей')
         interactor.display(
-            "  Приводим все разделители к запятой с пробелом: 'Artist1, Artist2'"
+            "  Нормализуем запятые и точки с запятой: 'Artist1, Artist2'"
         )
         files = self._normalize_separators(files, ctx, repo, interactor)
 
-        interactor.display('\n  [Подэтап 3.3] Анализ уточнений в скобках')
-        interactor.display('  Находим уточнения (ремастеринг, версии, саундтреки)')
-        interactor.display('  и предлагаем удалить лишние из тегов.')
-        files = self._process_annotations(files, ctx, repo, interactor)
-
-        interactor.display('\n  [Подэтап 3.4] Формирование новых имён файлов по тегам')
+        interactor.display('\n  [Подэтап 3.3] Формирование новых имён файлов по тегам')
         files = self._rename_by_tags(files, ctx, repo, interactor)
 
-        interactor.display('\n  [Подэтап 3.5] Обработка расхождений имён и тегов')
+        interactor.display('\n  [Подэтап 3.4] Обработка расхождений имён и тегов')
         files = self._handle_mismatches(files, ctx, repo, interactor)
 
         interactor.display('\n' + '=' * 60)
@@ -380,104 +372,7 @@ class TagRenamingStage:
 
         return files
 
-    # === Подэтап 3.3: уточнения в скобках ===
-
-    def _process_annotations(
-        self,
-        files: list[Path],
-        ctx: SessionContext,
-        repo: TagRepository,
-        interactor: UserInteractor,
-    ) -> list[Path]:
-        annotations = self._find_tag_annotations(files, repo)
-        if not annotations:
-            return files
-
-        # Автоудаление уточнений с недопустимыми символами
-        problematic = [ann for ann in annotations if INVALID_FILENAME_CHARS.search(ann)]
-        if problematic:
-            interactor.display(
-                f'\n  Внимание: {len(problematic)} уточнений содержат '
-                f'недопустимые символы и будут удалены автоматически:'
-            )
-            for ann in problematic:
-                interactor.display(f'    - ({ann})')
-
-            removed_count = 0
-            for ann in problematic:
-                for f in annotations[ann]:
-                    tags = repo.get_tags(f)
-                    if tags:
-                        new_title = remove_annotation_from_text(tags.title, ann)
-                        if new_title != tags.title and _update_tags(
-                            f, tags.artist, new_title, ctx, repo, interactor
-                        ):
-                            ctx.log_debug(f'Автоудалено: ({ann}) из {f.name}')
-                            removed_count += 1
-            if removed_count:
-                interactor.display(f'  Автоматически удалено: {removed_count}')
-                for ann in problematic:
-                    del annotations[ann]
-
-        if not annotations:
-            return files
-
-        categories = self._categorize_annotations(annotations)
-
-        interactor.display(
-            f'\nНайдено {len(annotations)} уникальных уточнений в {len(categories)} категориях:'
-        )
-
-        for _cat_key, cat_data in categories.items():
-            total_files = sum(
-                len(file_list) for file_list in cat_data['items'].values()
-            )
-            interactor.display(f'\n  {cat_data["name"]} ({total_files} файлов):')
-            for i, (ann, file_list) in enumerate(
-                sorted(
-                    cat_data['items'].items(), key=lambda x: len(x[1]), reverse=True
-                ),
-                1,
-            ):
-                interactor.display(f'    {i}. ({ann}) — {len(file_list)} файлов')
-
-        interactor.display('\nКакие категории удалить из тегов?')
-        interactor.display('  Полные названия: remaster, soundtrack, version, other')
-        interactor.display('  Сокращения:      r,        s,          v,       o')
-        choice = interactor.prompt('  (y - все, n - оставить все) [y]: ', default='y')
-
-        shortcuts = {'r': 'remaster', 's': 'soundtrack', 'v': 'version', 'o': 'other'}
-
-        to_remove: set[str] = set()
-        if choice in ('y', 'yes', 'д', 'да'):
-            for cat_data in categories.values():
-                to_remove.update(cat_data['items'].keys())
-        elif choice not in ('n', 'no', 'н', 'нет', ''):
-            selected_cats = [c.strip() for c in choice.split(',')]
-            for cat_input in selected_cats:
-                cat_key = shortcuts.get(cat_input, cat_input)
-                if cat_key in categories:
-                    to_remove.update(categories[cat_key]['items'].keys())
-                else:
-                    interactor.display(f'  Неизвестная категория: {cat_input}')
-
-        if to_remove:
-            removed_count = 0
-            for ann in to_remove:
-                for f in annotations[ann]:
-                    tags = repo.get_tags(f)
-                    if tags:
-                        new_title = remove_annotation_from_text(tags.title, ann)
-                        if new_title != tags.title and _update_tags(
-                            f, tags.artist, new_title, ctx, repo, interactor
-                        ):
-                            ctx.log_debug(f'Удалено из тега: ({ann}) из {f.name}')
-                            removed_count += 1
-            interactor.display(f'  Удалено уточнений из тегов: {removed_count}')
-
-        return files
-
-    # === Подэтап 3.4: формирование имён по тегам ===
+    # === Подэтап 3.3: формирование имён по тегам ===
 
     def _rename_by_tags(
         self,
@@ -486,7 +381,7 @@ class TagRenamingStage:
         repo: TagRepository,
         interactor: UserInteractor,
     ) -> list[Path]:
-        ctx.log_debug('Подэтап 3.4: формирование имён из тегов')
+        ctx.log_debug('Подэтап 3.3: формирование имён из тегов')
 
         interactor.display('  Поиск файлов с недопустимыми символами...')
         invalid_files = self._collect_invalid_filename_files(files, repo)
@@ -555,6 +450,18 @@ class TagRenamingStage:
                             )
                             if base_name:
                                 user_already_chose = True
+                                if (
+                                    problem_key == 'artist_name'
+                                    and strategy == 'remove'
+                                ):
+                                    # Если исполнитель уже совпадает, остаётся
+                                    # отдельное решение о расхождении названий.
+                                    current_parts = parse_artist_title(f.stem)
+                                    proposed_parts = parse_artist_title(base_name)
+                                    if current_parts and proposed_parts:
+                                        user_already_chose = (
+                                            current_parts[0] != proposed_parts[0]
+                                        )
                             else:
                                 ctx.log_debug(
                                     f'Пропущен (стратегия вернула None): {f.name}'
@@ -623,7 +530,7 @@ class TagRenamingStage:
 
         return resulting_files
 
-    # === Подэтап 3.5: обработка расхождений ===
+    # === Подэтап 3.4: обработка расхождений ===
 
     def _handle_mismatches(
         self,
@@ -751,20 +658,11 @@ class TagRenamingStage:
                 interactor.display(f'  {i}. {f.name}')
 
                 if cat_key == 'D':
-                    parsed = parse_artist_title(f.stem)
-                    if parsed:
-                        cleaned_artist, cleaned_title = clean_extracted_tags(
-                            parsed[0], parsed[1]
-                        )
-                        new_tag_str = f'{cleaned_artist} - {cleaned_title}'
+                    proposed = tags_from_filename(f.stem, tag_artist, tag_title)
+                    if proposed:
                         interactor.display('      Файл останется без изменений')
                         interactor.display(f'      Теги: {tag_str}')
-                        interactor.display(f'         → {new_tag_str}')
-                    else:
-                        new_tag_str = file_title or f.stem
-                        interactor.display('      Файл останется без изменений')
-                        interactor.display(f'      Теги: {tag_str}')
-                        interactor.display(f'         → {new_tag_str}')
+                        interactor.display(f'         → {proposed[0]} - {proposed[1]}')
                 elif cat_key == 'E':
                     interactor.display(f'      Файл: {file_title or "(нет)"}')
                     interactor.display(f'      Теги: {tag_str}')
@@ -790,27 +688,20 @@ class TagRenamingStage:
                         f,
                         _file_title,
                         new_name,
-                        _tag_artist,
-                        _tag_title,
+                        tag_artist,
+                        tag_title,
                     ) in categorized[cat_key]:
                         if default == 't':
                             rename_by_tags(f, new_name)
                         else:
-                            parsed = parse_artist_title(f.stem)
-                            if parsed:
-                                cleaned_artist, cleaned_title = clean_extracted_tags(
-                                    parsed[0], parsed[1]
-                                )
-                                if _update_tags(
-                                    f,
-                                    cleaned_artist,
-                                    cleaned_title,
-                                    ctx,
-                                    repo,
-                                    interactor,
-                                ):
-                                    ctx.log_debug(f'Теги обновлены из имени: {f.name}')
-                                    ctx.increment_stat('tags_written')
+                            proposed = tags_from_filename(f.stem, tag_artist, tag_title)
+                            if (
+                                proposed
+                                and proposed != (tag_artist, tag_title)
+                                and _update_tags(f, *proposed, ctx, repo, interactor)
+                            ):
+                                ctx.log_debug(f'Теги обновлены из имени: {f.name}')
+                                ctx.increment_stat('tags_written')
                 else:
                     interactor.display(f'  Группа {cat_key} пропущена.')
 
@@ -831,16 +722,16 @@ class TagRenamingStage:
                     interactor.display(f'      Файл: {file_title or "(нет)"}')
                     interactor.display(f'      Теги: {tag_artist} - {tag_title}')
 
-                    raw_name = f'{tag_artist} - {tag_title}'
-                    raw_name = normalize_title_spacing(raw_name)
-                    cleaned = INVALID_FILENAME_CHARS.sub('', raw_name)
-                    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-                    current_new_name = f'{cleaned}{f.suffix}'
+                    current_new_name = build_safe_filename(
+                        tag_artist, tag_title, f.suffix
+                    )
+                    parsed = tags_from_filename(
+                        f.stem, tag_artist, tag_title, repair_brackets=False
+                    )
 
                     if last_action == 't':
                         interactor.display(f'      → Новое имя (t): {current_new_name}')
                     elif last_action == 'f':
-                        parsed = parse_artist_title(f.stem)
                         if parsed:
                             interactor.display(
                                 f'      → Новые теги (f): {parsed[0]} - {parsed[1]}'
@@ -851,7 +742,6 @@ class TagRenamingStage:
                             )
                     else:
                         interactor.display(f'      → Если t: {current_new_name}')
-                        parsed = parse_artist_title(f.stem)
                         if parsed:
                             interactor.display(
                                 f'      → Если f: {parsed[0]} - {parsed[1]}'
@@ -871,9 +761,12 @@ class TagRenamingStage:
                     if choice == 't':
                         rename_by_tags(f, current_new_name)
                     elif choice == 'f':
-                        parsed = parse_artist_title(f.stem)
-                        if parsed and _update_tags(
-                            f, parsed[0], parsed[1], ctx, repo, interactor
+                        if (
+                            parsed
+                            and parsed != (tag_artist, tag_title)
+                            and _update_tags(
+                                f, parsed[0], parsed[1], ctx, repo, interactor
+                            )
                         ):
                             ctx.log_debug(f'Теги обновлены из имени: {f.name}')
                             ctx.increment_stat('tags_written')
@@ -897,76 +790,6 @@ class TagRenamingStage:
         interactor.display('  Объединение отключено; оба файла сохранены.')
 
     # === Приватные вспомогательные методы (чистая логика) ===
-
-    def _find_tag_annotations(
-        self, files: list[Path], repo: TagRepository
-    ) -> dict[str, list[Path]]:
-        """Находит уникальные скобки в тегах названий."""
-        annotations: dict[str, list[Path]] = {}
-        bracket_pattern = re.compile(r'[\(\[]([^\)\]]+)[\)\]]')
-
-        for f in files:
-            tags = repo.get_tags(f)
-            if tags:
-                title = tags.title
-                matches = bracket_pattern.findall(title)
-                for match in matches:
-                    match = match.strip()
-                    if not match:
-                        continue
-                    from config import JUNK_PATTERN
-
-                    if JUNK_PATTERN.search(f'({match})'):
-                        continue
-                    if FEAT_VARIANTS_PATTERN.match(match):
-                        continue
-                    if match not in annotations:
-                        annotations[match] = []
-                    if f not in annotations[match]:
-                        annotations[match].append(f)
-
-        return annotations
-
-    def _categorize_annotations(
-        self, annotations: dict[str, list[Path]]
-    ) -> dict[str, dict[str, Any]]:
-        """Группирует уточнения по категориям."""
-        categories: dict[str, dict[str, Any]] = {
-            'remaster': {
-                'name': 'Ремастеринг',
-                'pattern': re.compile(r'(?:remaster|remastered|remix)', re.I),
-                'items': {},
-            },
-            'soundtrack': {
-                'name': 'Саундтреки (from/From)',
-                'pattern': re.compile(r'^(?:from|From)\s', re.I),
-                'items': {},
-            },
-            'version': {
-                'name': 'Версии треков (Edit/Version/Mix)',
-                'pattern': re.compile(r'(?:edit|version|mix|single|album|radio)', re.I),
-                'items': {},
-            },
-            'other': {
-                'name': 'Прочее',
-                'pattern': None,
-                'items': {},
-            },
-        }
-
-        for ann, file_list in annotations.items():
-            categorized = False
-            for cat_key, cat_data in categories.items():
-                if cat_key == 'other':
-                    continue
-                if cat_data['pattern'] and cat_data['pattern'].search(ann):
-                    cat_data['items'][ann] = file_list
-                    categorized = True
-                    break
-            if not categorized:
-                categories['other']['items'][ann] = file_list
-
-        return {k: v for k, v in categories.items() if v['items']}
 
     def _collect_invalid_filename_files(
         self, files: list[Path], repo: TagRepository
@@ -1169,14 +992,10 @@ class TagWritingStage:
                     title = remove_junk(title)
                     artist, title = normalize_feat_pair(artist, title)
                     artist = remove_feat_guests_from_artist(artist, title)
-                    title = normalize_title_spacing(title)
                     tags_to_write.append((f, artist, title))
 
         if not tags_to_write:
             return files
-
-        # Обработка уточнений в скобках
-        tags_to_write = self._handle_annotations(tags_to_write, ctx, interactor)
 
         labels: list[str] = []
         for f, artist, title in tags_to_write:
@@ -1221,50 +1040,6 @@ class TagWritingStage:
             interactor.display(f'  Переименовано файлов: {renamed_count}')
 
         return ctx.present_paths(file_ids)
-
-    def _handle_annotations(
-        self,
-        tags_to_write: list[tuple[Path, str, str]],
-        ctx: SessionContext,
-        interactor: UserInteractor,
-    ) -> list[tuple[Path, str, str]]:
-        """Обрабатывает уточнения в скобках перед записью тегов."""
-        bracket_pattern = re.compile(r'[\(\[]([^\)\]]+)[\)\]]')
-        files_with_annotations: list[tuple[int, Path, str, str, list[str]]] = []
-
-        for i, (f, artist, title) in enumerate(tags_to_write):
-            matches = bracket_pattern.findall(title)
-            real_matches = [m for m in matches if not FEAT_VARIANTS_PATTERN.match(m)]
-            if real_matches:
-                files_with_annotations.append((i, f, artist, title, real_matches))
-
-        if not files_with_annotations:
-            return tags_to_write
-
-        interactor.display(
-            f'\n  Внимание: {len(files_with_annotations)} файлов содержат уточнения в скобках:'
-        )
-        for _i, f, _artist, _title, matches in files_with_annotations:
-            interactor.display(f'    {f.name}')
-            interactor.display(
-                f'      Уточнения: {", ".join(f"({m})" for m in matches)}'
-            )
-
-        choice = interactor.prompt(
-            '\n  Удалить уточнения из тегов и имён? (y/n) [y]: ', default='y'
-        )
-
-        if choice in ('', 'y', 'yes', 'д', 'да'):
-            for i, f, artist, title, matches in files_with_annotations:
-                new_title = title
-                for ann in matches:
-                    new_title = remove_annotation_from_text(new_title, ann)
-                tags_to_write[i] = (f, artist, new_title)
-            interactor.display('  Уточнения будут удалены перед записью.')
-        else:
-            interactor.display('  Уточнения будут сохранены.')
-
-        return tags_to_write
 
 
 class DuplicateResolutionStage:
