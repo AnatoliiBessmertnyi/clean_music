@@ -16,6 +16,9 @@ DIRECTORY_NAME = '.clean_music-recovery'
 _MARKER = b'clean_music recovery v1\n'
 _RECORD_NAME = re.compile(r'[0-9a-f]{32}\.json')
 _DRAFT_NAME = re.compile(r'[0-9a-f]{32}\.pending')
+_ARTIFACT_NAME = re.compile(
+    r'([0-9a-f]{32})\.(?:original|work\.(?:mp3|m4a|mp4|flac|ogg|wma))'
+)
 
 
 def _identity(info: os.stat_result) -> FileIdentity:
@@ -120,11 +123,17 @@ class RecoveryStore:
     def records(self) -> list[Path]:
         self.check()
         records = []
-        for entry in self.directory.iterdir():
+        entries = list(self.directory.iterdir())
+        names = {entry.name for entry in entries}
+        for entry in entries:
             if _RECORD_NAME.fullmatch(entry.name):
                 records.append(entry)
             elif entry.name in ('owner', 'lock') or _DRAFT_NAME.fullmatch(entry.name):
                 regular_file_info(entry)
+            elif (
+                artifact := _ARTIFACT_NAME.fullmatch(entry.name)
+            ) and f'{artifact[1]}.json' in names:
+                continue
             else:
                 raise OSError(f'неизвестный объект в каталоге восстановления: {entry}')
         return sorted(records)

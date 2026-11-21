@@ -1,6 +1,7 @@
 """Проверки сохранности файлов и тегов в этапах конвейера."""
 
 import os
+from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock
@@ -10,13 +11,35 @@ import pytest
 import stages
 from context import SessionContext
 from file_operations import FileExecutor
-from file_state import OperationStatus
+from file_state import FileRecord, OperationStatus
 from interactor import ConsoleInteractor, UserInteractor
 from pipeline import AudioProcessingPipeline
 from pipeline_utils import simulate_rename
+from recovery_store import RecoveryStore
 from tag_repository import AudioTags, ReadStatus, TagRepository
 from tests.test_pipeline_utils import Interactor, MemoryRepository, admit, windows
+from tests.test_tag_publication import synthetic_audio
 from tests.test_tag_repository import write_mp3
+
+
+@pytest.fixture(autouse=True)
+def memory_tag_publication(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = FileExecutor._publish_tag_change
+
+    def publish(
+        path: Path,
+        record: FileRecord,
+        artist: str | None,
+        title: str | None,
+        ctx: SessionContext,
+        repo: TagRepository,
+        interactor: UserInteractor,
+    ) -> tuple[OperationStatus, str]:
+        if isinstance(repo, MemoryRepository):
+            return repo._write_to_disk(path, artist, title)
+        return original(path, record, artist, title, ctx, repo, interactor)
+
+    monkeypatch.setattr(FileExecutor, '_publish_tag_change', staticmethod(publish))
 
 
 @pytest.fixture
@@ -91,14 +114,20 @@ def test_tag_writing_skips_unreadable_file(
 def test_tag_writing_fills_only_missing_field(
     tmp_path: Path, dry_run: bool, artist: str, title: str, expected: AudioTags
 ) -> None:
-    source = write_mp3(
-        tmp_path / 'Filename Artist - Filename Title.mp3', artist=artist, title=title
-    )
+    source = tmp_path / 'Filename Artist - Filename Title.mp3'
+    if dry_run:
+        write_mp3(source, artist=artist, title=title)
+    else:
+        synthetic_audio(source, artist=artist, title=title)
     repo = TagRepository()
     before = source.read_bytes()
     ctx = SessionContext(dry_run, False)
     admit(ctx, source)
-    [result] = stages.TagWritingStage().execute([source], ctx, repo, Interactor())
+    with ExitStack() as stack:
+        if not dry_run:
+            ctx.recovery = RecoveryStore(tmp_path)
+            stack.enter_context(ctx.recovery.session())
+        [result] = stages.TagWritingStage().execute([source], ctx, repo, Interactor())
     assert repo.get_tags(result).tags == expected
     if dry_run:
         assert not result.exists() and source.read_bytes() == before
@@ -455,10 +484,10 @@ def test_late_stages_keep_input_order_and_identity_without_rescan(
     final = tmp_path / 'Artist - Title.mp3'
     neighbor = tmp_path / 'Artist - One.mp3'
     outsider = tmp_path / 'Untracked.mp3'
-    for path in (source, neighbor, outsider):
-        path.write_bytes((b'\xff\xfb\x90\x64' + bytes(413)) * 5)
+    synthetic_audio(source, artist='', title='')
+    write_mp3(neighbor, artist='Artist', title='One')
+    outsider.touch()
     repo = TagRepository()
-    assert repo.update_tags(neighbor, 'Artist', 'One')
     ctx, ui = SessionContext(False, False, target_dir=tmp_path), Interactor()
     admit(ctx, neighbor, source)
     variations = Mock(wraps=stages.find_artist_variations)
@@ -471,7 +500,13 @@ def test_late_stages_keep_input_order_and_identity_without_rescan(
             stages.ManualInputStage(),
         ]
     )
-    assert pipeline.run([neighbor, source, source], ctx, repo, ui) == [neighbor, final]
+    store = RecoveryStore(tmp_path)
+    with store.session():
+        ctx.recovery = store
+        assert pipeline.run([neighbor, source, source], ctx, repo, ui) == [
+            neighbor,
+            final,
+        ], ui.messages
     variations.assert_called_once_with([neighbor, intermediate], repo)
     file_id = ctx.registry.track(source).id
     assert ctx.registry.id_for(final) == file_id
@@ -575,18 +610,11 @@ def test_unconfirmed_tag_write_blocks_dependent_rename(
     source = tmp_path / 'Artist - Title (vksaver).mp3'
     source.write_bytes(b'original')
     ctx, repo, ui = SessionContext(False, False), TagRepository(), Interactor()
-    audio = Mock(tags={}, info=None)
-    audio.save.side_effect = OSError('save failed')
-    write_input = audio if uncertain else OSError('open failed')
-    empty_audio = Mock(tags={}, info=None)
-    parser_calls = [empty_audio, write_input]
-    if uncertain:
-        parser_calls.append(empty_audio)
-    parser_calls.append(write_input)
-    if uncertain:
-        parser_calls.append(empty_audio)
-    mp3 = Mock(side_effect=parser_calls)
-    monkeypatch.setattr('tag_repository.MP3', mp3)
+    parser = Mock(return_value=Mock(tags={}, info=None))
+    monkeypatch.setattr('tag_repository.MP3', parser)
+    status = OperationStatus.UNCERTAIN if uncertain else OperationStatus.ERROR
+    publish = Mock(return_value=(status, 'publication failed'))
+    monkeypatch.setattr(FileExecutor, '_publish_tag_change', staticmethod(publish))
     monkeypatch.setattr('file_operations.modification_allowed', Mock(return_value=True))
     journal = Mock()
     monkeypatch.setattr('tag_repository.log_operation', journal)
@@ -604,7 +632,7 @@ def test_unconfirmed_tag_write_blocks_dependent_rename(
     assert outcome.status is (
         OperationStatus.UNCERTAIN if uncertain else OperationStatus.ERROR
     )
-    assert audio.save.call_count == 2 * int(uncertain)
+    assert publish.call_count == 2
     assert not rename.called and ctx.is_path_blocked(source)
     assert (
         repo.get_tags(source).status is ReadStatus.EMPTY

@@ -8,17 +8,17 @@ from tempfile import TemporaryDirectory
 from unittest.mock import Mock
 
 import pytest
-from mutagen.mp3 import MP3
 
-import tag_repository
 from context import SessionContext
 from file_operations import FileExecutor
 from file_state import OperationStatus
 from main import get_audio_files
 from pipeline_utils import WSL_MODIFICATION_DISABLED
+from recovery_store import RecoveryStore
 from report_events import Operation
 from tag_repository import AudioTags, TagRepository
 from tests.test_pipeline_utils import Interactor, windows
+from tests.test_tag_publication import synthetic_audio
 from tests.test_tag_repository import write_mp3
 
 
@@ -150,7 +150,7 @@ def test_rechecks_source_after_inspecting_rename_target(
 
 
 @windows
-def test_rechecks_after_loading_tags(
+def test_rechecks_identity_before_preparation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = write_mp3(tmp_path / 'A.mp3', artist='Old', title='Song')
@@ -166,22 +166,25 @@ def test_rechecks_after_loading_tags(
     assert get_audio_files(tmp_path, ctx, ui) == [source]
     assert repo.get_tags(source).tags == AudioTags('Old', 'Song')
 
-    def replace_during_load(path: Path) -> MP3:
-        loaded = MP3(path)
-        path.rename(parked)
-        substitute.rename(path)
-        return loaded
+    def replace_before_preparation() -> str:
+        source.rename(parked)
+        substitute.rename(source)
+        return 'ffprobe'
 
-    monkeypatch.setattr(tag_repository, 'MP3', replace_during_load)
-    result = FileExecutor().write_tags(source, 'Edited', 'Song', ctx, repo, ui)
+    monkeypatch.setattr('file_operations.find_ffprobe', replace_before_preparation)
+    store = RecoveryStore(tmp_path)
+    with store.session():
+        ctx.recovery = store
+        result = FileExecutor().write_tags(source, 'Edited', 'Song', ctx, repo, ui)
     assert result.status is OperationStatus.ERROR
-    assert 'физический объект подменён' in result.reason
+    assert 'оригинал подменён' in result.reason
     assert source.read_bytes() == replacement and parked.read_bytes() == original
 
 
 @windows
-def test_case_rename_then_write_preserves_identity(tmp_path: Path) -> None:
-    source = write_mp3(tmp_path / 'Track.mp3', artist='Old', title='Song')
+def test_case_rename_then_write_preserves_session_id(tmp_path: Path) -> None:
+    source = tmp_path / 'Track.mp3'
+    synthetic_audio(source, artist='Old', title='Song')
     target = source.with_name('track.mp3')
     ctx, repo, ui = (
         SessionContext(False, False, target_dir=tmp_path),
@@ -197,7 +200,14 @@ def test_case_rename_then_write_preserves_identity(tmp_path: Path) -> None:
     assert [path.name for path in tmp_path.iterdir() if path.is_file()] == [target.name]
     assert ctx.registry.id_for(target) == record.id
     assert ctx.registry.track(target).identity == record.identity
-    assert executor.write_tags(target, 'New', 'Song', ctx, repo, ui).is_confirmed_change
+    store = RecoveryStore(tmp_path)
+    with store.session():
+        ctx.recovery = store
+        assert executor.write_tags(
+            target, 'New', 'Song', ctx, repo, ui
+        ).is_confirmed_change, ui.messages
+    assert ctx.registry.id_for(target) == record.id
+    assert ctx.registry.track(target).identity != record.identity
     assert repo.read_tags_uncached(target).tags == AudioTags('New', 'Song')
 
 

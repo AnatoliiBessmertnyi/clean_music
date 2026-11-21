@@ -52,6 +52,16 @@ class MemoryRepository(TagRepository):
             self._disk_tags.get((stat.st_dev, stat.st_ino), AudioTags('', ''))
         )
 
+    def update_tags(self, filepath: Path, artist: str, title: str) -> bool:
+        result = self.apply_tags(
+            filepath,
+            artist,
+            title,
+            simulated=False,
+            publish=lambda a, t: self._write_to_disk(filepath, a, t),
+        )
+        return result.status in (OperationStatus.SUCCESS, OperationStatus.NOOP)
+
     def _write_to_disk(
         self,
         filepath: Path,

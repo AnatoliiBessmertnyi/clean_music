@@ -3,11 +3,13 @@
 from collections.abc import Callable
 from pathlib import Path
 
+from audio_verification import find_ffprobe
 from context import SessionContext
-from file_state import OperationResult, OperationStatus
+from file_state import FileRecord, OperationResult, OperationStatus
 from interactor import UserInteractor
 from pipeline_utils import modification_allowed, safe_rename, simulate_rename
 from report_events import log_operation
+from tag_publication import PublicationError, publish_tags
 from tag_repository import TagRepository
 
 type RenameFn = Callable[
@@ -72,14 +74,15 @@ class FileExecutor:
             )
             return OperationResult(OperationStatus.ERROR, current, reason)
 
-        def before_save() -> None:
-            if not modification_allowed(current, ctx, interactor):
-                raise OSError(
-                    ctx.get_block_reason(current) or 'модификация не разрешена'
-                )
+        def publish(
+            artist: str | None, title: str | None
+        ) -> tuple[OperationStatus, str]:
+            return self._publish_tag_change(
+                current, record, artist, title, ctx, repo, interactor
+            )
 
         result = repo.apply_tags(
-            current, artist, title, simulated=ctx.dry_run, before_save=before_save
+            current, artist, title, simulated=ctx.dry_run, publish=publish
         )
         if (
             result.is_confirmed_change or result.is_model_change
@@ -87,8 +90,58 @@ class FileExecutor:
             ctx.missing_files.remove(current)
         if result.status in (OperationStatus.ERROR, OperationStatus.UNCERTAIN):
             ctx.block_path(current, result.reason)
-            interactor.display_error(f'{current.name}: {result.reason}')
+            if result.reason != 'ffprobe недоступен':
+                interactor.display_error(f'{current.name}: {result.reason}')
         return result
+
+    @staticmethod
+    def _publish_tag_change(
+        current: Path,
+        record: FileRecord,
+        artist: str | None,
+        title: str | None,
+        ctx: SessionContext,
+        repo: TagRepository,
+        interactor: UserInteractor,
+    ) -> tuple[OperationStatus, str]:
+        try:
+            command = find_ffprobe()
+        except OSError as exc:
+            if not ctx.ffprobe_missing_reported:
+                interactor.display_error(str(exc))
+                ctx.ffprobe_missing_reported = True
+            return OperationStatus.ERROR, 'ffprobe недоступен'
+        if ctx.recovery is None or record.identity is None:
+            return (
+                OperationStatus.ERROR,
+                'нет блокировки восстановления или идентичности файла',
+            )
+        try:
+            identity = publish_tags(
+                ctx.recovery,
+                current.absolute(),
+                record.identity,
+                repo,
+                command,
+                artist,
+                title,
+            )
+        except PublicationError as exc:
+            if exc.confirmed is None:
+                return OperationStatus.UNCERTAIN, str(exc)
+            ctx.registry.confirm_replacement(record.id, exc.confirmed)
+            ctx.block_path(current, str(exc))
+            interactor.display_error(
+                f'{current.name}: теги записаны, очистка не завершена: {exc}'
+            )
+            return (
+                OperationStatus.SUCCESS,
+                f'теги записаны, очистка не завершена: {exc}',
+            )
+        except OSError as exc:
+            return OperationStatus.ERROR, str(exc)
+        ctx.registry.confirm_replacement(record.id, identity)
+        return OperationStatus.SUCCESS, 'запись выбранных artist/title подтверждена'
 
     def rename(
         self,

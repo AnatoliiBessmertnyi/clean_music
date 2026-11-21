@@ -162,6 +162,10 @@ class FileRegistry:
             self._model_sources.pop(file_id, None)
         self._records[file_id] = (updated, new_key)
 
+    def confirm_replacement(self, file_id: int, identity: FileIdentity) -> None:
+        record, key = self._records[file_id]
+        self._records[file_id] = (replace(record, identity=identity), key)
+
     def mark_missing(self, file_id: int) -> None:
         """Идемпотентно освобождает ключ пути (KeyError для неизвестного id)."""
         record, key = self._records[file_id]

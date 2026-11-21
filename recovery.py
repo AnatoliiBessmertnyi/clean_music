@@ -230,19 +230,35 @@ def recover_renames(
     *,
     diagnostic: bool = False,
 ) -> None:
-    records = []
+    from tag_publication import TagIntent, settle_tags
+
+    records: list[tuple[Path, RenameIntent | TagIntent]] = []
     for record in store.records():
         try:
-            records.append(
-                (record, RenameIntent.decode(store, record, store.read(record)))
-            )
+            data = store.read(record)
+            if data.get('kind') == 'tags':
+                tags = TagIntent.decode(store, record, data)
+                tags.paths(store, record)
+                records.append((record, tags))
+            else:
+                records.append((record, RenameIntent.decode(store, record, data)))
         except (OSError, ValueError) as exc:
             raise OSError(f'{record}: границы операции неизвестны ({exc})') from exc
     for record, intent in records:
         try:
-            settle_rename(store, record, intent, ctx, interactor, diagnostic=diagnostic)
+            if isinstance(intent, TagIntent):
+                settle_tags(store, record, intent, diagnostic=diagnostic)
+            else:
+                settle_rename(
+                    store, record, intent, ctx, interactor, diagnostic=diagnostic
+                )
         except OSError as exc:
             message = f'Восстановление {record}: {exc}'
             interactor.display_error(message)
-            for name in (intent.source, intent.target):
+            names = (
+                (intent.source,)
+                if isinstance(intent, TagIntent)
+                else (intent.source, intent.target)
+            )
+            for name in names:
                 ctx.block_path(store.root / name, message)
