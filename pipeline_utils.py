@@ -10,6 +10,7 @@ from pathlib import Path
 from config import FEAT_VARIANTS_PATTERN, INVALID_FILENAME_CHARS, LEADING_TRACK_PATTERN
 from context import SessionContext
 from duplicate_analysis import Candidate, compare_candidates, find_candidate_groups
+from file_state import entry_info, inspect_file
 from interactor import UserInteractor, prompt_command
 from parsing import parse_artist_title
 from report_events import log_operation
@@ -66,7 +67,7 @@ WSL_MODIFICATION_DISABLED = (
 )
 
 
-def _windows_local_ntfs(path: Path) -> bool:
+def windows_local_ntfs(path: Path) -> bool:
     """Подтверждает локальный NTFS; неизвестные тома не допускаются."""
     if sys.platform != 'win32':
         return False
@@ -96,21 +97,18 @@ def modification_allowed(
         if os.name != 'nt':
             raise OSError(WSL_MODIFICATION_DISABLED + ' (POSIX не подтверждён)')
         absolute = path.absolute()
-        for entry in (absolute, *absolute.parents):
-            info = os.lstat(entry)
-            if stat.S_ISLNK(info.st_mode) or (
-                getattr(info, 'st_file_attributes', 0)
-                & stat.FILE_ATTRIBUTE_REPARSE_POINT
-            ):
-                raise OSError(f'ссылки и reparse points не поддерживаются: {entry}')
-            if entry == absolute and (
-                not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-            ):
-                raise OSError('требуется обычный файл с одной жёсткой ссылкой')
-        if not _windows_local_ntfs(absolute):
+        if ctx.target_dir is not None and absolute.parent != ctx.target_dir.absolute():
+            raise OSError('файл находится вне выбранного каталога')
+        identity = inspect_file(absolute)
+        if not windows_local_ntfs(absolute.parent):
             raise OSError(
                 'модификация поддерживается только на локальном NTFS в Windows'
             )
+        record = ctx.registry.track(path)
+        if record.identity is None:
+            raise OSError('исходная физическая идентичность файла неизвестна')
+        if identity != record.identity:
+            raise OSError('физический объект подменён после сканирования')
     except OSError as exc:
         ctx.block_path(path, str(exc))
         interactor.display_error(f'{path.name}: {exc}')
@@ -166,6 +164,22 @@ def simulate_rename(
     )
 
 
+def _rename_source_allowed(
+    old_path: Path, new_path: Path, ctx: SessionContext, interactor: UserInteractor
+) -> bool:
+    if modification_allowed(old_path, ctx, interactor):
+        return True
+    log_operation(
+        'rename',
+        old_path,
+        'блокировка',
+        ctx.get_block_reason(old_path) or 'модификация не разрешена',
+        target=new_path,
+        proposed=ctx.dry_run,
+    )
+    return False
+
+
 def safe_rename(
     old_path: Path,
     new_path: Path,
@@ -174,15 +188,7 @@ def safe_rename(
     interactor: UserInteractor,
 ) -> tuple[str, Path | None]:
     """Один Windows rename без replace, удаления и временных путей."""
-    if not modification_allowed(old_path, ctx, interactor):
-        log_operation(
-            'rename',
-            old_path,
-            'блокировка',
-            ctx.get_block_reason(old_path) or 'модификация не разрешена',
-            target=new_path,
-            proposed=ctx.dry_run,
-        )
+    if not _rename_source_allowed(old_path, new_path, ctx, interactor):
         return 'skipped', None
     if ctx.is_path_blocked(new_path):
         ctx.block_path(old_path, 'целевой путь заблокирован')
@@ -212,23 +218,24 @@ def safe_rename(
         return 'unchanged', old_path
     try:
         try:
-            target_info = os.lstat(new_path)
+            os.lstat(new_path)
         except FileNotFoundError:
             occupied = False
         else:
             occupied = True
-        case_change = old_path.name.casefold() == new_path.name.casefold() and (
-            not occupied
-            or (
-                stat.S_ISREG(target_info.st_mode)
-                and target_info.st_nlink == 1
-                and not (
-                    getattr(target_info, 'st_file_attributes', 0)
-                    & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        case_change = old_path.name.casefold() == new_path.name.casefold()
+        if case_change and occupied:
+            try:
+                target_info = entry_info(new_path.absolute())
+            except OSError:
+                case_change = False
+            else:
+                case_change = (
+                    stat.S_ISREG(target_info.st_mode)
+                    and target_info.st_nlink == 1
+                    and (target_info.st_dev, target_info.st_ino)
+                    == ctx.registry.track(old_path).identity
                 )
-                and files_are_same(old_path, new_path)
-            )
-        )
         if occupied and not case_change:
             ctx.block_path(old_path, 'конфликт целевого имени; оба файла сохранены')
             interactor.display(
@@ -243,6 +250,8 @@ def safe_rename(
                 proposed=ctx.dry_run,
             )
             return 'duplicate_exists', new_path
+        if not _rename_source_allowed(old_path, new_path, ctx, interactor):
+            return 'skipped', None
         if ctx.dry_run:
             simulate_rename(old_path, new_path, repo, interactor)
             return 'planned', new_path

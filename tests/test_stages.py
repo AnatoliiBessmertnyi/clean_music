@@ -15,7 +15,7 @@ from interactor import ConsoleInteractor, UserInteractor
 from pipeline import AudioProcessingPipeline
 from pipeline_utils import simulate_rename
 from tag_repository import AudioTags, ReadStatus, TagRepository
-from tests.test_pipeline_utils import Interactor, MemoryRepository, windows
+from tests.test_pipeline_utils import Interactor, MemoryRepository, admit, windows
 from tests.test_tag_repository import write_mp3
 
 
@@ -54,6 +54,7 @@ def test_tag_writing_preserves_annotations(
     source = tmp_path / f'Исполнитель - {source_title}.mp3'
     source.touch()
     ctx, repo, ui = SessionContext(True, False), MemoryRepository(), Interactor('y')
+    admit(ctx, source)
     [current] = stages.TagWritingStage().execute([source], ctx, repo, ui)
     assert repo.get_tags(current).complete_tags == AudioTags('Исполнитель', title)
 
@@ -96,6 +97,7 @@ def test_tag_writing_fills_only_missing_field(
     repo = TagRepository()
     before = source.read_bytes()
     ctx = SessionContext(dry_run, False)
+    admit(ctx, source)
     [result] = stages.TagWritingStage().execute([source], ctx, repo, Interactor())
     assert repo.get_tags(result).tags == expected
     if dry_run:
@@ -123,6 +125,7 @@ def test_tag_renaming_preserves_metadata_on_second_pass(
         tmp_path
         / f'{artist.replace("/", "")} - Песня (Live) [AB Remix] (feat. Ирина).mp3'
     )
+    admit(ctx, source)
     stage = stages.TagRenamingStage()
 
     assert stage.execute([source], ctx, repo, ui) == [target]
@@ -141,6 +144,7 @@ def test_manual_artist_keeps_case_through_console(
     source = tmp_path / 'Song.mp3'
     source.touch()
     ctx, repo = SessionContext(True, False), MemoryRepository()
+    admit(ctx, source)
     ctx.missing_files = [source]
     monkeypatch.setattr(stages, 'modification_allowed', Mock(return_value=True))
     monkeypatch.setattr('builtins.input', Mock(side_effect=['Y', 'McCartney']))
@@ -180,6 +184,7 @@ def test_mismatch_write_retains_artist_sanitized_in_filename(
     repo.simulate_update_tags(source, 'AC/DC', 'Old title')
     monkeypatch.setattr(ui, 'prompt', Mock(side_effect=['1', 'f']))
 
+    admit(ctx, source)
     stage = stages.TagRenamingStage()
     assert stage.execute([source], ctx, repo, ui) == [source]
     assert repo.get_tags(source).complete_tags == AudioTags('AC/DC', 'Correct title')
@@ -190,6 +195,7 @@ def test_encoding_repair_preserves_title_annotations(tmp_path: Path) -> None:
     source = tmp_path / 'Исполнитель - Песня.mp3'
     source.touch()
     ctx, repo, ui = SessionContext(True, False), MemoryRepository(), Interactor('y')
+    admit(ctx, source)
     repo.simulate_update_tags(source, 'ÐÐ', 'Песня (Live)')
 
     assert stages.TagRenamingStage().execute([source], ctx, repo, ui) == [source]
@@ -207,6 +213,7 @@ def test_junk_rename_failure_blocks_tag_cleanup(
     target = tmp_path / 'Artist - Title.mp3'
     path.write_bytes(b'original')
     repo, ctx, ui = MemoryRepository(), SessionContext(False, False), Interactor()
+    admit(ctx, path)
     repo.simulate_update_tags(path, 'Artist', 'Title (vksaver)')
     files = [path]
     if conflict:
@@ -236,7 +243,7 @@ def test_junk_then_normalization_preserves_file_id(
     old.write_bytes(b'original')
     neighbor.write_bytes(b'neighbor')
     ctx, repo, ui = SessionContext(dry_run, False), MemoryRepository(), Interactor()
-    file_id = ctx.registry.register(old).id
+    file_id = admit(ctx, old, neighbor).id
     pipeline = AudioProcessingPipeline(
         [stages.JunkCleaningStage(), stages.NormalizationStage()]
     )
@@ -270,7 +277,7 @@ def test_tag_rename_passes_current_paths_to_mismatches(
     repo, ui = MemoryRepository(), Interactor()
     repo.simulate_update_tags(old, 'Artist', 'Title')
     repo.simulate_update_tags(neighbor, 'Artist', 'Other')
-    file_id = ctx.registry.register(old).id
+    file_id = admit(ctx, old).id
     neighbor_id = ctx.registry.register(neighbor).id
     if outcome == 'denied':
         monkeypatch.setattr(Path, 'rename', Mock(side_effect=PermissionError('locked')))
@@ -321,7 +328,7 @@ def test_tag_rename_applies_mismatches_in_input_order(
     for source, title in zip(files, titles, strict=True):
         source.write_bytes(title.encode())
         repo.simulate_update_tags(source, 'Artist', title)
-        ids.append(ctx.registry.register(source).id)
+        ids.append(admit(ctx, source).id)
 
     assert stages.TagRenamingStage().execute(files, ctx, repo, ui) == expected
     assert [ctx.registry.id_for(path) for path in expected] == ids
@@ -344,7 +351,7 @@ def test_tag_mismatch_keeps_original_path_on_rename_refusal(
     source.write_bytes(b'original')
     ctx, repo, ui = SessionContext(False, False), MemoryRepository(), Interactor('y')
     repo.simulate_update_tags(source, 'Artist', 'Corrected')
-    file_id = ctx.registry.register(source).id
+    file_id = admit(ctx, source).id
     files = [source]
     if outcome == 'conflict':
         target.write_bytes(b'occupied')
@@ -379,6 +386,7 @@ def test_tag_rename_conflict_keeps_both(tmp_path: Path, answer: str) -> None:
     old.write_bytes(b'old')
     new.write_bytes(b'new target')
     repo, ctx, ui = MemoryRepository(), SessionContext(False, False), Interactor(answer)
+    admit(ctx, old, new)
     repo.simulate_update_tags(old, 'Artist', 'Title')
     repo.simulate_update_tags(new, 'Artist', 'Title')
     assert stages.TagRenamingStage()._rename_by_tags([old, new], ctx, repo, ui) == [
@@ -422,6 +430,7 @@ def test_tag_writing_before_failed_rename(
     path = tmp_path / 'Artist - Title (vksaver).mp3'
     path.write_bytes(b'original')
     repo, ctx, ui = MemoryRepository(), SessionContext(False, False), Interactor()
+    admit(ctx, path)
     repo.succeed = write_succeeds
     rename = Mock(side_effect=PermissionError('locked'))
     monkeypatch.setattr(Path, 'rename', rename)
@@ -451,6 +460,7 @@ def test_late_stages_keep_input_order_and_identity_without_rescan(
     repo = TagRepository()
     assert repo.update_tags(neighbor, 'Artist', 'One')
     ctx, ui = SessionContext(False, False, target_dir=tmp_path), Interactor()
+    admit(ctx, neighbor, source)
     variations = Mock(wraps=stages.find_artist_variations)
     monkeypatch.setattr(stages, 'find_artist_variations', variations)
 
@@ -616,6 +626,7 @@ def test_artist_write_failure_blocks_rename(
     repo.simulate_update_tags(variant, 'artist', 'Two')
     repo.succeed = False
     ctx, ui = SessionContext(False, False, target_dir=tmp_path), Interactor()
+    admit(ctx, canonical, variant)
     if blocked_before:
         ctx.block_path(variant, '')
     rename = Mock(side_effect=AssertionError('dependent rename'))

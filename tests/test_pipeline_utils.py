@@ -3,6 +3,7 @@
 import os
 import stat
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -10,7 +11,7 @@ import pytest
 
 import pipeline_utils as utils
 from context import SessionContext
-from file_state import OperationStatus
+from file_state import FileRecord, OperationStatus, inspect_file
 from interactor import ConsoleInteractor
 from stages import process_rename_batch
 from tag_repository import AudioTags, MetadataRead, TagRepository
@@ -52,7 +53,12 @@ class MemoryRepository(TagRepository):
         )
 
     def _write_to_disk(
-        self, filepath: Path, artist: str | None, title: str | None
+        self,
+        filepath: Path,
+        artist: str | None,
+        title: str | None,
+        *,
+        before_save: Callable[[], None] | None = None,
     ) -> tuple[OperationStatus, str]:
         before = self.get_tags(filepath).tags
         assert before is not None
@@ -60,6 +66,8 @@ class MemoryRepository(TagRepository):
             before.artist if artist is None else artist,
             before.title if title is None else title,
         )
+        if before_save is not None:
+            before_save()
         self.writes.append((filepath, tags.artist, tags.title))
         if self.succeed:
             stat = filepath.stat()
@@ -67,6 +75,14 @@ class MemoryRepository(TagRepository):
         return (
             OperationStatus.SUCCESS if self.succeed else OperationStatus.ERROR
         ), 'test write'
+
+
+def admit(ctx: SessionContext, *paths: Path) -> FileRecord:
+    first, *others = paths
+    record = ctx.registry.register(first, identity=inspect_file(first))
+    for path in others:
+        ctx.registry.register(path, identity=inspect_file(path))
+    return record
 
 
 windows = pytest.mark.skipif(os.name != 'nt', reason='Реальная операция Windows/NTFS')
@@ -168,6 +184,7 @@ def test_conflict_preserves_bytes(
     ctx, repo, ui = SessionContext(dry_run, False), MemoryRepository(), Interactor()
     repo.simulate_update_tags(old, 'old', 'title')
     repo.simulate_update_tags(new, 'new', 'title')
+    admit(ctx, old)
     status, result = utils.safe_rename(old, new, ctx, repo, ui)
     assert status == 'duplicate_exists'
     assert result == new
@@ -187,6 +204,7 @@ def test_real_windows_rename(tmp_path: Path, new_name: str) -> None:
     temporary.write_bytes(b'occupied temporary')
     ctx, repo, ui = SessionContext(False, False), MemoryRepository(), Interactor()
     assert repo.update_tags(old, 'artist', 'title')
+    admit(ctx, old)
     status, result = utils.simple_rename(old, new, ctx, repo, ui)
     assert status == 'renamed', ui.messages
     assert result == new
@@ -207,6 +225,7 @@ def test_failed_rename_blocks_without_success(
     repo, ctx, ui = MemoryRepository(), SessionContext(False, False), Interactor()
     repo.simulate_update_tags(old, 'artist', 'title')
     monkeypatch.setattr(Path, 'rename', Mock(side_effect=PermissionError('locked')))
+    admit(ctx, old)
     status, result = utils.safe_rename(old, new, ctx, repo, ui)
     assert (
         utils.handle_rename_result(status, old, result, ctx, 'renamed_by_tags') is None
@@ -226,6 +245,7 @@ def test_case_rename_without_actual_change_is_not_success(
     new = tmp_path / 'track.mp3'
     ctx = SessionContext(False, False)
     monkeypatch.setattr(Path, 'rename', Mock(return_value=new))
+    admit(ctx, old)
     status, result = utils.safe_rename(old, new, ctx, MemoryRepository(), Interactor())
     assert status == 'failed' and result is None
     assert ctx.is_path_blocked(old) and ctx.is_path_blocked(new)
@@ -245,9 +265,9 @@ def test_target_appears_after_check(
         return original_rename(source, target)
 
     monkeypatch.setattr(Path, 'rename', competing_rename)
-    status, _ = utils.safe_rename(
-        old, new, SessionContext(False, False), MemoryRepository(), Interactor()
-    )
+    ctx = SessionContext(False, False)
+    admit(ctx, old)
+    status, _ = utils.safe_rename(old, new, ctx, MemoryRepository(), Interactor())
     assert status == 'duplicate_exists'
     assert old.read_bytes() == b'source' and new.read_bytes() == b'competitor'
 
@@ -257,9 +277,9 @@ def test_occupied_directory(tmp_path: Path) -> None:
     old, new = tmp_path / 'old.mp3', tmp_path / 'new.mp3'
     old.write_bytes(b'source')
     new.mkdir()
-    status, _ = utils.safe_rename(
-        old, new, SessionContext(False, False), MemoryRepository(), Interactor()
-    )
+    ctx = SessionContext(False, False)
+    admit(ctx, old)
+    status, _ = utils.safe_rename(old, new, ctx, MemoryRepository(), Interactor())
     assert status == 'duplicate_exists'
     assert old.read_bytes() == b'source' and new.is_dir()
 
@@ -293,9 +313,9 @@ def test_symlink_source_and_target(tmp_path: Path, dangling: bool) -> None:
     assert not utils.modification_allowed(
         link, SessionContext(False, False), Interactor()
     )
-    status, _ = utils.safe_rename(
-        source, link, SessionContext(False, False), MemoryRepository(), Interactor()
-    )
+    ctx = SessionContext(False, False)
+    admit(ctx, source)
+    status, _ = utils.safe_rename(source, link, ctx, MemoryRepository(), Interactor())
     assert status == 'duplicate_exists'
     assert source.read_bytes() == b'source' and link.is_symlink()
     if not dangling:
@@ -351,7 +371,7 @@ def test_unconfirmed_volume_refuses(
 ) -> None:
     path = tmp_path / 'source.mp3'
     path.write_bytes(b'original')
-    monkeypatch.setattr(utils, '_windows_local_ntfs', lambda path: False)
+    monkeypatch.setattr(utils, 'windows_local_ntfs', lambda path: False)
     ctx = SessionContext(False, False)
     status, _ = utils.safe_rename(
         path, tmp_path / 'new.mp3', ctx, MemoryRepository(), Interactor()
@@ -366,6 +386,7 @@ def test_unchanged_and_dry_run_do_not_count_success(tmp_path: Path) -> None:
     path.write_bytes(b'original')
     repo, ui, ctx = MemoryRepository(), Interactor(), SessionContext(True, False)
     repo.simulate_update_tags(path, 'artist', 'title')
+    admit(ctx, path)
     status, result = utils.safe_rename(path, path, ctx, repo, ui)
     assert status == 'unchanged'
     assert (
@@ -441,6 +462,7 @@ def test_batch_conflict_remains_available_for_display(tmp_path: Path) -> None:
     ctx, repo, ui = SessionContext(False, False), MemoryRepository(), Interactor()
     repo.simulate_update_tags(old, 'Artist', 'Title')
     repo.simulate_update_tags(new, 'Artist', 'Title')
+    admit(ctx, old, new)
     result = process_rename_batch(
         [old, new],
         [old],
@@ -474,8 +496,8 @@ def test_symlink_attributes_reject_source_and_target(
     assert not utils.modification_allowed(
         target, SessionContext(False, False), Interactor()
     )
-    status, _ = utils.safe_rename(
-        source, target, SessionContext(False, False), MemoryRepository(), Interactor()
-    )
+    ctx = SessionContext(False, False)
+    admit(ctx, source)
+    status, _ = utils.safe_rename(source, target, ctx, MemoryRepository(), Interactor())
     assert status == 'duplicate_exists'
     assert source.read_bytes() == b'source' and target.read_bytes() == b'target'

@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 import os
-import stat
 import subprocess
 import sys
 import tempfile
@@ -21,6 +20,7 @@ from typing import override
 from uuid import uuid4
 
 from config import SUPPORTED_EXTENSIONS
+from file_state import check_directory, regular_file_info
 from report_events import Operation, log_operation
 from report_format import render_compact
 from tag_repository import AudioTags, TagRepository
@@ -97,26 +97,11 @@ def _git_commit() -> str:
     return 'unknown'
 
 
-def _check_regular_path(path: Path) -> os.stat_result:
-    """Не читать содержимое ссылок и reparse points, включая родителей."""
-    info = path.lstat()
-    for entry in (path, *path.parents):
-        entry_info = info if entry == path else entry.lstat()
-        if stat.S_ISLNK(entry_info.st_mode) or (
-            getattr(entry_info, 'st_file_attributes', 0)
-            & stat.FILE_ATTRIBUTE_REPARSE_POINT
-        ):
-            raise OSError(f'ссылка или reparse point: {entry}')
-    if not stat.S_ISREG(info.st_mode):
-        raise OSError('не является обычным файлом')
-    return info
-
-
 def snapshot_file(path: Path, repo: TagRepository) -> FileSnapshot:
     """Читает файл и теги с диска, не используя кэш конвейера."""
     result = FileSnapshot(str(path))
     try:
-        before = _check_regular_path(path)
+        before = regular_file_info(path)
         result.identity = (before.st_dev, before.st_ino)
         with path.open('rb') as stream:
             result.sha256 = hashlib.file_digest(stream, 'sha256').hexdigest()
@@ -124,7 +109,7 @@ def snapshot_file(path: Path, repo: TagRepository) -> FileSnapshot:
         result.tags = metadata.tags
         if metadata.error is not None:
             result.errors.append(f'чтение тегов: {metadata.error}')
-        after = path.lstat()
+        after = regular_file_info(path)
         if (
             before.st_dev,
             before.st_ino,
@@ -229,13 +214,7 @@ class RunReport:
     def _audio_entries(self) -> list[Path]:
         assert self._directory is not None
         # Не следовать ссылке на выбранную папку даже при чтении отчёта.
-        for entry in (self._directory, *self._directory.parents):
-            info = entry.lstat()
-            if stat.S_ISLNK(info.st_mode) or (
-                getattr(info, 'st_file_attributes', 0)
-                & stat.FILE_ATTRIBUTE_REPARSE_POINT
-            ):
-                raise OSError(f'ссылка или reparse point в пути папки: {entry}')
+        check_directory(self._directory)
         return sorted(
             (
                 path
