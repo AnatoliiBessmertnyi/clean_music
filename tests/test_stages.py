@@ -408,6 +408,10 @@ def test_duplicate_stage_preserves_files_and_cache(
     assert [path.read_bytes() for path in files] == [b'A', b'BBBB']
     assert all(repo.get_tags(path).complete_tags is not None for path in files)
     assert not ctx.get_stat('duplicates_removed') and not ui.prompts
+    output = '\n'.join(ui.messages)
+    assert 'нормализованные исполнитель и название из тегов' in output
+    assert 'Байты различаются. Совпадение музыкальной записи не установлено' in output
+    assert 'Недостаточно данных: формат, кодек' in output
 
 
 @windows
