@@ -243,6 +243,7 @@ def test_cli_holds_lock_through_final_report(
 
     monkeypatch.setattr(cli, '__file__', str(tmp_path / 'main.py'))
     monkeypatch.setattr(cli, 'get_valid_path', lambda: root)
+    monkeypatch.setattr('builtins.input', lambda _: '')
     monkeypatch.setattr(sys, 'argv', ['main.py'])
     monkeypatch.setattr(RunReport, 'finish', check_lock)
     cli.main()
@@ -270,6 +271,7 @@ def test_cli_stops_before_scan_if_scope_unknown(
     before = {path: path.read_bytes() for path in root.rglob('*') if path.is_file()}
     monkeypatch.setattr(cli, '__file__', str(tmp_path / 'main.py'))
     monkeypatch.setattr(cli, 'get_valid_path', lambda: root)
+    monkeypatch.setattr('builtins.input', lambda _: '')
     monkeypatch.setattr(
         sys, 'argv', ['main.py', '--dry-run'] if dry_run else ['main.py']
     )
