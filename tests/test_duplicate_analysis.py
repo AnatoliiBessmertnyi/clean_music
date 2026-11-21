@@ -128,3 +128,7 @@ def test_dry_run_comparison_reads_physical_paths(tmp_path: Path) -> None:
     [pair] = compare_candidates(group, registry)
     assert pair.left.path == planned and pair.byte_status is ByteStatus.IDENTICAL
     assert old.exists() and not planned.exists()
+
+    registry.mark_content_modeled(registry.track(planned).id)
+    [pair] = compare_candidates(group, registry)
+    assert pair.byte_status is ByteStatus.UNKNOWN and pair.byte_error is None

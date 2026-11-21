@@ -98,7 +98,9 @@ def modification_allowed(
     try:
         if os.name != 'nt':
             raise OSError(WSL_MODIFICATION_DISABLED + ' (POSIX не подтверждён)')
-        absolute = path.absolute()
+        record = ctx.registry.track(path)
+        physical = ctx.registry.physical_path(record) if ctx.dry_run else path
+        absolute = physical.absolute()
         if ctx.target_dir is not None and absolute.parent != ctx.target_dir.absolute():
             raise OSError('файл находится вне выбранного каталога')
         identity = inspect_file(absolute)
@@ -106,7 +108,6 @@ def modification_allowed(
             raise OSError(
                 'модификация поддерживается только на локальном NTFS в Windows'
             )
-        record = ctx.registry.track(path)
         if record.identity is None:
             raise OSError('исходная физическая идентичность файла неизвестна')
         if identity != record.identity:
@@ -218,25 +219,37 @@ def safe_rename(
     if str(old_path.absolute()) == str(new_path.absolute()):
         return 'unchanged', old_path
     try:
-        try:
-            os.lstat(new_path)
-        except FileNotFoundError:
+        registry = ctx.registry
+        record = registry.track(old_path)
+        owner = registry.id_for(new_path) if ctx.dry_run else None
+        vacated = ctx.dry_run and registry.source_vacated(new_path)
+        physical = registry.physical_path(record)
+        case_change = old_path.name.casefold() == new_path.name.casefold()
+        if owner is not None and owner != record.id:
+            occupied = True
+            case_change = False
+        elif owner == record.id and new_path.absolute() != physical.absolute():
+            occupied = True
+        elif vacated:
             occupied = False
         else:
-            occupied = True
-        case_change = old_path.name.casefold() == new_path.name.casefold()
-        if case_change and occupied:
             try:
-                target_info = entry_info(new_path.absolute())
-            except OSError:
-                case_change = False
+                os.lstat(new_path)
+            except FileNotFoundError:
+                occupied = False
             else:
-                case_change = (
-                    stat.S_ISREG(target_info.st_mode)
-                    and target_info.st_nlink == 1
-                    and (target_info.st_dev, target_info.st_ino)
-                    == ctx.registry.track(old_path).identity
-                )
+                occupied = True
+            if case_change and occupied:
+                try:
+                    target_info = entry_info(new_path.absolute())
+                except OSError:
+                    case_change = False
+                else:
+                    case_change = (
+                        stat.S_ISREG(target_info.st_mode)
+                        and target_info.st_nlink == 1
+                        and (target_info.st_dev, target_info.st_ino) == record.identity
+                    )
         if occupied and not case_change:
             ctx.block_path(old_path, 'конфликт целевого имени; оба файла сохранены')
             interactor.display(

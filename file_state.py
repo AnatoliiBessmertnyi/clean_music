@@ -86,6 +86,7 @@ class FileRecord:
     path: Path
     present: bool
     identity: FileIdentity | None = None
+    modeled_content: bool = False
 
 
 class FileRegistry:
@@ -96,6 +97,7 @@ class FileRegistry:
         self._ids_by_path: dict[Path, int] = {}
         self._previous_ids: dict[Path, int] = {}
         self._model_sources: dict[int, Path] = {}
+        self._vacated_sources: set[Path] = set()
 
     @staticmethod
     def _path_key(path: Path) -> Path:
@@ -135,6 +137,14 @@ class FileRegistry:
     def physical_path(self, record: FileRecord) -> Path:
         return self._model_sources.get(record.id, record.path)
 
+    def source_vacated(self, path: Path) -> bool:
+        """Путь физического источника, освобождённый модельной операцией."""
+        return self._path_key(path) in self._vacated_sources
+
+    def mark_content_modeled(self, file_id: int) -> None:
+        record, key = self._records[file_id]
+        self._records[file_id] = (replace(record, modeled_content=True), key)
+
     def path_of(self, file_id: int) -> Path:
         """Возвращает последний известный путь или вызывает KeyError для неизвестного id."""
         return self._records[file_id][0].path
@@ -157,7 +167,9 @@ class FileRegistry:
             del self._ids_by_path[old_key]
             self._previous_ids[old_key] = file_id
         if simulated:
-            self._model_sources.setdefault(file_id, record.path)
+            source = self._model_sources.setdefault(file_id, record.path)
+            if new_key != self._path_key(source):
+                self._vacated_sources.add(self._path_key(source))
         else:
             self._model_sources.pop(file_id, None)
         self._records[file_id] = (updated, new_key)
@@ -166,10 +178,12 @@ class FileRegistry:
         record, key = self._records[file_id]
         self._records[file_id] = (replace(record, identity=identity), key)
 
-    def mark_missing(self, file_id: int) -> None:
+    def mark_missing(self, file_id: int, *, simulated: bool = False) -> None:
         """Идемпотентно освобождает ключ пути (KeyError для неизвестного id)."""
         record, key = self._records[file_id]
         if record.present:
+            if simulated:
+                self._vacated_sources.add(self._path_key(self.physical_path(record)))
             self._records[file_id] = (replace(record, present=False), key)
             del self._ids_by_path[key]
             self._previous_ids[key] = file_id

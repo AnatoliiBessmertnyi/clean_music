@@ -1,6 +1,8 @@
 """Выбор режима через обычную консольную точку входа."""
 
+import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from unittest.mock import Mock
@@ -10,6 +12,9 @@ from mutagen.id3 import ID3, TALB
 
 import main as cli
 from audio_verification import audio_signature, find_ffprobe
+from context import SessionContext
+from interactor import UserInteractor
+from pipeline import AudioProcessingPipeline
 from recovery_store import DIRECTORY_NAME
 from tag_repository import AudioTags, TagRepository
 from tests.test_tag_publication import synthetic_audio, windows
@@ -199,3 +204,138 @@ def test_safe_dry_run_keeps_collection_and_settings(
     assert source.read_bytes() == original
     assert list(path.parent.iterdir()) == [path]
     assert path.read_bytes() == settings_before
+
+
+@windows
+def test_safe_plan_matches_successful_cli_run(
+    tmp_path: Path,
+    cli_prompts: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dry_root, real_root = tmp_path / 'plan', tmp_path / 'apply'
+    dry_root.mkdir()
+    synthetic_audio(dry_root / 'Artist – Song.mp3', artist='', title='')
+    synthetic_audio(
+        dry_root / 'Artist - Song.flac', codec='flac', artist='Artist', title='Song'
+    )
+    synthetic_audio(dry_root / 'Other – Clash.mp3', artist='Other', title='Clash')
+    shutil.copyfile(dry_root / 'Other – Clash.mp3', dry_root / 'Other - Clash.mp3')
+    shutil.copytree(dry_root, real_root)
+    path = settings_path()
+    save_mode(path, 'deep')
+
+    def snapshot(root: Path) -> dict[Path, bytes | None]:
+        return {
+            p.relative_to(root): None if p.is_dir() else p.read_bytes()
+            for p in root.rglob('*')
+        }
+
+    before = snapshot(dry_root)
+    assert before == snapshot(real_root)
+    settings_before = snapshot(path.parent)
+    plan_tags: dict[str, AudioTags | None] = {}
+    run_pipeline = AudioProcessingPipeline.run
+
+    def inspect_plan(
+        self: AudioProcessingPipeline,
+        initial_files: list[Path],
+        ctx: SessionContext,
+        repo: TagRepository,
+        interactor: UserInteractor,
+    ) -> list[Path]:
+        files = run_pipeline(self, initial_files, ctx, repo, interactor)
+        if ctx.dry_run:
+            plan_tags.update((p.name, repo.get_tags(p).tags) for p in files)
+            assert not any(ctx.stats.values())
+            assert ctx.planned_stats['dash_normalized'] == 1
+            assert ctx.planned_stats['tags_written'] == 1
+        return files
+
+    monkeypatch.setattr(AudioProcessingPipeline, 'run', inspect_plan)
+    logs = tmp_path / 'logs'
+
+    def run(root: Path, *, dry_run: bool) -> list[dict[str, str | bool]]:
+        cli_prompts.reset_mock()
+        cli_prompts.side_effect = ['safe', str(root), 'y', 'y', 'y']
+        args = ['main.py', '--dry-run'] if dry_run else ['main.py']
+        monkeypatch.setattr(sys, 'argv', args)
+        existing = set(logs.glob('run-*.log'))
+        cli.main()
+        [report] = set(logs.glob('run-*.log')) - existing
+        output = capsys.readouterr().out
+        assert str(report) in output
+        assert "('artist', 'song')" in output
+        assert ('Будущие размер и байты неизвестны' in output) == dry_run
+        return [
+            json.loads(line)
+            for line in report.read_text(encoding='utf-8').splitlines()
+            if line.startswith('{')
+        ]
+
+    planned = run(dry_root, dry_run=True)
+    plan_prompts = cli_prompts.call_args_list.copy()
+    assert snapshot(dry_root) == before
+    assert snapshot(path.parent) == settings_before
+    assert not (dry_root / DIRECTORY_NAME).exists()
+    confirmed = run(real_root, dry_run=False)
+    assert cli_prompts.call_args_list == plan_prompts
+    assert not list((real_root / DIRECTORY_NAME).glob('*.json'))
+
+    def operations(
+        records: list[dict[str, str | bool]], *, dry_run: bool
+    ) -> list[tuple[object, ...]]:
+        entries: list[tuple[object, ...]] = []
+        for op in records:
+            if op['type'] != 'ОПЕРАЦИЯ' or op['kind'] not in (
+                'rename',
+                'tags',
+                'block',
+            ):
+                continue
+            assert op['proposed'] == dry_run
+            result = op['result']
+            changed = result in ('ПРЕДЛОЖЕНИЕ', 'успех')
+            entries.append(
+                (
+                    op['stage'],
+                    op['kind'],
+                    Path(str(op['path'])).name,
+                    Path(str(op['target'])).name if op['target'] else None,
+                    'изменение' if changed else result,
+                    None if changed else op['reason'],
+                    op['artist'],
+                    op['title'],
+                )
+            )
+        return entries
+
+    plan_operations = operations(planned, dry_run=True)
+    assert plan_operations == operations(confirmed, dry_run=False)
+    assert [op[1] for op in plan_operations if op[4] == 'изменение'] == [
+        'rename',
+        'tags',
+    ]
+    assert any(op[4] == 'конфликт' for op in plan_operations)
+    assert {record['status'] for record in planned if record['type'] == 'ФАЙЛ'} == {
+        'не изменён'
+    }
+    assert {record['status'] for record in confirmed if record['type'] == 'ФАЙЛ'} == {
+        'не изменён',
+        'переименован и изменено содержимое/теги',
+    }
+    repo = TagRepository()
+    assert (
+        plan_tags
+        == {
+            p.name: repo.read_tags_uncached(p).tags
+            for p in real_root.iterdir()
+            if p.is_file()
+        }
+        == {
+            'Artist - Song.mp3': AudioTags('Artist', 'Song'),
+            'Artist - Song.flac': AudioTags('Artist', 'Song'),
+            'Other – Clash.mp3': AudioTags('Other', 'Clash'),
+            'Other - Clash.mp3': AudioTags('Other', 'Clash'),
+        }
+    )

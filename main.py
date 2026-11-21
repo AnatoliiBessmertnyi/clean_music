@@ -180,22 +180,24 @@ def _process(
 
     # 4. Финальная статистика
     interactor.display('\n' + '=' * 60)
-    interactor.display('=== Счётчики конвейера (не итоговая сверка диска) ===')
+    label = 'Запланированные изменения' if ctx.dry_run else 'Подтверждённые изменения'
+    interactor.display(f'=== {label} по счётчикам конвейера ===')
+    counts = ctx.planned_stats if ctx.dry_run else ctx.stats
     interactor.display('=' * 60)
-    interactor.display(f'Очистка от мусора (имена): {ctx.get_stat("junk_removed")}')
-    interactor.display(f'Очистка от мусора (теги): {ctx.get_stat("tags_cleaned")}')
+    interactor.display(f'Очистка от мусора (имена): {counts.get("junk_removed", 0)}')
+    interactor.display(f'Очистка от мусора (теги): {counts.get("tags_cleaned", 0)}')
     interactor.display(
-        f'Нормализация тире и пробелов: {ctx.get_stat("dash_normalized")}'
+        f'Нормализация тире и пробелов: {counts.get("dash_normalized", 0)}'
     )
-    interactor.display(f'Удалено дубликатов: {ctx.get_stat("duplicates_removed")}')
-    interactor.display(f'Переименовано по тегам: {ctx.get_stat("renamed_by_tags")}')
-    interactor.display(f'Записано тегов: {ctx.get_stat("tags_written")}')
+    interactor.display(f'Удалено дубликатов: {counts.get("duplicates_removed", 0)}')
+    interactor.display(f'Переименовано по тегам: {counts.get("renamed_by_tags", 0)}')
+    interactor.display(f'Записано тегов: {counts.get("tags_written", 0)}')
     interactor.display(
         f'Нормализовано исполнителей: '
-        f'{ctx.get_stat("artists_normalized")} файлов '
-        f'({ctx.get_stat("artists_normalized_unique")} уникальных)'
+        f'{counts.get("artists_normalized", 0)} файлов '
+        f'({counts.get("artists_normalized_unique", 0)} уникальных)'
     )
-    interactor.display(f'Ручной ввод: {ctx.get_stat("manual_input")}')
+    interactor.display(f'Ручной ввод: {counts.get("manual_input", 0)}')
 
     still_missing: list[Path] = getattr(ctx, '_still_missing', [])
     if still_missing:
