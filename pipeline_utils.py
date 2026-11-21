@@ -9,8 +9,8 @@ from pathlib import Path
 
 from config import FEAT_VARIANTS_PATTERN, INVALID_FILENAME_CHARS, LEADING_TRACK_PATTERN
 from context import SessionContext
+from duplicate_analysis import Candidate, compare_candidates, find_candidate_groups
 from interactor import UserInteractor, prompt_command
-from naming import normalize_filename_stem, normalize_unicode
 from parsing import parse_artist_title
 from report_events import log_operation
 from tag_repository import TagRepository
@@ -535,33 +535,38 @@ def clean_filename_safely(
 
 
 def find_duplicates(files: list[Path], repo: TagRepository) -> list[list[Path]]:
-    """Находит дубликаты файлов по тегам и нормализованным именам."""
-    tag_map: dict[tuple[str, str, str], list[Path]] = {}
-    for f in files:
-        metadata = repo.get_tags(f)
-        if metadata.tags is None:
-            continue
-        tags = metadata.complete_tags
-        normalized_name = normalize_filename_stem(f.stem).lower()
-
-        if tags:
-            artist_norm = normalize_unicode(tags.artist).lower().strip()
-            title_norm = normalize_unicode(tags.title).lower().strip()
-            key = (artist_norm, title_norm, 'tags')
-        else:
-            name_norm = normalize_unicode(normalized_name)
-            key = (name_norm, '', 'name')
-
-        if key not in tag_map:
-            tag_map[key] = []
-        tag_map[key].append(f)
-
-    return [group for group in tag_map.values() if len(group) > 1]
+    """Возвращает пути кандидатов для вызывающих мест, которым нужны только группы."""
+    return [
+        [candidate.path for candidate in group.candidates]
+        for group in find_candidate_groups(files, repo)
+    ]
 
 
 def get_best_name_from_group(group: list[Path]) -> Path:
     """Выбирает файл с наиболее правильным именем из группы дубликатов."""
     return max(group, key=name_quality_score)
+
+
+def _display_candidate(candidate: Candidate, interactor: UserInteractor) -> None:
+    metadata = candidate.metadata
+    status = metadata.status.name
+    if metadata.error:
+        status += f' ({metadata.error})'
+    interactor.display(f'    {candidate.path} — теги {status}')
+    known = ', '.join(
+        f'{field}={value!r}'
+        for field, value in candidate.values().items()
+        if value is not None
+    )
+    interactor.display(f'      {known}')
+    for source, qualifiers in (
+        ('имя', candidate.name_qualifiers),
+        ('тег названия', candidate.tag_qualifiers),
+    ):
+        if qualifiers:
+            interactor.display(f'      Уточнения ({source}): {", ".join(qualifiers)}')
+    if candidate.qualifier_disagreement:
+        interactor.display('      Уточнения в имени и теге расходятся.')
 
 
 def process_duplicates(
@@ -570,13 +575,29 @@ def process_duplicates(
     repo: TagRepository,
     interactor: UserInteractor,
 ) -> list[Path]:
-    """Только показывает кандидатов; совпадение не разрешает объединение."""
-    duplicates = find_duplicates(files, repo)
+    """Показывает основания поиска и результаты сравнения кандидатов."""
+    duplicates = find_candidate_groups(files, repo)
     interactor.display(f'  Групп кандидатов в дубликаты: {len(duplicates)}')
     for i, group in enumerate(duplicates, 1):
-        interactor.display(f'  Группа {i}:')
-        for path in group:
-            interactor.display(f'    {path.name}')
+        interactor.display(f'  Группа {i}: {group.source} {group.key!r}')
+        for number, candidate in enumerate(group.candidates, 1):
+            interactor.display(f'    Файл {number}')
+            _display_candidate(candidate, interactor)
+        numbers = {
+            candidate.path: number
+            for number, candidate in enumerate(group.candidates, 1)
+        }
+        for pair in compare_candidates(group, ctx.registry):
+            left, right = numbers[pair.left.path], numbers[pair.right.path]
+            interactor.display(f'    Файлы {left} и {right}: {pair.byte_status}.')
+            if pair.byte_error:
+                interactor.display(f'      Ошибка чтения: {pair.byte_error}')
+            if pair.differences:
+                interactor.display(f'      Различия: {", ".join(pair.differences)}')
+            if pair.missing:
+                interactor.display(
+                    f'      Недостаточно данных: {", ".join(pair.missing)}'
+                )
     if duplicates:
         interactor.display('  Объединение отключено; все файлы сохранены.')
     return files
