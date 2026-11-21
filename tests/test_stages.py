@@ -463,6 +463,53 @@ def test_duplicate_stage_preserves_files_and_cache(
     assert 'нормализованные исполнитель и название из тегов' in output
     assert 'Байты различаются. Совпадение музыкальной записи не установлено' in output
     assert 'Недостаточно данных: формат, кодек' in output
+    assert 'полное совпадение байтов не подтверждено' in output
+
+
+@pytest.mark.parametrize(
+    ('suffix', 'explanation'),
+    [
+        (' (1)', 'Результат анализа: сохранить файл 1, файл 2 — лишняя копия'),
+        (' (Live)', 'Выбор копии пропущен: имена или исходные теги'),
+    ],
+)
+def test_duplicate_stage_explains_equal_bytes(
+    tmp_path: Path, suffix: str, explanation: str
+) -> None:
+    original = write_mp3(tmp_path / 'Artist - Song.mp3', artist='Artist', title='Song')
+    copy = tmp_path / f'Artist - Song{suffix}.mp3'
+    content = original.read_bytes()
+    copy.write_bytes(content)
+    files = [original, copy]
+    ctx, repo, ui = SessionContext(False, False), TagRepository(), Interactor()
+    assert stages.DuplicateResolutionStage().execute(files, ctx, repo, ui) == files
+    output = '\n'.join(ui.messages)
+    assert 'Побайтовое совпадение подтверждено' in output
+    assert explanation in output
+    assert [path.read_bytes() for path in files] == [content, content]
+    assert not ui.prompts
+
+
+@pytest.mark.usefixtures('model_platform_guard')
+def test_duplicate_stage_after_virtual_tag_write(tmp_path: Path) -> None:
+    original = tmp_path / 'Artist - Song.mp3'
+    copy = tmp_path / 'Artist - Song (1).mp3'
+    files = [original, copy]
+    for path in files:
+        path.write_bytes(b'identical')
+    ctx, repo, ui = SessionContext(True, False), MemoryRepository(), Interactor('y')
+    admit(ctx, original, copy)
+    # У файла с заполненными тегами виртуальная запись не требуется.
+    repo.simulate_update_tags(copy, 'Artist', 'Song')
+    assert stages.TagWritingStage().execute(files, ctx, repo, ui) == files
+    assert ctx.registry.track(original).modeled_content
+    assert stages.DuplicateResolutionStage().execute(files, ctx, repo, ui) == files
+    output = '\n'.join(ui.messages)
+    assert 'Будущие размер и байты неизвестны' in output
+    assert 'полное совпадение байтов не подтверждено' in output
+    assert 'Побайтовое совпадение подтверждено' not in output
+    assert 'Результат анализа: сохранить' not in output
+    assert [path.read_bytes() for path in files] == [b'identical', b'identical']
 
 
 @windows
