@@ -134,7 +134,7 @@ def test_uncached_tags_bypass_pipeline_simulation(tmp_path: Path) -> None:
     assert snapshot_file(path, repo).tags == AudioTags('Исполнитель', 'Название')
 
 
-def test_partial_tags_are_visible_without_changing_pipeline_contract(
+def test_partial_tags_are_visible_in_pipeline_and_report(
     tmp_path: Path,
 ) -> None:
     path = make_audio(tmp_path / 'track.mp3')
@@ -142,8 +142,8 @@ def test_partial_tags_are_visible_without_changing_pipeline_contract(
     tags.delall('TIT2')
     tags.save(path)
     repo = TagRepository()
-    assert repo.get_tags(path) is None
-    assert repo.read_tags_uncached(path) == AudioTags('Исполнитель', '')
+    assert repo.get_tags(path).tags == AudioTags('Исполнитель', '')
+    assert repo.read_tags_uncached(path).tags == AudioTags('Исполнитель', '')
 
 
 def test_report_serializes_asf_attribute_values(
@@ -159,7 +159,8 @@ def test_report_serializes_asf_attribute_values(
                 tags={
                     'Author': [ASFUnicodeAttribute('Исполнитель')],
                     'Title': [ASFUnicodeAttribute('Название')],
-                }
+                },
+                info=None,
             )
         ),
     )

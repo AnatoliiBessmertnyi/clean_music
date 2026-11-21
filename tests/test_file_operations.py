@@ -84,7 +84,10 @@ def test_registered_missing_source_cannot_start_simulation(tmp_path: Path) -> No
 
     assert result.status is OperationStatus.ERROR
     assert ctx.registry.path_of(record.id) == old
-    assert repo.get_tags(old) == tags and repo.get_tags(new) is None
+    assert (
+        repo.get_tags(old).complete_tags == tags
+        and repo.get_tags(new).complete_tags is None
+    )
 
 
 @windows
@@ -119,7 +122,10 @@ def test_refused_model_step_preserves_path_and_cache(
     )
     assert ctx.get_block_reason(middle) == result.reason
     assert ctx.registry.path_of(record.id) == middle
-    assert repo.get_tags(middle) == tags and repo.get_tags(new) is None
+    assert (
+        repo.get_tags(middle).complete_tags == tags
+        and repo.get_tags(new).complete_tags is None
+    )
     assert old.read_bytes() == b'original' and not middle.exists()
 
 
@@ -211,12 +217,12 @@ def test_dry_run_case_change_preserves_identity() -> None:
 
 
 @windows
-def test_default_executor_moves_file_and_tag_cache(tmp_path: Path) -> None:
+def test_default_executor_reads_tags_from_renamed_file(tmp_path: Path) -> None:
     old, new = tmp_path / 'old.mp3', tmp_path / 'new.mp3'
     old.write_bytes(b'audio')
     ctx, repo, ui = SessionContext(False, False), MemoryRepository(), Interactor()
     source = ctx.registry.register(old)
-    repo.simulate_update_tags(old, 'artist', 'title')
+    assert repo.update_tags(old, 'artist', 'title')
 
     result = FileExecutor().rename(old, new, ctx, repo, ui)
 
@@ -226,8 +232,8 @@ def test_default_executor_moves_file_and_tag_cache(tmp_path: Path) -> None:
     assert not old.exists()
     assert ctx.registry.id_for(new) == source.id
     assert ctx.registry.id_for(old) is None
-    assert repo.get_tags(new) == AudioTags('artist', 'title')
-    assert repo.get_tags(old) is None
+    assert repo.get_tags(new).complete_tags == AudioTags('artist', 'title')
+    assert repo.get_tags(old).complete_tags is None
 
 
 @windows

@@ -36,7 +36,7 @@ from pipeline_utils import (
     select_indices,
 )
 from strategies import StrategyFactory
-from tag_repository import TagRepository
+from tag_repository import MetadataRead, ReadStatus, TagRepository
 
 _file_executor = FileExecutor()
 
@@ -136,7 +136,7 @@ class JunkCleaningStage:
         """Очищает мусор из тегов исполнителя и названия."""
         candidates = []
         for f in files:
-            tags = repo.get_tags(f)
+            tags = repo.get_tags(f).complete_tags
             if not tags:
                 continue
 
@@ -262,7 +262,7 @@ class TagRenamingStage:
     ) -> list[Path]:
         feat_candidates: list[tuple[Path, str, str, str, str, str]] = []
         for f in files:
-            tags = repo.get_tags(f)
+            tags = repo.get_tags(f).complete_tags
             if not tags:
                 continue
 
@@ -331,7 +331,7 @@ class TagRenamingStage:
     ) -> list[Path]:
         sep_candidates: list[tuple[Path, str, str, str]] = []
         for f in files:
-            tags = repo.get_tags(f)
+            tags = repo.get_tags(f).complete_tags
             if not tags:
                 continue
             artist, title = str(tags.artist), str(tags.title)
@@ -412,7 +412,8 @@ class TagRenamingStage:
 
         for position, f in enumerate(files):
             file_title = extract_title_from_filename(f.stem)
-            tags = repo.get_tags(f)
+            metadata = repo.get_tags(f)
+            tags = metadata.complete_tags
             ctx.log_debug(
                 f'Анализ: {f.name}, теги: {tags}, извлечённое название: {file_title!r}'
             )
@@ -485,7 +486,7 @@ class TagRenamingStage:
                     safe_candidates.append((position, f, new_name))
                 else:
                     mismatch_candidates.append((f, file_title, new_name))
-            else:
+            elif metadata.status is ReadStatus.EMPTY:
                 missing.append(f)
 
         resulting_files = files.copy()
@@ -552,7 +553,7 @@ class TagRenamingStage:
             if current is None:
                 continue
             f = current
-            tags = repo.get_tags(f)
+            tags = repo.get_tags(f).complete_tags
             if not tags:
                 continue
 
@@ -600,7 +601,7 @@ class TagRenamingStage:
         }
 
         for f, file_title, new_name in active_mismatch:
-            tags = repo.get_tags(f)
+            tags = repo.get_tags(f).complete_tags
             if not tags:
                 continue
             tag_artist, tag_title = tags.artist, tags.title
@@ -801,7 +802,7 @@ class TagRenamingStage:
         problems: dict[str, list[tuple[Path, str, str]]] = {}
 
         for f in files:
-            tags = repo.get_tags(f)
+            tags = repo.get_tags(f).complete_tags
             if not tags:
                 continue
 
@@ -986,25 +987,30 @@ class TagWritingStage:
     ) -> list[Path]:
         file_ids = ctx.file_ids(files)
         files = ctx.present_paths(file_ids)
-        tags_to_write: list[tuple[Path, str, str]] = []
+        tags_to_write: list[tuple[Path, MetadataRead, str, str]] = []
 
         for f in files:
             parsed = parse_artist_title(f.stem)
-            if parsed:
-                tags = repo.get_tags(f)
-                if not tags:
-                    artist, title = parsed
-                    artist = remove_junk(artist)
-                    title = remove_junk(title)
-                    artist, title = normalize_feat_pair(artist, title)
-                    artist = remove_feat_guests_from_artist(artist, title)
-                    tags_to_write.append((f, artist, title))
+            if not parsed:
+                continue
+            metadata = repo.get_tags(f)
+            tags = metadata.tags
+            if tags is None or metadata.status is ReadStatus.COMPLETE:
+                continue
+            artist, title = parsed
+            artist = remove_junk(artist)
+            title = remove_junk(title)
+            artist, title = normalize_feat_pair(artist, title)
+            artist = remove_feat_guests_from_artist(artist, tags.title or title)
+            tags_to_write.append(
+                (f, metadata, tags.artist or artist, tags.title or title)
+            )
 
         if not tags_to_write:
             return files
 
         labels: list[str] = []
-        for f, artist, title in tags_to_write:
+        for f, _, artist, title in tags_to_write:
             new_filename = build_safe_filename(artist, title, f.suffix)
             if new_filename != f.name:
                 labels.append(
@@ -1015,7 +1021,7 @@ class TagWritingStage:
 
         selected_indices = select_indices(
             labels,
-            f'Найдено {len(tags_to_write)} файлов с корректным именем, но без тегов. Записать теги?',
+            f'Найдено {len(tags_to_write)} файлов с корректным именем и незаполненными тегами. Записать теги?',
             interactor,
         )
 
@@ -1023,7 +1029,9 @@ class TagWritingStage:
         renamed_count = 0
 
         for i in selected_indices:
-            f, artist, title = tags_to_write[i]
+            f, metadata, artist, title = tags_to_write[i]
+            if repo.get_tags(f) != metadata:
+                continue
 
             result = _file_executor.write_tags(f, artist, title, ctx, repo, interactor)
             if not (result.is_confirmed_change or result.is_model_change):
@@ -1140,7 +1148,7 @@ class ArtistNormalizationStage:
                 if file_id in processed_files or individual_artist == canonical:
                     continue
                 f = ctx.present_path(file_id)
-                if f is None or (tags := repo.get_tags(f)) is None:
+                if f is None or (tags := repo.get_tags(f).complete_tags) is None:
                     continue
 
                 new_full_artist = re.sub(
@@ -1211,7 +1219,9 @@ class ManualInputStage:
             if file_id in present_ids
         ]
         actually_missing = [
-            f for f in ctx.present_paths(missing_ids) if repo.get_tags(f) is None
+            f
+            for f in ctx.present_paths(missing_ids)
+            if repo.get_tags(f).status is ReadStatus.EMPTY
         ]
         ctx.missing_files = actually_missing
         ctx.log_debug(
@@ -1232,6 +1242,8 @@ class ManualInputStage:
 
         for i in selected_indices:
             f = actually_missing[i]
+            if repo.get_tags(f).status is not ReadStatus.EMPTY:
+                continue
             record = ctx.registry.track(f)
             physical = ctx.registry.physical_path(record) if ctx.dry_run else f
             checked_path = f if ctx.is_path_blocked(f) else physical

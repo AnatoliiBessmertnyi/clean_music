@@ -7,12 +7,6 @@ import stat
 import sys
 from pathlib import Path
 
-from mutagen.asf import ASF
-from mutagen.flac import FLAC
-from mutagen.mp3 import MP3
-from mutagen.mp4 import MP4
-from mutagen.oggvorbis import OggVorbis
-
 from config import FEAT_VARIANTS_PATTERN, INVALID_FILENAME_CHARS, LEADING_TRACK_PATTERN
 from context import SessionContext
 from interactor import UserInteractor, prompt_command
@@ -162,7 +156,6 @@ def simulate_rename(
     interactor.display(
         f'  [DRY RUN] Переименовал бы: {old_path.name} → {new_path.name}'
     )
-    repo.get_tags(old_path)
     repo.simulate_rename(old_path, new_path)
     log_operation(
         'rename',
@@ -290,7 +283,8 @@ def safe_rename(
         return 'failed', None
     if ctx.report is not None:
         ctx.report.record_rename(old_path, new_path)
-    repo.simulate_rename(old_path, new_path)
+    repo.invalidate(old_path)
+    repo.invalidate(new_path)
     return 'renamed', new_path
 
 
@@ -313,21 +307,8 @@ def handle_rename_result(
 
 def get_audio_duration(filepath: Path) -> float | None:
     """Возвращает длительность аудиофайла в секундах или None."""
-    ext = filepath.suffix.lower()
-    try:
-        if ext == '.mp3':
-            return float(MP3(filepath).info.length)  # type: ignore[attr-defined]
-        if ext in ('.m4a', '.mp4'):
-            return float(MP4(filepath).info.length)  # type: ignore[attr-defined]
-        if ext == '.flac':
-            return float(FLAC(filepath).info.length)  # type: ignore[union-attr]
-        if ext == '.ogg':
-            return float(OggVorbis(filepath).info.length)  # type: ignore[attr-defined]
-        if ext == '.wma':
-            return float(ASF(filepath).info.length)  # type: ignore[attr-defined]
-    except Exception:
-        pass
-    return None
+    info = TagRepository().read_tags_uncached(filepath).info
+    return info.duration if info is not None else None
 
 
 def format_duration(seconds: float) -> str:
@@ -557,7 +538,10 @@ def find_duplicates(files: list[Path], repo: TagRepository) -> list[list[Path]]:
     """Находит дубликаты файлов по тегам и нормализованным именам."""
     tag_map: dict[tuple[str, str, str], list[Path]] = {}
     for f in files:
-        tags = repo.get_tags(f)
+        metadata = repo.get_tags(f)
+        if metadata.tags is None:
+            continue
+        tags = metadata.complete_tags
         normalized_name = normalize_filename_stem(f.stem).lower()
 
         if tags:
@@ -604,7 +588,7 @@ def find_artist_variations(
     """Находит разные варианты написания одного исполнителя."""
     artist_map: dict[str, list[tuple[Path, str, str]]] = {}
     for f in files:
-        tags = repo.get_tags(f)
+        tags = repo.get_tags(f).complete_tags
         if tags:
             full_artist = tags.artist.strip()
             individual_artists = [

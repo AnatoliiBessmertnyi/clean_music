@@ -14,8 +14,9 @@ from file_state import OperationStatus
 from interactor import ConsoleInteractor, UserInteractor
 from pipeline import AudioProcessingPipeline
 from pipeline_utils import simulate_rename
-from tag_repository import AudioTags, TagRepository
+from tag_repository import AudioTags, ReadStatus, TagRepository
 from tests.test_pipeline_utils import Interactor, MemoryRepository, windows
+from tests.test_tag_repository import write_mp3
 
 
 @pytest.fixture
@@ -54,7 +55,54 @@ def test_tag_writing_preserves_annotations(
     source.touch()
     ctx, repo, ui = SessionContext(True, False), MemoryRepository(), Interactor('y')
     [current] = stages.TagWritingStage().execute([source], ctx, repo, ui)
-    assert repo.get_tags(current) == AudioTags('Исполнитель', title)
+    assert repo.get_tags(current).complete_tags == AudioTags('Исполнитель', title)
+
+
+@pytest.mark.parametrize('denied', [False, True])
+def test_tag_writing_skips_unreadable_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, denied: bool
+) -> None:
+    source = tmp_path / 'Filename Artist - Filename Title.mp3'
+    source.write_bytes(b'corrupt')
+    if denied:
+        monkeypatch.setattr(
+            'tag_repository.MP3', Mock(side_effect=PermissionError('denied'))
+        )
+    repo = TagRepository()
+    write = Mock()
+    monkeypatch.setattr(repo, 'apply_tags', write)
+    ui = Interactor()
+    ctx = SessionContext(False, False)
+    assert stages.TagWritingStage().execute([source], ctx, repo, ui) == [source]
+    assert not write.called and not ui.prompts
+    assert source.read_bytes() == b'corrupt'
+
+
+@pytest.mark.usefixtures('model_platform_guard')
+@pytest.mark.parametrize('dry_run', [True, pytest.param(False, marks=windows)])
+@pytest.mark.parametrize(
+    ('artist', 'title', 'expected'),
+    [
+        ('AC/DC', '', AudioTags('AC/DC', 'Filename Title')),
+        ('', 'Original / Title', AudioTags('Filename Artist', 'Original / Title')),
+    ],
+)
+def test_tag_writing_fills_only_missing_field(
+    tmp_path: Path, dry_run: bool, artist: str, title: str, expected: AudioTags
+) -> None:
+    source = write_mp3(
+        tmp_path / 'Filename Artist - Filename Title.mp3', artist=artist, title=title
+    )
+    repo = TagRepository()
+    before = source.read_bytes()
+    ctx = SessionContext(dry_run, False)
+    [result] = stages.TagWritingStage().execute([source], ctx, repo, Interactor())
+    assert repo.get_tags(result).tags == expected
+    if dry_run:
+        assert not result.exists() and source.read_bytes() == before
+        assert repo.read_tags_uncached(source).tags == AudioTags(artist, title)
+    else:
+        assert repo.read_tags_uncached(result).tags == expected
 
 
 @pytest.mark.usefixtures('model_platform_guard')
@@ -66,9 +114,10 @@ def test_tag_renaming_preserves_metadata_on_second_pass(
     source = tmp_path / 'Песня.mp3'
     source.touch()
     ctx, repo, ui = SessionContext(dry_run, False), MemoryRepository(), Interactor()
-    repo.simulate_update_tags(
+    assert repo.update_tags(
         source, f'{artist} featuring Ирина', 'Песня (Live) [A/B Remix]'
     )
+    repo.writes.clear()
     expected = AudioTags(artist, 'Песня (Live) [A/B Remix] (feat. Ирина)')
     target = (
         tmp_path
@@ -77,9 +126,9 @@ def test_tag_renaming_preserves_metadata_on_second_pass(
     stage = stages.TagRenamingStage()
 
     assert stage.execute([source], ctx, repo, ui) == [target]
-    assert repo.get_tags(target) == expected
+    assert repo.get_tags(target).complete_tags == expected
     assert stage.execute([target], ctx, repo, ui) == [target]
-    assert repo.get_tags(target) == expected
+    assert repo.get_tags(target).complete_tags == expected
     assert source.exists() == dry_run
     assert target.exists() != dry_run
     assert len(repo.writes) == int(not dry_run)
@@ -133,7 +182,7 @@ def test_mismatch_write_retains_artist_sanitized_in_filename(
 
     stage = stages.TagRenamingStage()
     assert stage.execute([source], ctx, repo, ui) == [source]
-    assert repo.get_tags(source) == AudioTags('AC/DC', 'Correct title')
+    assert repo.get_tags(source).complete_tags == AudioTags('AC/DC', 'Correct title')
 
 
 @pytest.mark.usefixtures('model_platform_guard')
@@ -144,7 +193,9 @@ def test_encoding_repair_preserves_title_annotations(tmp_path: Path) -> None:
     repo.simulate_update_tags(source, 'ÐÐ', 'Песня (Live)')
 
     assert stages.TagRenamingStage().execute([source], ctx, repo, ui) == [source]
-    assert repo.get_tags(source) == AudioTags('Исполнитель', 'Песня (Live)')
+    assert repo.get_tags(source).complete_tags == AudioTags(
+        'Исполнитель', 'Песня (Live)'
+    )
 
 
 @windows
@@ -355,7 +406,7 @@ def test_duplicate_stage_preserves_files_and_cache(
         repo.simulate_update_tags(path, 'Artist', 'Title')
     assert stages.DuplicateResolutionStage().execute(files, ctx, repo, ui) == files
     assert [path.read_bytes() for path in files] == [b'A', b'BBBB']
-    assert all(repo.get_tags(path) is not None for path in files)
+    assert all(repo.get_tags(path).complete_tags is not None for path in files)
     assert not ctx.get_stat('duplicates_removed') and not ui.prompts
 
 
@@ -375,7 +426,7 @@ def test_tag_writing_before_failed_rename(
     assert rename.call_count == int(write_succeeds)
     assert ctx.get_stat('tags_written') == int(write_succeeds)
     assert ctx.get_stat('renamed_by_tags') == 0 and ctx.is_path_blocked(path)
-    assert repo.get_tags(path) == (
+    assert repo.get_tags(path).complete_tags == (
         AudioTags('Artist', 'Title') if write_succeeds else None
     )
     assert not path.with_name('Artist - Title.mp3').exists()
@@ -416,7 +467,7 @@ def test_late_stages_keep_input_order_and_identity_without_rescan(
         final
     ]
     assert ctx.registry.current_paths() == [neighbor, final]
-    assert repo.read_tags_uncached(final) == AudioTags('Artist', 'Title')
+    assert repo.read_tags_uncached(final).tags == AudioTags('Artist', 'Title')
     assert ctx.get_stat('tags_written') == ctx.get_stat('artists_normalized') == 1
     assert ctx.get_stat('renamed_by_tags') == 2
 
@@ -494,7 +545,7 @@ def test_modeled_tag_write_after_rename_uses_current_path(
     )
     assert ctx.registry.current_paths() == [current]
     assert ctx.registry.track(original).id == ctx.registry.id_for(current)
-    assert repo.get_tags(current) == AudioTags('Artist', 'Title')
+    assert repo.get_tags(current).complete_tags == AudioTags('Artist', 'Title')
     assert all(call.args[0] == original for call in guard.call_args_list)
     assert (
         not repo.writes
@@ -504,22 +555,25 @@ def test_modeled_tag_write_after_rename_uses_current_path(
 
 
 @pytest.mark.parametrize('uncertain', [False, True])
-def test_unconfirmed_tag_write_keeps_cache_and_blocks_dependent_rename(
+def test_unconfirmed_tag_write_blocks_dependent_rename(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, uncertain: bool
 ) -> None:
     source = tmp_path / 'Artist - Title (vksaver).mp3'
     source.write_bytes(b'original')
     ctx, repo, ui = SessionContext(False, False), TagRepository(), Interactor()
-    audio = Mock(tags={})
+    audio = Mock(tags={}, info=None)
     audio.save.side_effect = OSError('save failed')
-    mp3 = (
-        Mock(return_value=audio)
-        if uncertain
-        else Mock(side_effect=OSError('open failed'))
-    )
+    write_input = audio if uncertain else OSError('open failed')
+    empty_audio = Mock(tags={}, info=None)
+    parser_calls = [empty_audio, write_input]
+    if uncertain:
+        parser_calls.append(empty_audio)
+    parser_calls.append(write_input)
+    if uncertain:
+        parser_calls.append(empty_audio)
+    mp3 = Mock(side_effect=parser_calls)
     monkeypatch.setattr('tag_repository.MP3', mp3)
     monkeypatch.setattr('file_operations.modification_allowed', Mock(return_value=True))
-    monkeypatch.setattr(repo, '_read_from_disk', Mock(return_value=None))
     journal = Mock()
     monkeypatch.setattr('tag_repository.log_operation', journal)
     rename = Mock()
@@ -538,7 +592,10 @@ def test_unconfirmed_tag_write_keeps_cache_and_blocks_dependent_rename(
     )
     assert audio.save.call_count == 2 * int(uncertain)
     assert not rename.called and ctx.is_path_blocked(source)
-    assert repo.get_tags(source) is None and source.read_bytes() == b'original'
+    assert (
+        repo.get_tags(source).status is ReadStatus.EMPTY
+        and source.read_bytes() == b'original'
+    )
     assert ctx.get_stat('tags_written') == ctx.get_stat('renamed_by_tags') == 0
 
 
@@ -587,7 +644,7 @@ def test_tag_writing_rejects_hardlink(tmp_path: Path, dry_run: bool) -> None:
     alias.hardlink_to(path)
     repo, ctx = MemoryRepository(), SessionContext(dry_run, False)
     stages.TagWritingStage().execute([path], ctx, repo, Interactor())
-    assert not repo.writes and repo.get_tags(path) is None
+    assert not repo.writes and repo.get_tags(path).complete_tags is None
     assert ctx.is_path_blocked(path)
     assert path.read_bytes() == alias.read_bytes() == b'original'
 
@@ -605,7 +662,7 @@ def test_wsl_mounted_tag_write_refused(dry_run: bool) -> None:
         repo, ctx, ui = MemoryRepository(), SessionContext(dry_run, False), Interactor()
         stages.TagWritingStage().execute([path], ctx, repo, ui)
         assert ctx.is_path_blocked(path)
-        assert not repo.writes and repo.get_tags(path) is None
+        assert not repo.writes and repo.get_tags(path).complete_tags is None
         assert not ctx.get_stat('tags_written')
         assert 'Модификация на монтированных файловых системах WSL' in '\n'.join(
             ui.messages

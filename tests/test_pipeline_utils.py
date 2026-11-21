@@ -13,7 +13,7 @@ from context import SessionContext
 from file_state import OperationStatus
 from interactor import ConsoleInteractor
 from stages import process_rename_batch
-from tag_repository import AudioTags, TagRepository
+from tag_repository import AudioTags, MetadataRead, TagRepository
 
 
 class Interactor:
@@ -40,14 +40,30 @@ class MemoryRepository(TagRepository):
         super().__init__()
         self.writes: list[tuple[Path, str, str]] = []
         self.succeed = True
+        self._disk_tags: dict[tuple[int, int], AudioTags] = {}
 
-    def _read_from_disk(self, filepath: Path) -> AudioTags | None:
-        return None
+    def read_tags_uncached(self, filepath: Path) -> MetadataRead:
+        try:
+            stat = filepath.stat()
+        except OSError as exc:
+            return MetadataRead(None, error=str(exc))
+        return MetadataRead(
+            self._disk_tags.get((stat.st_dev, stat.st_ino), AudioTags('', ''))
+        )
 
     def _write_to_disk(
-        self, filepath: Path, artist: str, title: str
+        self, filepath: Path, artist: str | None, title: str | None
     ) -> tuple[OperationStatus, str]:
-        self.writes.append((filepath, artist, title))
+        before = self.get_tags(filepath).tags
+        assert before is not None
+        tags = AudioTags(
+            before.artist if artist is None else artist,
+            before.title if title is None else title,
+        )
+        self.writes.append((filepath, tags.artist, tags.title))
+        if self.succeed:
+            stat = filepath.stat()
+            self._disk_tags[(stat.st_dev, stat.st_ino)] = tags
         return (
             OperationStatus.SUCCESS if self.succeed else OperationStatus.ERROR
         ), 'test write'
@@ -156,8 +172,8 @@ def test_conflict_preserves_bytes(
     assert status == 'duplicate_exists'
     assert result == new
     assert old.read_bytes() == old_bytes and new.read_bytes() == new_bytes
-    assert repo.get_tags(old) == AudioTags('old', 'title')
-    assert repo.get_tags(new) == AudioTags('new', 'title')
+    assert repo.get_tags(old).complete_tags == AudioTags('old', 'title')
+    assert repo.get_tags(new).complete_tags == AudioTags('new', 'title')
     assert ctx.is_path_blocked(old) and not ctx.is_path_blocked(new)
     assert not ctx.get_stat('renamed_by_tags')
 
@@ -170,7 +186,7 @@ def test_real_windows_rename(tmp_path: Path, new_name: str) -> None:
     temporary = tmp_path / f'{new.stem}__temp__{new.suffix}'
     temporary.write_bytes(b'occupied temporary')
     ctx, repo, ui = SessionContext(False, False), MemoryRepository(), Interactor()
-    repo.simulate_update_tags(old, 'artist', 'title')
+    assert repo.update_tags(old, 'artist', 'title')
     status, result = utils.simple_rename(old, new, ctx, repo, ui)
     assert status == 'renamed', ui.messages
     assert result == new
@@ -179,7 +195,7 @@ def test_real_windows_rename(tmp_path: Path, new_name: str) -> None:
     assert 'Track.mp3' not in actual_names
     assert new.read_bytes() == b'audio bytes'
     assert temporary.read_bytes() == b'occupied temporary'
-    assert repo.get_tags(new) == AudioTags('artist', 'title')
+    assert repo.get_tags(new).complete_tags == AudioTags('artist', 'title')
 
 
 @windows
@@ -196,7 +212,7 @@ def test_failed_rename_blocks_without_success(
         utils.handle_rename_result(status, old, result, ctx, 'renamed_by_tags') is None
     )
     assert old.read_bytes() == b'original' and not new.exists()
-    assert repo.get_tags(old) == AudioTags('artist', 'title')
+    assert repo.get_tags(old).complete_tags == AudioTags('artist', 'title')
     assert ctx.is_path_blocked(old) and ctx.is_path_blocked(new)
     assert ctx.get_stat('renamed_by_tags') == 0
 
@@ -397,7 +413,10 @@ def test_candidates_are_information_only(
         repo.simulate_update_tags(path, 'artist', 'title')
     assert utils.process_duplicates(files, ctx, repo, ui) == files
     assert [path.read_bytes() for path in files] == [b'AAA', b'B']
-    assert all(repo.get_tags(path) == AudioTags('artist', 'title') for path in files)
+    assert all(
+        repo.get_tags(path).complete_tags == AudioTags('artist', 'title')
+        for path in files
+    )
     assert not ui.prompts and not ctx.get_stat('duplicates_removed')
     assert all(path.name in '\n'.join(ui.messages) for path in files)
 

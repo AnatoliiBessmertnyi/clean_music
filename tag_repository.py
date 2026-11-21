@@ -1,7 +1,9 @@
 """Репозиторий для работы с тегами аудиофайлов с кэшированием."""
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import Enum, auto
+from os import stat_result
 from pathlib import Path
 
 from mutagen import MutagenError
@@ -31,29 +33,87 @@ class AudioTags:
     title: str
 
 
-class TagRepository:
-    """Репозиторий для работы с тегами аудиофайлов.
+class ReadStatus(Enum):
+    COMPLETE = auto()
+    PARTIAL = auto()
+    EMPTY = auto()
+    ERROR = auto()
 
-    Кэширует прочитанные теги для избежания многократного чтения с диска.
-    Обновляет кэш при подтверждённой или моделируемой записи.
-    """
+
+@dataclass(frozen=True)
+class AudioInfo:
+    format: str
+    codec: str | None
+    duration: float | None
+    bitrate: int | None
+    sample_rate: int | None
+    channels: int | None
+    bits_per_sample: int | None
+
+
+@dataclass(frozen=True)
+class MetadataRead:
+    """Результат чтения. Пустые строки обозначают отсутствующие поля."""
+
+    tags: AudioTags | None
+    info: AudioInfo | None = None
+    error: str | None = None
+
+    @property
+    def status(self) -> ReadStatus:
+        if self.tags is None:
+            return ReadStatus.ERROR
+        if self.tags.artist and self.tags.title:
+            return ReadStatus.COMPLETE
+        if self.tags.artist or self.tags.title:
+            return ReadStatus.PARTIAL
+        return ReadStatus.EMPTY
+
+    @property
+    def complete_tags(self) -> AudioTags | None:
+        return self.tags if self.status is ReadStatus.COMPLETE else None
+
+
+def _positive[T: (int, float)](value: T | None) -> T | None:
+    return value if value is not None and value > 0 else None
+
+
+def _fingerprint(stat: stat_result) -> tuple[int, ...]:
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+class TagRepository:
+    """Читает метаданные и хранит модельные изменения dry-run."""
 
     def __init__(self) -> None:
-        self._cache: dict[Path, AudioTags | None] = {}
+        self._cache: dict[Path, tuple[tuple[int, ...] | None, MetadataRead]] = {}
+        self._model_sources: dict[Path, Path] = {}
 
-    def get_tags(self, filepath: Path) -> AudioTags | None:
-        """Возвращает теги файла, используя кэш при наличии.
-
-        Args:
-            filepath: Путь к аудиофайлу
-
-        Returns:
-            AudioTags с исполнителем и названием, или None если теги не найдены
-        """
+    def get_tags(self, filepath: Path) -> MetadataRead:
         key = filepath.absolute()
-        if key not in self._cache:
-            self._cache[key] = self._read_from_disk(filepath)
-        return self._cache[key]
+        source = self._model_sources.get(key, key)
+        try:
+            stamp = _fingerprint(source.stat())
+        except FileNotFoundError:
+            stamp = None
+        except OSError as exc:
+            self._cache.pop(key, None)
+            return MetadataRead(None, error=str(exc))
+
+        cached = self._cache.get(key)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        self._cache.pop(key, None)
+        result = self.read_tags_uncached(source)
+        if stamp is not None and result.tags is not None:
+            try:
+                if _fingerprint(source.stat()) == stamp:
+                    self._cache[key] = (stamp, result)
+                    return result
+            except OSError as exc:
+                return MetadataRead(None, error=str(exc))
+            return MetadataRead(None, error='файл изменился во время чтения')
+        return result
 
     def apply_tags(
         self, filepath: Path, artist: str, title: str, *, simulated: bool
@@ -61,17 +121,27 @@ class TagRepository:
         """Применяет запись тегов и публикует её результат."""
         tags = AudioTags(artist, title)
         key = filepath.absolute()
-        if self._cache.get(key) == tags:
+        before = self.get_tags(filepath)
+        if before.tags == tags:
             return OperationResult(OperationStatus.NOOP, filepath, 'теги не изменились')
-        if simulated:
-            self.simulate_update_tags(filepath, artist, title)
+        if simulated and before.tags is not None:
+            self._update_model(filepath, tags, before)
             return OperationResult(
                 OperationStatus.SIMULATED, filepath, 'запись запланирована'
             )
 
-        status, reason = self._write_to_disk(filepath, artist, title)
+        if before.tags is None:
+            status = OperationStatus.ERROR
+            reason = before.error or 'чтение метаданных не подтверждено'
+        else:
+            status, reason = self._write_to_disk(
+                filepath,
+                artist if artist != before.tags.artist else None,
+                title if title != before.tags.title else None,
+            )
+        if status in (OperationStatus.SUCCESS, OperationStatus.UNCERTAIN):
+            self._cache.pop(key, None)
         if status is OperationStatus.SUCCESS:
-            self._cache[key] = tags
             logger.info(
                 'Теги записаны: %s; artist=%r; title=%r',
                 filepath,
@@ -86,6 +156,7 @@ class TagRepository:
             reason,
             artist=artist,
             title=title,
+            proposed=simulated,
         )
         return OperationResult(status, filepath, reason)
 
@@ -94,101 +165,77 @@ class TagRepository:
         result = self.apply_tags(filepath, artist, title, simulated=False)
         return result.status in (OperationStatus.SUCCESS, OperationStatus.NOOP)
 
-    def read_tags_uncached(self, filepath: Path) -> AudioTags | None:
-        """Читает для отчёта с диска; ошибки не превращаются в отсутствие тегов."""
-        return self._read_tags(filepath, report_errors=True)
+    def read_tags_uncached(self, filepath: Path) -> MetadataRead:
+        """Читает физический файл в обход кэша и модели."""
+        ext = filepath.suffix.lower()
+        parsers = {
+            '.mp3': (MP3, 'MPEG audio', 'TPE1', 'TIT2'),
+            '.m4a': (MP4, 'MP4', '©ART', '©nam'),
+            '.mp4': (MP4, 'MP4', '©ART', '©nam'),
+            '.flac': (FLAC, 'FLAC', 'artist', 'title'),
+            '.ogg': (OggVorbis, 'Ogg', 'artist', 'title'),
+            '.wma': (ASF, 'ASF', 'Author', 'Title'),
+        }
+        if ext not in parsers:
+            return MetadataRead(None, error='формат файла не поддерживается')
+        parser, format_name, artist_key, title_key = parsers[ext]
+        try:
+            audio = parser(filepath)
+            artist = audio.tags.get(artist_key) if audio.tags is not None else None
+            title = audio.tags.get(title_key) if audio.tags is not None else None
+            if ext == '.mp3':
+                tags = AudioTags(
+                    str(artist) if artist else '', str(title) if title else ''
+                )
+            else:
+                tags = AudioTags(
+                    str(artist[0]) if artist else '', str(title[0]) if title else ''
+                )
+
+            info = getattr(audio, 'info', None)
+            codec = None
+            if ext == '.mp3':
+                layer = getattr(info, 'layer', None)
+                if layer is not None:
+                    codec = f'MPEG audio layer {layer}'
+            elif ext == '.flac':
+                codec = 'FLAC'
+            elif ext == '.ogg':
+                codec = 'Vorbis'
+            elif ext == '.wma':
+                codec = getattr(info, 'codec_type', None) or getattr(
+                    info, 'codec_name', None
+                )
+            else:
+                codec = getattr(info, 'codec', None)
+            return MetadataRead(
+                tags,
+                AudioInfo(
+                    format_name,
+                    codec or None,
+                    _positive(getattr(info, 'length', None)),
+                    _positive(getattr(info, 'bitrate', None)),
+                    _positive(getattr(info, 'sample_rate', None)),
+                    _positive(getattr(info, 'channels', None)),
+                    _positive(getattr(info, 'bits_per_sample', None)),
+                ),
+            )
+        except (MutagenError, OSError, ValueError) as exc:
+            return MetadataRead(None, error=str(exc) or type(exc).__name__)
 
     def invalidate(self, filepath: Path) -> None:
-        """Удаляет файл из кэша.
-
-        Args:
-            filepath: Путь к файлу для удаления из кэша
-        """
-        self._cache.pop(filepath.absolute(), None)
+        key = filepath.absolute()
+        self._cache.pop(key, None)
+        self._model_sources.pop(key, None)
 
     def clear_cache(self) -> None:
-        """Очищает весь кэш."""
         self._cache.clear()
-
-    def _read_from_disk(self, filepath: Path) -> AudioTags | None:
-        """Читает теги для конвейера с прежней обработкой ошибок."""
-        return self._read_tags(filepath)
-
-    def _read_tags(
-        self, filepath: Path, *, report_errors: bool = False
-    ) -> AudioTags | None:
-        """Читает теги непосредственно с диска."""
-        ext = filepath.suffix.lower()
-        try:
-            if ext == '.mp3':
-                audio = MP3(filepath)  # type: ignore[assignment]
-                if audio.tags is None:
-                    return None
-                artist = audio.tags.get('TPE1')
-                title = audio.tags.get('TIT2')
-                if report_errors:
-                    return AudioTags(
-                        str(artist) if artist else '', str(title) if title else ''
-                    )
-                if artist and title:
-                    return AudioTags(str(artist), str(title))
-            elif ext in ('.m4a', '.mp4'):
-                audio = MP4(filepath)  # type: ignore[assignment]
-                if audio.tags is None:
-                    return None
-                artist = audio.tags.get('©ART')
-                title = audio.tags.get('©nam')
-                if report_errors:
-                    return AudioTags(
-                        str(artist[0]) if artist else '', str(title[0]) if title else ''
-                    )
-                if artist and title:
-                    return AudioTags(artist[0], title[0])
-            elif ext == '.flac':
-                audio = FLAC(filepath)  # type: ignore[assignment]
-                if audio.tags is None:
-                    return None
-                artist = audio.tags.get('artist')
-                title = audio.tags.get('title')
-                if report_errors:
-                    return AudioTags(
-                        str(artist[0]) if artist else '', str(title[0]) if title else ''
-                    )
-                if artist and title:
-                    return AudioTags(artist[0], title[0])
-            elif ext == '.ogg':
-                audio = OggVorbis(filepath)  # type: ignore[assignment]
-                if audio.tags is None:
-                    return None
-                artist = audio.tags.get('artist')
-                title = audio.tags.get('title')
-                if report_errors:
-                    return AudioTags(
-                        str(artist[0]) if artist else '', str(title[0]) if title else ''
-                    )
-                if artist and title:
-                    return AudioTags(artist[0], title[0])
-            elif ext == '.wma':
-                audio = ASF(filepath)  # type: ignore[assignment]
-                if audio.tags is None:
-                    return None
-                artist = audio.tags.get('Author')
-                title = audio.tags.get('Title')
-                if report_errors:
-                    return AudioTags(
-                        str(artist[0]) if artist else '', str(title[0]) if title else ''
-                    )
-                if artist and title:
-                    return AudioTags(artist[0], title[0])
-        except (MutagenError, OSError, ValueError):
-            if report_errors:
-                raise
-        return None
+        self._model_sources.clear()
 
     def _write_to_disk(
-        self, filepath: Path, artist: str, title: str
+        self, filepath: Path, artist: str | None, title: str | None
     ) -> tuple[OperationStatus, str]:
-        """Записывает теги непосредственно на диск."""
+        """Записывает теги непосредственно на диск. None сохраняет поле целиком."""
         ext = filepath.suffix.lower()
         saving = False
         try:
@@ -200,8 +247,10 @@ class TagRepository:
                 if audio.tags is None:
                     audio.add_tags()
                 if audio.tags is not None:
-                    audio.tags['TPE1'] = TPE1(encoding=3, text=artist)
-                    audio.tags['TIT2'] = TIT2(encoding=3, text=title)
+                    if artist is not None:
+                        audio.tags['TPE1'] = TPE1(encoding=3, text=artist)
+                    if title is not None:
+                        audio.tags['TIT2'] = TIT2(encoding=3, text=title)
                     saving = True
                     audio.save()
                     return OperationStatus.SUCCESS, 'запись выбранных artist/title'
@@ -210,29 +259,37 @@ class TagRepository:
                 if audio.tags is None:
                     audio.add_tags()
                 if audio.tags is not None:
-                    audio.tags['©ART'] = [artist]
-                    audio.tags['©nam'] = [title]
+                    if artist is not None:
+                        audio.tags['©ART'] = [artist]
+                    if title is not None:
+                        audio.tags['©nam'] = [title]
                     saving = True
                     audio.save()
                     return OperationStatus.SUCCESS, 'запись выбранных artist/title'
             elif ext == '.flac':
                 audio = FLAC(filepath)  # type: ignore[assignment]
-                audio['artist'] = [artist]
-                audio['title'] = [title]
+                if artist is not None:
+                    audio['artist'] = [artist]
+                if title is not None:
+                    audio['title'] = [title]
                 saving = True
                 audio.save()
                 return OperationStatus.SUCCESS, 'запись выбранных artist/title'
             elif ext == '.ogg':
                 audio = OggVorbis(filepath)  # type: ignore[assignment]
-                audio['artist'] = [artist]
-                audio['title'] = [title]
+                if artist is not None:
+                    audio['artist'] = [artist]
+                if title is not None:
+                    audio['title'] = [title]
                 saving = True
                 audio.save()
                 return OperationStatus.SUCCESS, 'запись выбранных artist/title'
             elif ext == '.wma':
                 audio = ASF(filepath)  # type: ignore[assignment]
-                audio['Author'] = [artist]
-                audio['Title'] = [title]
+                if artist is not None:
+                    audio['Author'] = [artist]
+                if title is not None:
+                    audio['Title'] = [title]
                 saving = True
                 audio.save()
                 return OperationStatus.SUCCESS, 'запись выбранных artist/title'
@@ -243,24 +300,27 @@ class TagRepository:
         return OperationStatus.ERROR, 'запись тегов недоступна для файла'
 
     def simulate_update_tags(self, filepath: Path, artist: str, title: str) -> None:
-        """Имитирует обновление тегов для dry-run режима.
+        """Имитирует обновление тегов для dry-run режима."""
+        self._update_model(filepath, AudioTags(artist, title), self.get_tags(filepath))
 
-        Обновляет кэш без записи на диск, чтобы следующие этапы
-        видели "новые" теги при сухом прогоне.
-
-        Args:
-            filepath: Путь к файлу
-            artist: Новое имя исполнителя
-            title: Новое название трека
-        """
-        self._cache[filepath.absolute()] = AudioTags(artist, title)
+    def _update_model(
+        self, filepath: Path, tags: AudioTags, before: MetadataRead
+    ) -> None:
+        key = filepath.absolute()
+        cached = self._cache.get(key)
+        source = self._model_sources.get(key, key)
+        try:
+            stamp = cached[0] if cached is not None else _fingerprint(source.stat())
+        except OSError:
+            stamp = None
+        self._cache[key] = (stamp, replace(before, tags=tags, error=None))
         log_operation(
             'tags',
             filepath,
             'ПРЕДЛОЖЕНИЕ',
             'план записи выбранных artist/title; диск не изменён',
-            artist=artist,
-            title=title,
+            artist=tags.artist,
+            title=tags.title,
         )
 
     def simulate_rename(self, old_path: Path, new_path: Path) -> None:
@@ -273,10 +333,12 @@ class TagRepository:
             new_path: Новый путь к файлу
         """
         old_key, new_key = old_path.absolute(), new_path.absolute()
-        if old_key in self._cache:
-            self._cache[new_key] = self._cache.pop(old_key)
-        elif old_key != new_key:
-            self.invalidate(new_path)
+        source = self._model_sources.pop(old_key, old_key)
+        cached = self._cache.pop(old_key, None)
+        self.invalidate(new_key)
+        self._model_sources[new_key] = source
+        if cached is not None:
+            self._cache[new_key] = cached
 
     def simulate_unlink(self, filepath: Path) -> None:
         """Имитирует удаление файла для dry-run режима.
