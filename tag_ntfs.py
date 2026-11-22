@@ -251,6 +251,40 @@ class _SecurityAttributes(c.Structure):
     _fields_ = [('length', w.DWORD), ('descriptor', c.c_void_p), ('inherit', w.BOOL)]
 
 
+def _restore_inherited_dacl(handle: int, descriptor: c.c_void_p) -> None:
+    present, defaulted = w.BOOL(), w.BOOL()
+    acl = c.c_void_p()
+    get_acl = _api(
+        'advapi32',
+        'GetSecurityDescriptorDacl',
+        w.BOOL,
+        c.c_void_p,
+        c.POINTER(w.BOOL),
+        c.POINTER(c.c_void_p),
+        c.POINTER(w.BOOL),
+    )
+    if not get_acl(descriptor, c.byref(present), c.byref(acl), c.byref(defaulted)):
+        raise _win_error()
+    if not present or not acl:
+        raise OSError('cannot restore absent or NULL DACL')
+    set_info = _api(
+        'advapi32',
+        'SetSecurityInfo',
+        w.DWORD,
+        w.HANDLE,
+        w.DWORD,
+        w.DWORD,
+        c.c_void_p,
+        c.c_void_p,
+        c.c_void_p,
+        c.c_void_p,
+    )
+    # SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION.
+    error = set_info(handle, 1, 0x20000004, None, None, acl, None)
+    if error:
+        raise _win_error(error)
+
+
 def copy_protected(
     source: BinaryIO,
     path: Path,
@@ -275,20 +309,26 @@ def copy_protected(
     )
     if not convert(attributes.security, 1, c.byref(descriptor), None):
         raise _win_error()
-    try:
+    with ExitStack() as stack:
+        stack.callback(_kernel('LocalFree', c.c_void_p, c.c_void_p), descriptor)
         sa = _SecurityAttributes(c.sizeof(_SecurityAttributes), descriptor, False)
-        handle = _open(path, 0xC0000000, 0, 1, c.byref(sa))
-    finally:
-        _kernel('LocalFree', c.c_void_p, c.c_void_p)(descriptor)
-    try:
-        fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
-    except OSError:
-        _close(handle)
-        raise
-    with os.fdopen(fd, 'wb') as work:
+        expected = attributes.security
+        inherited = 'D:AI(' in expected
+        access = 0xC0000000 | (0x40000 if inherited else 0)  # WRITE_DAC
+        handle = _open(path, access, 0, 1, c.byref(sa))
+        try:
+            fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+        except OSError:
+            _close(handle)
+            raise
+        work = stack.enter_context(os.fdopen(fd, 'wb'))
         info = os.fstat(fd)
         register((info.st_dev, info.st_ino))
-        if _attributes(handle, info, empty=True).security != attributes.security:
+        actual = _attributes(handle, info, empty=True).security
+        if inherited and actual == expected.replace('D:AI(', 'D:(', 1):
+            _restore_inherited_dacl(handle, descriptor)
+            actual = _security(handle)
+        if actual != expected:
             raise OSError('права пустой рабочей копии отличаются от оригинала')
         source.seek(0)
         shutil.copyfileobj(source, work, length=1024 * 1024)
