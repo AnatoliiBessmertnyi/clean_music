@@ -208,7 +208,9 @@ def test_safe_dry_run_keeps_collection_and_settings(
 
 
 @windows
-def test_safe_plan_matches_successful_cli_run(
+@pytest.mark.parametrize('deep', [False, True], ids=['safe', 'deep'])
+def test_tag_model_matches_successful_cli_run(
+    deep: bool,
     tmp_path: Path,
     cli_prompts: Mock,
     monkeypatch: pytest.MonkeyPatch,
@@ -234,6 +236,8 @@ def test_safe_plan_matches_successful_cli_run(
 
     before = snapshot(dry_root)
     assert before == snapshot(real_root)
+    ffprobe = find_ffprobe()
+    original_audio = audio_signature(ffprobe, real_root / 'Artist – Song.mp3')
     settings_before = snapshot(path.parent)
     plan_tags: dict[str, AudioTags | None] = {}
     run_pipeline = AudioProcessingPipeline.run
@@ -258,7 +262,7 @@ def test_safe_plan_matches_successful_cli_run(
 
     def run(root: Path, *, dry_run: bool) -> list[dict[str, str | bool]]:
         cli_prompts.reset_mock()
-        cli_prompts.side_effect = ['safe', str(root), 'y', 'y', 'y']
+        cli_prompts.side_effect = ['run' if deep else 'safe', str(root), 'y', 'y', 'y']
         args = ['main.py', '--dry-run'] if dry_run else ['main.py']
         monkeypatch.setattr(sys, 'argv', args)
         existing = set(logs.glob('run-*.log'))
@@ -268,6 +272,7 @@ def test_safe_plan_matches_successful_cli_run(
         assert str(report) in output
         assert "('artist', 'song')" in output
         assert ('Будущие размер и байты неизвестны' in output) == dry_run
+        assert 'Удалено дубликатов: 0' in output
         return [
             json.loads(line)
             for line in report.read_text(encoding='utf-8').splitlines()
@@ -282,6 +287,11 @@ def test_safe_plan_matches_successful_cli_run(
     confirmed = run(real_root, dry_run=False)
     assert cli_prompts.call_args_list == plan_prompts
     assert not list((real_root / DIRECTORY_NAME).glob('*.json'))
+    result = real_root / 'Artist - Song.mp3'
+    assert result.read_bytes() != before[Path('Artist – Song.mp3')]
+    assert audio_signature(ffprobe, result) == original_audio
+    for name in ('Artist - Song.flac', 'Other – Clash.mp3', 'Other - Clash.mp3'):
+        assert (real_root / name).read_bytes() == before[Path(name)]
 
     def operations(
         records: list[dict[str, str | bool]], *, dry_run: bool
