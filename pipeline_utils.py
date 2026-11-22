@@ -5,17 +5,28 @@ import os
 import re
 import stat
 import sys
+from collections.abc import Iterator
+from contextlib import closing
 from pathlib import Path
 
 from config import FEAT_VARIANTS_PATTERN, INVALID_FILENAME_CHARS, LEADING_TRACK_PATTERN
 from context import SessionContext
 from duplicate_analysis import (
+    ByteStatus,
     Candidate,
+    CandidateGroup,
     compare_candidates,
     decide_copies,
     find_candidate_groups,
 )
-from file_state import FileIdentity, entry_info, inspect_file
+from duplicate_removal import Stamp, file_stamp, remove_exact_copies
+from file_state import (
+    FileIdentity,
+    OperationStatus,
+    entry_info,
+    inspect_file,
+    regular_file_info,
+)
 from interactor import UserInteractor, prompt_command
 from parsing import parse_artist_title
 from recovery import begin_rename, recover_renames, settle_rename
@@ -675,7 +686,8 @@ def process_duplicates(
     repo: TagRepository,
     interactor: UserInteractor,
 ) -> list[Path]:
-    """Показывает основания поиска и результаты сравнения кандидатов."""
+    """Анализирует группы и применяет решения о точных копиях в deep."""
+    file_ids = ctx.file_ids(files)
     duplicates = find_candidate_groups(files, repo)
     interactor.display(f'  Групп кандидатов в дубликаты: {len(duplicates)}')
     for i, group in enumerate(duplicates, 1):
@@ -687,7 +699,19 @@ def process_duplicates(
             candidate.path: number
             for number, candidate in enumerate(group.candidates, 1)
         }
+        expected: dict[Path, Stamp] = {}
+        reason = ''
+        if ctx.deep and not ctx.dry_run:
+            try:
+                for candidate in group.candidates:
+                    expected[candidate.path] = file_stamp(
+                        regular_file_info(candidate.path)
+                    )
+            except OSError as exc:
+                reason = str(exc)
         pairs = list(compare_candidates(group, ctx.registry))
+        winner = None
+        copies = []
         for decision in decide_copies(group, pairs):
             pair = decision.pair
             left, right = numbers[pair.left.path], numbers[pair.right.path]
@@ -701,6 +725,8 @@ def process_duplicates(
                     f'      Недостаточно данных: {", ".join(pair.missing)}'
                 )
             if decision.keep is not None and decision.redundant is not None:
+                winner = decision.keep
+                copies.append(decision.redundant)
                 keep = numbers[decision.keep]
                 redundant = numbers[decision.redundant]
                 interactor.display(
@@ -709,9 +735,91 @@ def process_duplicates(
                 )
             else:
                 interactor.display(f'      Выбор копии пропущен: {decision.reason}.')
-    if duplicates:
+        if ctx.deep and winner is not None:
+            if any(
+                pair.byte_status in (ByteStatus.ERROR, ByteStatus.UNKNOWN)
+                for pair in pairs
+            ):
+                reason = reason or 'побайтовое сравнение группы не завершено'
+            _apply_copy_decisions(
+                group, winner, tuple(copies), expected, reason, ctx, repo, interactor
+            )
+    if duplicates and not ctx.deep:
         interactor.display('  Объединение отключено; все файлы сохранены.')
-    return files
+    return ctx.present_paths(file_ids)
+
+
+def _apply_copy_decisions(
+    group: CandidateGroup,
+    winner: Path,
+    copies: tuple[Path, ...],
+    expected: dict[Path, Stamp],
+    reason: str,
+    ctx: SessionContext,
+    repo: TagRepository,
+    interactor: UserInteractor,
+) -> None:
+    for candidate in group.candidates:
+        reason = reason or ctx.get_block_reason(candidate.path) or ''
+    if not ctx.dry_run and not windows_local_ntfs(winner.parent):
+        reason = reason or (
+            WSL_MODIFICATION_DISABLED if os.name != 'nt' else 'требуется локальный NTFS'
+        )
+
+    def results() -> Iterator[tuple[Path, OperationStatus, str]]:
+        if reason:
+            yield copies[0], OperationStatus.ERROR, reason
+        elif ctx.dry_run:
+            for copy in copies:
+                yield copy, OperationStatus.SIMULATED, 'план удаления точной копии'
+        else:
+            with closing(
+                remove_exact_copies(group, winner, copies, expected, ctx.registry, repo)
+            ) as execution:
+                yield from execution
+
+    completed = set()
+    interactor.display(f'  Сохраняемая копия: {winner.name}')
+    for copy, status, detail in results():
+        completed.add(copy)
+        if status in (OperationStatus.SUCCESS, OperationStatus.SIMULATED):
+            ctx.registry.mark_missing(
+                ctx.registry.track(copy).id, simulated=ctx.dry_run
+            )
+            if ctx.dry_run:
+                repo.simulate_unlink(copy)
+            else:
+                repo.invalidate(copy)
+            ctx.increment_stat('duplicates_removed')
+            label = 'Запланировано удаление' if ctx.dry_run else 'Удалён'
+            result = 'ПРЕДЛОЖЕНИЕ' if ctx.dry_run else 'успех'
+        elif status is OperationStatus.UNCERTAIN:
+            label, result = 'Удаление не подтверждено', 'неопределённость'
+            ctx.block_path(copy, detail)
+            ctx.block_path(winner, detail)
+        else:
+            label, result = 'Пропущен', 'отказ'
+        interactor.display(f'  {label}: {copy.name}. {detail}')
+        log_operation(
+            'duplicate_delete',
+            copy,
+            result,
+            detail,
+            target=winner,
+            proposed=ctx.dry_run,
+        )
+    for copy in copies:
+        if copy not in completed:
+            detail = 'обработка группы остановлена после первого сбоя'
+            interactor.display(f'  Пропущен: {copy.name}. {detail}')
+            log_operation(
+                'duplicate_delete',
+                copy,
+                'отказ',
+                detail,
+                target=winner,
+                proposed=ctx.dry_run,
+            )
 
 
 def find_artist_variations(

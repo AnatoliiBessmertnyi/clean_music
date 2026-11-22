@@ -9,7 +9,7 @@ from pathlib import Path
 from config import SUPPORTED_EXTENSIONS
 from context import SessionContext
 from file_state import check_directory, inspect_file
-from interactor import ConsoleInteractor, UserInteractor, choose_safe_mode, logged_input
+from interactor import ConsoleInteractor, UserInteractor, choose_mode, logged_input
 from pipeline import AudioProcessingPipeline
 from pipeline_utils import windows_local_ntfs
 from recovery import recover_renames
@@ -114,9 +114,15 @@ def _run(report: RunReport, recovery_session: ExitStack) -> None:
             'итог отчёта сверяется с диском. ***'
         )
 
-    if not choose_safe_mode(interactor, dry_run=ctx.dry_run):
+    mode = choose_mode(interactor, dry_run=ctx.dry_run)
+    if mode is None:
         return
-    interactor.display('Выбран безопасный режим (safe).')
+    ctx.deep = mode == 'deep'
+    interactor.display(
+        'Выбран глубокий режим (deep).'
+        if ctx.deep
+        else 'Выбран безопасный режим (safe).'
+    )
     repo = TagRepository()
     target_dir = get_valid_path()
     ctx.target_dir = target_dir

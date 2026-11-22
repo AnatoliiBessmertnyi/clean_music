@@ -40,8 +40,8 @@ def prompt_command(interactor: UserInteractor, message: str, default: str = '') 
     return interactor.prompt(message, default=default).strip().lower()
 
 
-def choose_safe_mode(interactor: UserInteractor, *, dry_run: bool) -> bool:
-    """Возвращает разрешение на запуск safe после завершения выбора."""
+def choose_mode(interactor: UserInteractor, *, dry_run: bool) -> Mode | None:
+    """Выбирает режим обработки с явным подтверждением deep."""
     path = None
     preferred = None
     try:
@@ -72,29 +72,42 @@ def choose_safe_mode(interactor: UserInteractor, *, dry_run: bool) -> bool:
                 f'Сохранено предпочтение для следующего запуска: {mode}.'
             )
 
-    def choose_after_deep() -> bool:
-        interactor.display(
-            'Глубокий режим deep пока недоступен. Он предусматривает '
-            'безвозвратное удаление достоверных дублей.'
-        )
+    def choose_after_deep() -> Mode | None:
+        if dry_run:
+            interactor.display(
+                'Deep в dry-run выполняет прогноз удаления. Для запуска введите run.'
+            )
+        else:
+            interactor.display(
+                'Программа не может проверить отсутствие сторонних изменений. '
+                'Они могут добавить поток NTFS или подменить имя после проверки.'
+            )
+            interactor.display(
+                'Точные дубли будут удалены безвозвратно. Приостановите синхронизацию '
+                'и другие программы, которые могут менять эту папку. Для запуска введите run'
+            )
         while True:
             choice = prompt_command(
                 interactor,
                 'once — запустить safe один раз, safe — сохранить и запустить safe, '
-                'deep — сохранить deep и выйти, Enter/cancel — выйти: ',
+                'run — запустить deep, deep — сохранить deep и выйти, Enter/cancel — выйти: ',
             )
             if choice in ('', 'cancel'):
-                return False
+                return None
+            if choice == 'run':
+                if preferred != 'deep':
+                    remember('deep')
+                return 'deep'
             if choice == 'once':
                 interactor.display(
                     'Разовый запуск safe. Сохранённое предпочтение остаётся прежним.'
                 )
-                return True
+                return 'safe'
             if choice == 'safe' or choice == 'deep':
                 mode: Mode = 'safe' if choice == 'safe' else 'deep'
                 if mode != preferred:
                     remember(mode)
-                return mode == 'safe'
+                return 'safe' if mode == 'safe' else None
             interactor.display_error('Неизвестная команда. Выберите вариант из меню.')
 
     try:
@@ -113,15 +126,15 @@ def choose_safe_mode(interactor: UserInteractor, *, dry_run: bool) -> bool:
             if choice == 'safe':
                 if preferred != 'safe':
                     remember('safe')
-                return True
+                return 'safe'
             if choice == 'deep':
                 return choose_after_deep()
             if choice == 'cancel':
-                return False
+                return None
             interactor.display_error('Неизвестная команда. Выберите вариант из меню.')
     except (EOFError, KeyboardInterrupt):
         interactor.display('Выбор режима прерван. Обработка не начата.')
-        return False
+        return None
 
 
 class ConsoleInteractor:
