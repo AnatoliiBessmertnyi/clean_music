@@ -1076,7 +1076,7 @@ class TagWritingStage:
 
 
 class DuplicateResolutionStage:
-    """Этап 5: Показ кандидатов в дубликаты без объединения."""
+    """Этап 5: Анализ кандидатов и применение подтверждённых решений в deep."""
 
     @property
     def name(self) -> str:

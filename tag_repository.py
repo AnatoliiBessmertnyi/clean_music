@@ -195,6 +195,15 @@ class TagRepository:
 
     def read_tags_uncached(self, filepath: Path) -> MetadataRead:
         """Читает физический файл в обход кэша и модели."""
+        return self._read_tags(filepath, filepath)
+
+    def read_open_tags(self, filepath: Path, stream: BinaryIO) -> MetadataRead:
+        """Читает теги защищённого объекта, используя имя для выбора формата."""
+        stream.seek(0)
+        return self._read_tags(filepath, stream)
+
+    @staticmethod
+    def _read_tags(filepath: Path, source: Path | BinaryIO) -> MetadataRead:
         ext = filepath.suffix.lower()
         parsers = {
             '.mp3': (MP3, 'MPEG audio', 'TPE1', 'TIT2'),
@@ -208,7 +217,7 @@ class TagRepository:
             return MetadataRead(None, error='формат файла не поддерживается')
         parser, format_name, artist_key, title_key = parsers[ext]
         try:
-            audio = parser(filepath)
+            audio = parser(source)
             artist = audio.tags.get(artist_key) if audio.tags is not None else None
             title = audio.tags.get(title_key) if audio.tags is not None else None
             if ext == '.mp3':

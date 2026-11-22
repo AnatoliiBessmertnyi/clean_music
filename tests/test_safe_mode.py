@@ -42,6 +42,7 @@ def test_mode_lifecycle(
         ([''], True, 'safe'),
         ([''], True, 'safe'),
         (['deep', 'deep'], False, 'deep'),
+        (['run'], True, 'deep'),
         ([''], False, 'deep'),
         (['once'], True, 'deep'),
         (['safe'], True, 'safe'),
@@ -56,8 +57,8 @@ def test_mode_lifecycle(
         assert enter_collection.call_count == int(starts)
         assert load_mode(path) == preferred
         output = capsys.readouterr().out
-        if answers in (['deep', 'deep'], ['once']):
-            assert 'безвозвратное удаление' in output
+        if answers in (['deep', 'deep'], ['run'], ['once']):
+            assert 'Точные дубли будут удалены безвозвратно' in output
         if answers == ['once']:
             assert 'Сохранённое предпочтение остаётся прежним' in output
 

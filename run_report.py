@@ -276,6 +276,8 @@ class RunReport:
         ):
             self._proposed_paths.pop(path, None)
             self._proposed_paths[os.path.normcase(operation.target)] = originals
+        elif operation.kind == 'duplicate_delete' and operation.result == 'ПРЕДЛОЖЕНИЕ':
+            self._proposed_paths.pop(path, None)
 
     def _write_json(self, label: str, data: object) -> None:
         logger.info(
@@ -305,12 +307,32 @@ class RunReport:
         self.changes = []
         verification_complete = self._initial_complete
         matched: set[str] = set()
+        deleted = {
+            original
+            for operation in self.operations
+            if operation.kind == 'duplicate_delete'
+            and operation.result == 'успех'
+            and not operation.proposed
+            for original in operation.originals
+        }
+        uncertain = {
+            original
+            for operation in self.operations
+            if operation.kind == 'duplicate_delete'
+            and operation.result == 'неопределённость'
+            for original in operation.originals
+        }
         for original, before in self._before.items():
             current = self._current_paths[original]
-            final = after.get(current)
+            final = None if original in deleted else after.get(current)
             if final is not None:
                 matched.add(current)
-            if final is None:
+            if original in deleted:
+                status = 'удалён как точная копия'
+            elif original in uncertain:
+                status = 'результат удаления неопределён'
+                verification_complete = False
+            elif final is None:
                 status = 'отсутствует после запуска (удаление не подтверждено)'
             elif before.errors or final.errors:
                 status = 'ошибка проверки'

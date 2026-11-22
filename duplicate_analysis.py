@@ -2,11 +2,12 @@
 
 import os
 import re
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from itertools import combinations
 from pathlib import Path
+from typing import BinaryIO
 
 from file_state import FileRegistry
 from naming import normalize_filename_stem, normalize_unicode
@@ -192,38 +193,50 @@ def find_candidate_groups(
     ]
 
 
-def _compare_bytes(left: Path, right: Path) -> tuple[ByteStatus, str | None]:
+def compare_streams(first: BinaryIO, second: BinaryIO) -> tuple[ByteStatus, str | None]:
     try:
-        with left.open('rb') as first, right.open('rb') as second:
-            before = (os.fstat(first.fileno()), os.fstat(second.fileno()))
-            matched = 0
-            while True:
-                first_chunk = first.read(_CHUNK_SIZE)
-                second_chunk = second.read(_CHUNK_SIZE)
-                if first_chunk != second_chunk:
-                    status = ByteStatus.DIFFERENT
-                    break
-                if not first_chunk:
-                    if any(stat.st_size != matched for stat in before):
-                        return ByteStatus.ERROR, 'прочитан не весь файл'
-                    status = ByteStatus.IDENTICAL
-                    break
-                matched += len(first_chunk)
-            after = (os.fstat(first.fileno()), os.fstat(second.fileno()))
-            for old, new in zip(before, after, strict=True):
-                if (old.st_size, old.st_mtime_ns, old.st_ctime_ns) != (
-                    new.st_size,
-                    new.st_mtime_ns,
-                    new.st_ctime_ns,
-                ):
-                    return ByteStatus.ERROR, 'файл изменился во время сравнения'
+        first.seek(0)
+        second.seek(0)
+        before = (os.fstat(first.fileno()), os.fstat(second.fileno()))
+        matched = 0
+        while True:
+            first_chunk = first.read(_CHUNK_SIZE)
+            second_chunk = second.read(_CHUNK_SIZE)
+            if first_chunk != second_chunk:
+                status = ByteStatus.DIFFERENT
+                break
+            if not first_chunk:
+                if any(stat.st_size != matched for stat in before):
+                    return ByteStatus.ERROR, 'прочитан не весь файл'
+                status = ByteStatus.IDENTICAL
+                break
+            matched += len(first_chunk)
+        after = (os.fstat(first.fileno()), os.fstat(second.fileno()))
+        for old, new in zip(before, after, strict=True):
+            if (old.st_size, old.st_mtime_ns, old.st_ctime_ns) != (
+                new.st_size,
+                new.st_mtime_ns,
+                new.st_ctime_ns,
+            ):
+                return ByteStatus.ERROR, 'файл изменился во время сравнения'
     except OSError as exc:
         return ByteStatus.ERROR, str(exc)
     return status, None
 
 
+def _compare_bytes(left: Path, right: Path) -> tuple[ByteStatus, str | None]:
+    try:
+        with left.open('rb') as first, right.open('rb') as second:
+            return compare_streams(first, second)
+    except OSError as exc:
+        return ByteStatus.ERROR, str(exc)
+
+
 def compare_candidates(
-    group: CandidateGroup, registry: FileRegistry
+    group: CandidateGroup,
+    registry: FileRegistry,
+    *,
+    compare: Callable[[Path, Path], tuple[ByteStatus, str | None]] = _compare_bytes,
 ) -> Iterator[PairAnalysis]:
     """Сравнивает только пары внутри найденной группы."""
     records = {
@@ -243,7 +256,7 @@ def compare_candidates(
         if left_record.modeled_content or right_record.modeled_content:
             status, error = ByteStatus.UNKNOWN, None
         else:
-            status, error = _compare_bytes(
+            status, error = compare(
                 registry.physical_path(left_record),
                 registry.physical_path(right_record),
             )

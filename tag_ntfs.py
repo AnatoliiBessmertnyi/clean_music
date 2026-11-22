@@ -5,13 +5,13 @@ import os
 import stat
 import sys
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from ctypes import wintypes as w
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from file_state import FileIdentity, regular_file_info
+from file_state import FileIdentity, check_directory, regular_file_info
 
 _ALLOWED = (
     stat.FILE_ATTRIBUTE_HIDDEN
@@ -87,7 +87,13 @@ def _security(handle: int) -> str:
 
 
 def _open(
-    path: Path, access: int, share: int, disposition: int = 3, security: object = None
+    path: Path,
+    access: int,
+    share: int,
+    disposition: int = 3,
+    security: object = None,
+    *,
+    directory: bool = False,
 ) -> int:
     create = _kernel(
         'CreateFileW',
@@ -101,7 +107,8 @@ def _open(
         w.HANDLE,
     )
     # FILE_FLAG_OPEN_REPARSE_POINT
-    handle = create(str(path), access, share, security, disposition, 0x00200000, None)
+    flags = 0x00200000 | (0x02000000 if directory else 0)
+    handle = create(str(path), access, share, security, disposition, flags, None)
     if handle is None or handle == _INVALID_HANDLE:
         raise _win_error()
     return int(handle)
@@ -111,7 +118,7 @@ def _close(handle: int) -> None:
     _kernel('CloseHandle', w.BOOL, w.HANDLE)(handle)
 
 
-def _no_ads(handle: int) -> None:
+def require_no_ads(handle: int) -> None:
     get = _kernel(
         'GetFileInformationByHandleEx', w.BOOL, w.HANDLE, c.c_int, c.c_void_p, w.DWORD
     )
@@ -151,7 +158,7 @@ def _attributes(
         raise OSError('неподдерживаемые атрибуты NTFS')
     # Пустой файл может не иметь выделенного основного потока.
     if not empty:
-        _no_ads(handle)
+        require_no_ads(handle)
     return Attributes(
         _security(handle), flags & _ALLOWED, info.st_birthtime_ns, info.st_mtime_ns
     )
@@ -159,7 +166,7 @@ def _attributes(
 
 @contextmanager
 def guarded_file(
-    path: Path, *, delete: bool = False, write: bool = False
+    path: Path, *, delete: bool = False, write: bool = False, exclusive: bool = False
 ) -> Iterator[tuple[int, BinaryIO]]:
     """Запрещает конкурирующее открытие для изменения или удаления."""
     if sys.platform != 'win32':
@@ -169,7 +176,7 @@ def guarded_file(
     expected = regular_file_info(path)
     access = 0x80000000 | (0x10000 if delete else 0)  # GENERIC_READ | DELETE
     access |= 0x40000000 if write else 0
-    handle = _open(path, access, 1)
+    handle = _open(path, access, 0 if exclusive else 1)
     try:
         fd = msvcrt.open_osfhandle(
             handle, (os.O_RDWR if write else os.O_RDONLY) | os.O_BINARY
@@ -185,6 +192,55 @@ def guarded_file(
         ) or info.st_nlink != 1:
             raise OSError('файл подменён перед открытием')
         yield handle, stream
+
+
+def _query(handle: int, kind: int, size: int) -> bytes:
+    get = _kernel(
+        'GetFileInformationByHandleEx', w.BOOL, w.HANDLE, c.c_int, c.c_void_p, w.DWORD
+    )
+    buffer = c.create_string_buffer(size)
+    if not get(handle, kind, buffer, size):
+        raise _win_error()
+    return buffer.raw
+
+
+def require_path_binding(path: Path, handle: int, *, directory: bool = False) -> None:
+    """Сверяет имя через открытие на чтение атрибутов, совместимое с DELETE."""
+    probe = _open(path, 0x80, 7, directory=directory)
+    try:
+        flags = int.from_bytes(_query(probe, 9, 8)[:4], 'little')
+        if (
+            flags & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            or bool(flags & stat.FILE_ATTRIBUTE_DIRECTORY) != directory
+            or _query(probe, 18, 24) != _query(handle, 18, 24)
+        ):
+            raise OSError(f'имя больше не указывает на проверенный объект: {path}')
+    finally:
+        _close(probe)
+
+
+def require_single_live_link(handle: int) -> None:
+    # FILE_STANDARD_INFO: NumberOfLinks, DeletePending, Directory.
+    info = _query(handle, 1, 24)
+    if int.from_bytes(info[16:20], 'little') != 1 or info[20] or info[21]:
+        raise OSError('требуется обычный файл с одной ссылкой без ожидающего удаления')
+    flags = int.from_bytes(_query(handle, 9, 8)[:4], 'little')
+    if flags & (stat.FILE_ATTRIBUTE_REPARSE_POINT | stat.FILE_ATTRIBUTE_READONLY):
+        raise OSError('найдена точка повторной обработки или атрибут «только чтение»')
+
+
+@contextmanager
+def guarded_directory(path: Path) -> Iterator[int]:
+    """Удерживает проверенную цепочку каталогов на время удаления."""
+    path = path.absolute()
+    check_directory(path)
+    with ExitStack() as stack:
+        for parent in (*reversed(path.parents), path):
+            # FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, без FILE_SHARE_DELETE.
+            handle = _open(parent, 0x81, 3, directory=True)
+            stack.callback(_close, handle)
+            require_path_binding(parent, handle, directory=True)
+        yield handle
 
 
 def read_attributes(handle: int, stream: BinaryIO) -> Attributes:
