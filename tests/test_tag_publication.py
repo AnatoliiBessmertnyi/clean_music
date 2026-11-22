@@ -162,22 +162,7 @@ def test_stopped_process_and_two_recoveries(tmp_path: Path, point: str) -> None:
     synthetic_audio(source)
     original = source.read_bytes()
     original_id = inspect_file(source)
-    worker = subprocess.run(
-        [
-            sys.executable,
-            '-X',
-            'utf8',
-            '-m',
-            'tests.test_tag_publication',
-            str(root),
-            point,
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
-    assert worker.returncode == 23, worker.stdout + worker.stderr
+    run_stopped_worker(root, point)
     directory = root / DIRECTORY_NAME
     assert len(list(directory.glob('*.json'))) == 1
     work = list(directory.glob('*.work.mp3'))
@@ -210,6 +195,65 @@ def test_stopped_process_and_two_recoveries(tmp_path: Path, point: str) -> None:
             assert inspect_file(source) != original_id
 
 
+def run_stopped_worker(root: Path, point: str) -> None:
+    worker = subprocess.run(
+        [
+            sys.executable,
+            '-X',
+            'utf8',
+            '-m',
+            'tests.test_tag_publication',
+            str(root),
+            point,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert worker.returncode == 23, worker.stdout + worker.stderr
+
+
+@windows
+@pytest.mark.parametrize('registered', [False, True], ids=['before-id', 'after-id'])
+def test_recovery_at_work_id_registration(tmp_path: Path, registered: bool) -> None:
+    source = tmp_path / 'Track.mp3'
+    synthetic_audio(source)
+    original = inspect_file(source), source.read_bytes()
+    run_stopped_worker(tmp_path, 'after-id' if registered else 'before-id')
+    store = RecoveryStore(tmp_path)
+    [record] = store.directory.glob('*.json')
+    journal = record.read_bytes()
+    with store.session():
+        data = store.read(record)
+    work = record.with_suffix('.work.mp3')
+    saved = record.with_suffix('.original')
+    work_id = inspect_file(work)
+    assert work_id != original[0] and work.read_bytes() == b''
+    assert data['phase'] == 'COPYING'
+    assert data['work_id'] == (list(work_id) if registered else None)
+    assert (inspect_file(source), source.read_bytes()) == original
+    assert not saved.exists()
+    for _ in range(2):
+        ctx, ui = SessionContext(False, False), Interactor()
+        with store.session():
+            recover_renames(store, ctx, ui)
+        assert (inspect_file(source), source.read_bytes()) == original
+        assert not saved.exists()
+        assert ctx.is_path_blocked(source) == (not registered)
+        if registered:
+            assert not work.exists() and not record.exists()
+        else:
+            assert record.read_bytes() == journal
+            assert (inspect_file(work), work.read_bytes()) == (work_id, b'')
+            [message] = [line for line in ui.messages if 'STOP' in line]
+            assert str(record) in message and 'COPYING' in message
+            assert 'ID рабочей копии в журнале: не зафиксирован' in message
+            assert f'{source} — оригинал подтверждён' in message
+            assert f'{work} — принадлежность не подтверждена' in message
+            assert f'{saved} — отсутствует' in message
+
+
 def stop_worker(root: Path, point: str) -> None:
     source = root / 'Track.mp3'
     store = RecoveryStore(root)
@@ -220,7 +264,12 @@ def stop_worker(root: Path, point: str) -> None:
     def write(
         self: RecoveryStore, path: Path, data: dict[str, object], *, initial: bool
     ) -> None:
+        registering = data.get('phase') == 'COPYING' and data.get('work_id') is not None
+        if registering and point == 'before-id':
+            os._exit(23)
         log(self, path, data, initial=initial)
+        if registering and point == 'after-id':
+            os._exit(23)
         if str(data.get('phase')).lower() == point:
             os._exit(23)
 

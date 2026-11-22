@@ -199,14 +199,27 @@ def settle_tags(
     source, work, saved = intent.paths(store, record)
     store.check()
     observed_work = intent.observe(work, work=True, diagnostic=diagnostic)
+    observed_source = intent.observe(source, diagnostic=diagnostic)
+    observed_saved = intent.observe(saved, diagnostic=diagnostic)
     decision = reconcile_publication(
-        intent.phase,
-        intent.observe(source, diagnostic=diagnostic),
-        observed_work,
-        intent.observe(saved, diagnostic=diagnostic),
+        intent.phase, observed_source, observed_work, observed_saved
     )
     if decision is PublicationDecision.STOP:
-        raise OSError('не удалось подтвердить состояние оригинала и рабочей копии')
+        states = {
+            ObservedFile.ABSENT: 'отсутствует',
+            ObservedFile.ORIGINAL: 'оригинал подтверждён',
+            ObservedFile.VERIFIED_COPY: 'копия проверена',
+            ObservedFile.OWNED_INCOMPLETE_COPY: 'незавершённая копия с подтверждённым ID',
+            ObservedFile.UNKNOWN: 'принадлежность не подтверждена',
+        }
+        work_id = 'не зафиксирован' if intent.work_id is None else str(intent.work_id)
+        raise OSError(
+            f'STOP: требуется ручная проверка восстановления тегов. '
+            f'Фаза {intent.phase.name}, ID рабочей копии в журнале: {work_id}. '
+            f'Исходный путь {source} — {states[observed_source]}. '
+            f'Рабочая копия {work} — {states[observed_work]}. '
+            f'Резервный путь {saved} — {states[observed_saved]}.'
+        )
     if diagnostic:
         return False
     if decision is PublicationDecision.RESTORE_ORIGINAL:
