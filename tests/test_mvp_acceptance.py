@@ -203,3 +203,50 @@ def test_cli_reports_rename_success_then_sharing_violation(
     output = capsys.readouterr().out
     assert 'Нормализация тире и пробелов: 1' in output
     assert 'Переименовано по тегам: 0' in output
+
+
+@windows
+@pytest.mark.parametrize('missing', ['ffprobe', 'ffmpeg'])
+def test_cli_missing_tool_before_processing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    missing: str,
+) -> None:
+    root = tmp_path / 'music'
+    root.mkdir()
+    source = root / 'Artist - Song.mp3'
+    synthetic_audio(source, artist='', title='Song')
+    original = source.read_bytes()
+    other = root / 'Other – Tune.mp3'
+    write_mp3(other, artist='Other', title='Tune')
+    other_bytes = other.read_bytes()
+    tools = tmp_path / 'bin'
+    tools.mkdir()
+    available = 'ffmpeg' if missing == 'ffprobe' else 'ffprobe'
+    executable = shutil.which(available)
+    assert executable is not None
+    shutil.copy2(executable, tools / Path(executable).name)
+    monkeypatch.setenv('PATH', str(tools))
+    _, report = run_cli(tmp_path, monkeypatch, ['safe', str(root), 'y', 'y', 'n'])
+    output = capsys.readouterr().out
+    warning = missing + ' недоступен'
+    assert output.count(warning) == 1
+    assert output.index(warning) < output.index('Снимаю исходное состояние')
+    assert root.joinpath('Other - Tune.mp3').read_bytes() == other_bytes
+    operations = [
+        json.loads(line) for line in report.splitlines() if line.startswith('{')
+    ]
+    [write] = [
+        op
+        for op in operations
+        if op.get('kind') == 'tags' and op['path'] == str(source)
+    ]
+    tags = TagRepository().read_tags_uncached(source).tags
+    if missing == 'ffprobe':
+        assert 'изменения тегов artist/title' in output
+        assert write['result'] == 'отказ' and write['reason'] == warning
+        assert tags == AudioTags('', 'Song') and source.read_bytes() == original
+    else:
+        assert write['result'] == 'успех'
+        assert tags == AudioTags('Artist', 'Song')

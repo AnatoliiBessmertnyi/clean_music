@@ -6,6 +6,7 @@ from collections import Counter
 from contextlib import ExitStack
 from pathlib import Path
 
+from audio_verification import find_ffmpeg_tool
 from config import SUPPORTED_EXTENSIONS
 from context import SessionContext
 from file_state import check_directory, inspect_file
@@ -126,6 +127,19 @@ def _run(report: RunReport, recovery_session: ExitStack) -> None:
     repo = TagRepository()
     target_dir = get_valid_path()
     ctx.target_dir = target_dir
+    notices = []
+    if find_ffmpeg_tool('ffprobe') is None:
+        notices.append(
+            'ffprobe недоступен. Для прогноза запись тегов моделируется без ffprobe.'
+            if ctx.dry_run
+            else 'ffprobe недоступен. Будут пропущены изменения тегов artist/title '
+            'и переименования, требующие успешной записи этих тегов.'
+        )
+        ctx.ffprobe_missing_reported = True
+    if find_ffmpeg_tool('ffmpeg') is None:
+        notices.append('ffmpeg недоступен. Операции CLI не требуют этого инструмента.')
+    if notices:
+        interactor.display(' '.join(notices))
     diagnostic = ctx.dry_run or os.name != 'nt'
     try:
         if os.name == 'nt' and not windows_local_ntfs(target_dir.absolute()):
