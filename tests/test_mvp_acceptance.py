@@ -250,3 +250,28 @@ def test_cli_missing_tool_before_processing(
     else:
         assert write['result'] == 'успех'
         assert tags == AudioTags('Artist', 'Song')
+
+
+@windows
+def test_safe_reports_tag_write_refused_for_named_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / 'music'
+    root.mkdir()
+    source = root / 'Artist - Song.mp3'
+    synthetic_audio(source, artist='', title='Song')
+    stream = Path(f'{source}:synthetic')
+    stream.write_bytes(b'synthetic stream data')
+    before = source.read_bytes(), stream.read_bytes()
+
+    _, report = run_cli(tmp_path, monkeypatch, ['safe', str(root), 'y', 'n'])
+    operations = [
+        json.loads(line) for line in report.splitlines() if line.startswith('{')
+    ]
+    [write] = [op for op in operations if op.get('kind') == 'tags']
+    assert write['path'] == str(source) and write['result'] == 'отказ'
+    reason = write['reason']
+    assert 'именованный поток NTFS' in reason and 'запись тегов отклонена' in reason
+    assert 'только основной поток' in reason
+    assert reason in capsys.readouterr().out
+    assert (source.read_bytes(), stream.read_bytes()) == before

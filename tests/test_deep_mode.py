@@ -149,12 +149,15 @@ def test_plan_keeps_unknown_bytes_and_updates_later_stages(tmp_path: Path) -> No
 
 @windows
 @pytest.mark.parametrize(
-    'failure', ['replace', 'winner_changed', 'winner_missing', 'ads', 'access']
+    'failure',
+    ['replace', 'winner_changed', 'winner_missing', 'ads', 'existing_ads', 'access'],
 )
 def test_group_rechecks_before_any_deletion(
     failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     a, b, c = collection(tmp_path / 'music')
+    if failure == 'existing_ads':
+        Path(f'{c}:unique').write_bytes(b'unique')
     data = a.read_bytes()
     winner_id, c_id = inspect_file(a), inspect_file(c)
     ctx, repo, ui = (
@@ -201,8 +204,13 @@ def test_group_rechecks_before_any_deletion(
         assert a.read_bytes() == (
             data + b'changed' if failure == 'winner_changed' else data
         )
-    if failure == 'ads':
+    if failure in ('ads', 'existing_ads'):
         assert Path(f'{c}:unique').read_bytes() == b'unique'
+    if failure == 'existing_ads':
+        assert any(
+            'удаление дубля остановлено' in message and c.name in message
+            for message in ui.messages
+        )
     assert any('обработка группы остановлена' in message for message in ui.messages), (
         ui.messages
     )
