@@ -9,7 +9,12 @@ from pathlib import Path
 
 from config import FEAT_VARIANTS_PATTERN, INVALID_FILENAME_CHARS, LEADING_TRACK_PATTERN
 from context import SessionContext
-from duplicate_analysis import Candidate, compare_candidates, find_candidate_groups
+from duplicate_analysis import (
+    Candidate,
+    compare_candidates,
+    decide_copies,
+    find_candidate_groups,
+)
 from file_state import FileIdentity, entry_info, inspect_file
 from interactor import UserInteractor, prompt_command
 from parsing import parse_artist_title
@@ -682,7 +687,9 @@ def process_duplicates(
             candidate.path: number
             for number, candidate in enumerate(group.candidates, 1)
         }
-        for pair in compare_candidates(group, ctx.registry):
+        pairs = list(compare_candidates(group, ctx.registry))
+        for decision in decide_copies(group, pairs):
+            pair = decision.pair
             left, right = numbers[pair.left.path], numbers[pair.right.path]
             interactor.display(f'    Файлы {left} и {right}: {pair.byte_status}.')
             if pair.byte_error:
@@ -693,6 +700,15 @@ def process_duplicates(
                 interactor.display(
                     f'      Недостаточно данных: {", ".join(pair.missing)}'
                 )
+            if decision.keep is not None and decision.redundant is not None:
+                keep = numbers[decision.keep]
+                redundant = numbers[decision.redundant]
+                interactor.display(
+                    f'      Результат анализа: сохранить файл {keep}, '
+                    f'файл {redundant} — лишняя копия. Основание: {decision.reason}.'
+                )
+            else:
+                interactor.display(f'      Выбор копии пропущен: {decision.reason}.')
     if duplicates:
         interactor.display('  Объединение отключено; все файлы сохранены.')
     return files
