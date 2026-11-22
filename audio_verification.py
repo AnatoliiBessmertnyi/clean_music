@@ -58,13 +58,20 @@ _CODECS = {
 }
 
 
-def find_ffprobe() -> str:
+def find_ffmpeg_tool(name: str) -> str | None:
     for directory in os.get_exec_path():
         candidate = Path(directory)
         if candidate.is_absolute():
-            command = shutil.which(str(candidate / 'ffprobe'))
+            command = shutil.which(str(candidate / name))
             if command is not None:
                 return command
+    return None
+
+
+def find_ffprobe() -> str:
+    command = find_ffmpeg_tool('ffprobe')
+    if command is not None:
+        return command
     raise OSError(
         'ffprobe не найден. Установите FFmpeg и добавьте каталог ffprobe в PATH.'
     )
