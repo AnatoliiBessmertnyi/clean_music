@@ -118,7 +118,7 @@ def _close(handle: int) -> None:
     _kernel('CloseHandle', w.BOOL, w.HANDLE)(handle)
 
 
-def require_no_ads(handle: int) -> None:
+def require_no_ads(handle: int, reason: str) -> None:
     get = _kernel(
         'GetFileInformationByHandleEx', w.BOOL, w.HANDLE, c.c_int, c.c_void_p, w.DWORD
     )
@@ -131,7 +131,7 @@ def require_no_ads(handle: int) -> None:
             if offset or buffer.raw[24 : 24 + name_length] != '::$DATA'.encode(
                 'utf-16-le'
             ):
-                raise OSError('обнаружен именованный поток NTFS')
+                raise OSError(f'обнаружен именованный поток NTFS: {reason}')
             return
         error = _last_error()
         if error not in (122, 234):
@@ -158,7 +158,10 @@ def _attributes(
         raise OSError('неподдерживаемые атрибуты NTFS')
     # Пустой файл может не иметь выделенного основного потока.
     if not empty:
-        require_no_ads(handle)
+        require_no_ads(
+            handle,
+            'запись тегов отклонена, поскольку рабочая копия сохраняет только основной поток',
+        )
     return Attributes(
         _security(handle), flags & _ALLOWED, info.st_birthtime_ns, info.st_mtime_ns
     )

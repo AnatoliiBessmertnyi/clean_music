@@ -45,7 +45,11 @@ def _verify(path: Path, opened: tuple[int, BinaryIO], expected: Stamp) -> None:
     ):
         raise OSError(f'изменился или не допущен файловый объект: {path}')
     require_single_live_link(handle)
-    require_no_ads(handle)
+    require_no_ads(
+        handle,
+        'удаление дубля остановлено: при сравнении учитывается только основной поток '
+        f'(файл с именованным потоком: {path.name})',
+    )
 
 
 def remove_exact_copies(
