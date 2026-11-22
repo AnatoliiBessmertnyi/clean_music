@@ -81,18 +81,23 @@ def _recover_in_worker(root: Path) -> None:
 
 @WINDOWS
 @pytest.mark.parametrize(
-    ('point', 'target', 'foreign_source', 'expected'),
+    ('point', 'target', 'foreign_source', 'expected', 'via_cli'),
     [
-        ('before_intent', 'New.mp3', False, 'Track.mp3'),
-        ('after_intent', 'New.mp3', False, 'Track.mp3'),
-        ('after_rename', 'New.mp3', False, 'New.mp3'),
-        ('after_rename', 'New.mp3', True, 'New.mp3'),
-        ('after_rename', 'track.mp3', False, 'track.mp3'),
-        ('after_completion', 'New.mp3', False, 'New.mp3'),
+        ('before_intent', 'New.mp3', False, 'Track.mp3', False),
+        ('after_intent', 'New.mp3', False, 'Track.mp3', False),
+        ('after_rename', 'New.mp3', False, 'New.mp3', False),
+        ('after_rename', 'New.mp3', True, 'New.mp3', True),
+        ('after_rename', 'track.mp3', False, 'track.mp3', False),
+        ('after_completion', 'New.mp3', False, 'New.mp3', False),
     ],
 )
 def test_process_stop_and_two_recoveries(
-    tmp_path: Path, point: str, target: str, foreign_source: bool, expected: str
+    tmp_path: Path,
+    point: str,
+    target: str,
+    foreign_source: bool,
+    expected: str,
+    via_cli: bool,
 ) -> None:
     root = tmp_path / 'audio'
     root.mkdir()
@@ -134,8 +139,10 @@ def test_process_stop_and_two_recoveries(
                 process.kill()
             process.wait(timeout=5)
 
+    foreign_identity = None
     if foreign_source:
         source.write_bytes(b'foreign bytes')
+        foreign_identity = inspect_file(source)
     store = RecoveryStore(root, diagnostic=True)
     with store.session():
         records = store.records()
@@ -149,18 +156,36 @@ def test_process_stop_and_two_recoveries(
             )
 
     for attempt in range(2):
+        command = _worker_command('recover', root)
+        answers = None
+        if via_cli:
+            command = [
+                sys.executable,
+                '-X',
+                'utf8',
+                '-c',
+                'import main, sys; main.__file__ = sys.argv[1]; main.main()',
+                str(tmp_path / 'main.py'),
+            ]
+            answers = f'safe\n{root}\nn\n'
         result = subprocess.run(
-            _worker_command('recover', root),
+            command,
+            input=answers,
             capture_output=True,
             encoding='utf-8',
             timeout=15,
             check=True,
         )
-        assert json.loads(result.stdout.splitlines()[-1]) == []
+        if not via_cli:
+            assert json.loads(result.stdout.splitlines()[-1]) == []
         assert ('Восстановление rename' in result.stdout) == (
             attempt == 0 and bool(records)
         )
         if attempt == 0 and records:
+            if via_cli:
+                assert result.stdout.index(
+                    'Восстановление rename'
+                ) < result.stdout.index('Снимаю исходное состояние файлов')
             assert f'{expected}: подтверждён' in result.stdout
             if foreign_source:
                 assert 'Track.mp3: другой объект' in result.stdout
@@ -170,6 +195,7 @@ def test_process_stop_and_two_recoveries(
         assert names == ({expected, source.name} if foreign_source else {expected})
         if foreign_source:
             assert source.read_bytes() == b'foreign bytes'
+            assert inspect_file(source) == foreign_identity
         with store.session():
             assert not store.records()
 

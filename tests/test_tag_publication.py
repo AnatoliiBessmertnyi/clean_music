@@ -29,7 +29,12 @@ windows = pytest.mark.skipif(os.name != 'nt', reason='требуется Windows
 
 
 def synthetic_audio(
-    path: Path, *, codec: str = 'libmp3lame', artist: str = 'Artist', title: str = 'Old'
+    path: Path,
+    *,
+    codec: str = 'libmp3lame',
+    artist: str = 'Artist',
+    title: str = 'Old',
+    frequency: int = 440,
 ) -> None:
     ffmpeg = shutil.which('ffmpeg')
     if ffmpeg is None or shutil.which('ffprobe') is None:
@@ -42,7 +47,7 @@ def synthetic_audio(
             '-f',
             'lavfi',
             '-i',
-            'sine=duration=1',
+            f'sine=frequency={frequency}:duration=1',
             '-c:a',
             codec,
             '-metadata',
