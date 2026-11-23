@@ -275,3 +275,36 @@ def test_safe_reports_tag_write_refused_for_named_stream(
     assert 'только основной поток' in reason
     assert reason in capsys.readouterr().out
     assert (source.read_bytes(), stream.read_bytes()) == before
+
+
+@windows
+def test_safe_refuses_tag_write_with_id3v1_trailer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / 'music'
+    root.mkdir()
+    source = root / 'Artist - Song.mp3'
+    synthetic_audio(source, artist='', title='Song')
+    # ID3v1: signature, 30-byte title, empty artist/album/year/comment, unknown genre.
+    with source.open('ab') as stream:
+        stream.write(b'TAG' + b'Song'.ljust(30, b'\0') + bytes(94) + b'\xff')
+    original = source.read_bytes()
+    identity = inspect_file(source)
+    assert original.startswith(b'ID3\x04') and original[-128:-125] == b'TAG'
+    repo = TagRepository()
+    tags = repo.read_tags_uncached(source).tags
+    assert tags == AudioTags('', 'Song')
+
+    _, report = run_cli(tmp_path, monkeypatch, ['safe', str(root), 'y', 'n'])
+    operations = [
+        json.loads(line) for line in report.splitlines() if line.startswith('{')
+    ]
+    [write] = [op for op in operations if op.get('kind') == 'tags']
+    assert write['path'] == str(source) and write['artist'] == 'Artist'
+    assert write['result'] == 'отказ' and not write['proposed']
+    reason = 'сосуществующий ID3v1 не поддерживается при записи'
+    assert write['reason'] == reason
+    assert f'{source.name}: {reason}' in capsys.readouterr().out
+    assert inspect_file(source) == identity and source.read_bytes() == original
+    assert repo.read_tags_uncached(source).tags == tags
+    assert {p.name for p in (root / DIRECTORY_NAME).iterdir()} == {'owner', 'lock'}
