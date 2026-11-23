@@ -19,6 +19,7 @@ from naming import (
     normalize_feat_pair,
     normalize_filename_stem,
     normalize_title_spacing,
+    preserve_name_qualifiers,
     remove_feat_guests_from_artist,
     remove_junk,
 )
@@ -279,7 +280,9 @@ class TagRenamingStage:
             new_artist = remove_feat_guests_from_artist(new_artist, new_title)
 
             if new_artist != artist or new_title != title:
-                new_filename = build_safe_filename(new_artist, new_title, f.suffix)
+                new_filename = build_safe_filename(
+                    new_artist, new_title, f.suffix, source_stem=f.stem
+                )
                 feat_candidates.append(
                     (f, artist, title, new_artist, new_title, new_filename)
                 )
@@ -483,7 +486,7 @@ class TagRenamingStage:
                 else:
                     base_name = raw_name
 
-                new_name = f'{base_name}{f.suffix}'
+                new_name = f'{preserve_name_qualifiers(base_name, f.stem)}{f.suffix}'
 
                 if new_name == f.name:
                     continue
@@ -570,7 +573,9 @@ class TagRenamingStage:
 
             artist = remove_junk(str(tags.artist))
             title = remove_junk(str(tags.title))
-            current_new_name = build_safe_filename(artist, title, f.suffix)
+            current_new_name = build_safe_filename(
+                artist, title, f.suffix, source_stem=f.stem
+            )
 
             if current_new_name == f.name:
                 ctx.log_debug(f'Файл {f.name} уже имеет корректное имя, пропускаю')
@@ -728,16 +733,17 @@ class TagRenamingStage:
 
                 last_action = 'n'
 
-                for f, file_title, _old_new_name, tag_artist, tag_title in categorized[
-                    cat_key
-                ]:
+                for (
+                    f,
+                    file_title,
+                    current_new_name,
+                    tag_artist,
+                    tag_title,
+                ) in categorized[cat_key]:
                     interactor.display(f'\n  {f.name}')
                     interactor.display(f'      Файл: {file_title or "(нет)"}')
                     interactor.display(f'      Теги: {tag_artist} - {tag_title}')
 
-                    current_new_name = build_safe_filename(
-                        tag_artist, tag_title, f.suffix
-                    )
                     parsed = tags_from_filename(
                         f.stem, tag_artist, tag_title, repair_brackets=False
                     )
@@ -828,7 +834,7 @@ class TagRenamingStage:
 
             cleaned = INVALID_FILENAME_CHARS.sub('', raw_name)
             cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-            if f'{cleaned}{f.suffix}' == f.name:
+            if f'{preserve_name_qualifiers(cleaned, f.stem)}{f.suffix}' == f.name:
                 continue
 
             if '/' in invalid_chars:
@@ -888,7 +894,9 @@ class TagRenamingStage:
             interactor.display(f'  {i}. {current_name}')
             interactor.display(f'     {proposed_name}')
             if preview_result:
-                interactor.display(f'     → {preview_result}')
+                interactor.display(
+                    f'     → {preserve_name_qualifiers(preview_result, f.stem)}'
+                )
             else:
                 interactor.display(f'     → {proposed_name}')
 
@@ -976,7 +984,7 @@ class TagRenamingStage:
     def _titles_match(self, file_title: str, tag_title: str) -> bool:
         """Проверяет, совпадают ли названия (с допуском на различия)."""
         f = file_title.lower().strip()
-        t = tag_title.lower().strip()
+        t = preserve_name_qualifiers(tag_title, file_title).lower().strip()
         if f == t:
             return True
         return f in t or t in f
@@ -1022,7 +1030,9 @@ class TagWritingStage:
 
         labels: list[str] = []
         for f, _, artist, title in tags_to_write:
-            new_filename = build_safe_filename(artist, title, f.suffix)
+            new_filename = build_safe_filename(
+                artist, title, f.suffix, source_stem=f.stem
+            )
             if new_filename != f.name:
                 labels.append(
                     f'{f.name} → {new_filename} (artist: {artist!r}, title: {title!r})'
@@ -1052,7 +1062,9 @@ class TagWritingStage:
                 continue
             written_count += 1
             ctx.increment_stat('tags_written')
-            new_filename = build_safe_filename(artist, title, f.suffix)
+            new_filename = build_safe_filename(
+                artist, title, f.suffix, source_stem=f.stem
+            )
             if new_filename != f.name:
                 renamed = _file_executor.rename(
                     f, f.with_name(new_filename), ctx, repo, interactor
@@ -1193,7 +1205,7 @@ class ArtistNormalizationStage:
                         base_name = clean_filename_safely(
                             raw_name, f.name, ctx, interactor
                         )
-                        if base_name == 'SKIP':
+                        if not base_name or base_name == 'SKIP':
                             ctx.log_debug(
                                 f'Пропущен из-за недопустимых символов: {f.name}'
                             )
@@ -1201,7 +1213,9 @@ class ArtistNormalizationStage:
                     else:
                         base_name = raw_name
 
-                    new_name = f'{base_name}{f.suffix}'
+                    new_name = (
+                        f'{preserve_name_qualifiers(base_name, f.stem)}{f.suffix}'
+                    )
                     new_path = f.with_name(new_name)
                     renamed = _file_executor.rename(f, new_path, ctx, repo, interactor)
                     if renamed.is_confirmed_change or renamed.is_model_change:
@@ -1288,13 +1302,13 @@ class ManualInputStage:
 
             if INVALID_FILENAME_CHARS.search(raw_name):
                 base_name = clean_filename_safely(raw_name, f.name, ctx, interactor)
-                if base_name == 'SKIP':
+                if not base_name or base_name == 'SKIP':
                     interactor.display(f'  Переименование пропущено: {f.name}')
                     continue
             else:
                 base_name = raw_name
 
-            new_name = f'{base_name}{f.suffix}'
+            new_name = f'{preserve_name_qualifiers(base_name, f.stem)}{f.suffix}'
             new_path = f.with_name(new_name)
             if new_path.name != f.name:
                 _file_executor.rename(f, new_path, ctx, repo, interactor)

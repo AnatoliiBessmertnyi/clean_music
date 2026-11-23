@@ -1,7 +1,6 @@
 """Поиск кандидатов и сравнение исходных признаков без изменения файлов."""
 
 import os
-import re
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -10,11 +9,14 @@ from pathlib import Path
 from typing import BinaryIO
 
 from file_state import FileRegistry
-from naming import normalize_filename_stem, normalize_unicode
+from naming import (
+    COPY_SUFFIX,
+    normalize_filename_stem,
+    normalize_unicode,
+    split_qualifiers,
+)
 from tag_repository import MetadataRead, TagRepository
 
-_QUALIFIER = re.compile(r'\s*(?:\(([^()\[\]]+)\)|\[([^()\[\]]+)\])$')
-_COPY_SUFFIX = re.compile(r' \([1-9][0-9]*\)')
 _CHUNK_SIZE = 1024 * 1024
 
 
@@ -121,7 +123,7 @@ def decide_copies(
             and candidate.metadata.complete_tags == winner.metadata.complete_tags
             and candidate.path.suffix == winner.path.suffix
             and candidate.path.stem.startswith(winner.path.stem)
-            and _COPY_SUFFIX.fullmatch(candidate.path.stem[len(winner.path.stem) :])
+            and COPY_SUFFIX.fullmatch(candidate.path.stem[len(winner.path.stem) :])
         }
 
     for pair in pairs:
@@ -158,12 +160,8 @@ def _normalize(text: str) -> str:
 
 
 def _split_qualifiers(text: str) -> tuple[str, tuple[str, ...]]:
-    base = text.rstrip()
-    qualifiers = []
-    while (match := _QUALIFIER.search(base)) is not None:
-        qualifiers.append(match[1] or match[2])
-        base = base[: match.start()].rstrip()
-    return base or text, tuple(reversed(qualifiers))
+    base, groups = split_qualifiers(text)
+    return base, tuple(group[1:-1] for group in groups)
 
 
 def find_candidate_groups(
