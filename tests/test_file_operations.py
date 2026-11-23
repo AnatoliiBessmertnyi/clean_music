@@ -360,3 +360,31 @@ def test_default_executor_same_path_is_noop(tmp_path: Path) -> None:
     assert result.path == path
     assert path.read_bytes() == b'audio'
     assert ctx.registry.current_paths() == [path]
+
+
+def test_tag_write_blocked_without_reason(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    source = tmp_path / 'Track.mp3'
+    source.write_bytes(b'synthetic')
+    ctx = SessionContext(False, False)
+    ctx.block_path(source, '')
+    with caplog.at_level('INFO', logger='clean_music'):
+        result = FileExecutor().write_tags(
+            source, 'Artist', 'Title', ctx, MemoryRepository(), Interactor()
+        )
+
+    reason = 'запись тегов заблокирована, причина не указана'
+    assert result == OperationResult(OperationStatus.ERROR, source, reason)
+    [operation] = [
+        record.operation
+        for record in caplog.records
+        if hasattr(record, 'operation') and record.operation.kind == 'tags'
+    ]
+    assert (operation.path, operation.result, operation.reason) == (
+        str(source),
+        'блокировка',
+        reason,
+    )
+    assert ctx.is_path_blocked(source)
+    assert source.read_bytes() == b'synthetic'
