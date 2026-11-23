@@ -56,7 +56,10 @@ class FileExecutor:
             return OperationResult(OperationStatus.ERROR, None, reason)
 
         if not modification_allowed(current, ctx, interactor):
-            reason = ctx.get_block_reason(current) or '??????????? ?? ?????????'
+            reason = (
+                ctx.get_block_reason(current)
+                or 'запись тегов заблокирована, причина не указана'
+            )
             log_operation(
                 'tags',
                 current,
