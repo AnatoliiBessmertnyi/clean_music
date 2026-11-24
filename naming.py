@@ -96,8 +96,23 @@ def split_qualifiers(text: str) -> tuple[str, tuple[str, ...]]:
     return base or text, tuple(reversed(groups))
 
 
-def preserve_name_qualifiers(stem: str, source_stem: str) -> str:
-    """Дополняет только создаваемое имя после выбора способа санитизации."""
+def title_separator(title: str) -> int | None:
+    """Первый слэш вне скобок. При нарушенной парности деление небезопасно."""
+    expected = []
+    separator = None
+    for index, char in enumerate(title):
+        if char in '([':
+            expected.append(')' if char == '(' else ']')
+        elif char in ')]':
+            if not expected or expected.pop() != char:
+                return None
+        elif char == '/' and not expected and separator is None:
+            separator = index
+    return None if expected else separator
+
+
+def qualifier_name_candidate(stem: str, source_stem: str) -> tuple[str, bool]:
+    """Имя с написанием из тегов и признак необходимости отдельного выбора."""
     cleaned = remove_junk(source_stem)
     _, groups = split_qualifiers(cleaned)
     _, existing = split_qualifiers(stem)
@@ -113,13 +128,42 @@ def preserve_name_qualifiers(stem: str, source_stem: str) -> str:
         and COPY_SUFFIX.fullmatch(' ' + groups[-1])
     ):
         groups = groups[:-1]
+    unmatched = []
     for group in groups:
         value = key(group)
         if value in available:
             available.remove(value)
         else:
+            unmatched.append((group, value))
+
+    ambiguous = False
+    for group, value in unmatched:
+        # Только сигнал для ручного выбора. Анализ дублей использует исходные признаки.
+        alternatives = [
+            other
+            for other in available
+            if len(other) == len(value)
+            and all(
+                a == b
+                or (
+                    unicodedata.category(a).startswith('P')
+                    and unicodedata.category(b).startswith('P')
+                    and not INVALID_FILENAME_CHARS.search(a + b)
+                )
+                for a, b in zip(value, other, strict=True)
+            )
+        ]
+        if alternatives:
+            ambiguous = True
+            available.remove(alternatives[0])
+        else:
             stem += ' ' + group
-    return stem
+    return stem, ambiguous
+
+
+def preserve_name_qualifiers(stem: str, source_stem: str) -> str:
+    proposed, ambiguous = qualifier_name_candidate(stem, source_stem)
+    return source_stem if ambiguous else proposed
 
 
 def build_safe_filename(
@@ -141,8 +185,11 @@ def build_safe_filename(
         >>> build_safe_filename("AC/DC", "Back in Black", ".mp3")
         'ACDC - Back in Black.mp3'
     """
-    raw_name = f'{artist} - {title}'
-    raw_name = normalize_title_spacing(raw_name)
+    base, groups = split_qualifiers(title)
+    if groups and '/' in title:
+        suffix = ' '.join(group.replace('/', '_') for group in groups)
+        title = f'{base} {suffix}' if base != title else suffix
+    raw_name = normalize_title_spacing(f'{artist} - {title}')
     cleaned = INVALID_FILENAME_CHARS.sub('', raw_name)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     return f'{preserve_name_qualifiers(cleaned, source_stem)}{extension}'

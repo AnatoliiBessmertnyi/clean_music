@@ -1,11 +1,14 @@
 """Тесты для функций работы с именами."""
 
+import pytest
+
 from naming import (
     build_safe_filename,
     normalize_dash,
     normalize_title_spacing,
     remove_junk,
 )
+from strategies import BilingualTitleStrategy
 
 
 class TestNormalizeTitleSpacing:
@@ -82,3 +85,36 @@ class TestBuildSafeFilename:
     def test_multiple_spaces_normalized(self) -> None:
         result = build_safe_filename('Artist', 'Title   (feat. Guest)', '.mp3')
         assert result == 'Artist - Title (feat. Guest).mp3'
+
+
+@pytest.mark.parametrize('group', ['(w/o Guest)', '[w/o Guest]', '(feat. w/o Guest)'])
+@pytest.mark.parametrize('first', [True, False])
+def test_bilingual_title_only_splits_outside_groups(group: str, first: bool) -> None:
+    strategy = BilingualTitleStrategy(first)
+    safe = group.replace('/', '_')
+    assert strategy.apply(f'Artist - Title {group}', {'/'}) == f'Artist - Title {safe}'
+    chosen = 'English' if first else 'Second'
+    assert (
+        strategy.apply(f'Artist - English / Second {group}', {'/'})
+        == f'Artist - {chosen} {safe}'
+    )
+    assert strategy.apply('Artist - English / Second', {'/'}) == f'Artist - {chosen}'
+    assert strategy.apply('Artist - English / (Second)', {'/'}) == (
+        'Artist - English' if first else 'Artist - (Second)'
+    )
+    # An internal slash before the separator must not select the wrong boundary.
+    assert strategy.apply(f'Artist - English {group} / Second', {'/'}) == (
+        f'Artist - English {safe}' if first else 'Artist - Second'
+    )
+
+
+def test_build_name_sanitizes_qualifier_before_matching() -> None:
+    assert (
+        build_safe_filename(
+            'Artist',
+            'Title (w/o Guest)',
+            '.mp3',
+            source_stem='Artist - Title (w_o Guest)',
+        )
+        == 'Artist - Title (w_o Guest).mp3'
+    )

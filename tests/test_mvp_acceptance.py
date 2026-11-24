@@ -396,3 +396,100 @@ def test_safe_sanitizes_name_and_keeps_version(
             op.get('kind') in ('tags', 'rename') for op in report_operations(repeated)
         )
         assert target.read_bytes() == original
+
+
+@windows
+@pytest.mark.parametrize('source_title', ['Title', 'Title (w_o Guest)'])
+def test_safe_qualifier_slash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_title: str
+) -> None:
+    root = tmp_path / 'music'
+    root.mkdir()
+    source = root / f'Artist - {source_title}.mp3'
+    title = 'Title (w/o Guest)'
+    target = root / 'Artist - Title (w_o Guest).mp3'
+    synthetic_audio(source, title=title)
+    original = source.read_bytes()
+    for dry_run in (True, False):
+        answers = ['safe', str(root), '1'] + (['y'] if target != source else [])
+        _, report = run_cli(tmp_path, monkeypatch, answers, dry_run=dry_run)
+        renames = [op for op in report_operations(report) if op.get('kind') == 'rename']
+        assert [op['target'] for op in renames] == (
+            [str(target)] if source != target else []
+        )
+        if dry_run:
+            assert source.read_bytes() == original
+    assert target.read_bytes() == original
+    assert TagRepository().read_tags_uncached(target).tags == AudioTags('Artist', title)
+    _, repeated = run_cli(tmp_path, monkeypatch, ['safe', str(root), '1'])
+    assert not any(op.get('kind') == 'rename' for op in report_operations(repeated))
+
+
+@windows
+@pytest.mark.parametrize('occupied', [True, False])
+def test_safe_ambiguous_qualifier_choice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, occupied: bool
+) -> None:
+    root = tmp_path / 'music'
+    root.mkdir()
+    source = root / 'Artist - Title (Original_ 2022 Remaster).mp3'
+    title = 'Title (Original; 2022 Remaster)'
+    target = root / f'Artist - {title}.mp3'
+    synthetic_audio(source, title=title)
+    original = source.read_bytes()
+    if occupied:
+        synthetic_audio(target, title=title, frequency=660)
+    target_before = target.read_bytes() if occupied else None
+    _, skipped = run_cli(tmp_path, monkeypatch, ['safe', str(root), ''])
+    assert not any(
+        op.get('kind') in ('rename', 'tags') for op in report_operations(skipped)
+    )
+    assert source.read_bytes() == original
+    for dry_run in (True, False):
+        _, report = run_cli(
+            tmp_path, monkeypatch, ['safe', str(root), 't'], dry_run=dry_run
+        )
+        assert f'{source.name} → {target.name}' in report
+        [rename] = [
+            op for op in report_operations(report) if op.get('kind') == 'rename'
+        ]
+        assert Path(rename['target']) == target
+        assert rename['result'] == (
+            'конфликт' if occupied else 'ПРЕДЛОЖЕНИЕ' if dry_run else 'успех'
+        )
+        if dry_run or occupied:
+            assert source.read_bytes() == original
+    if occupied:
+        assert target.read_bytes() == target_before
+    else:
+        assert target.read_bytes() == original
+        _, repeated = run_cli(tmp_path, monkeypatch, ['safe', str(root)])
+        assert not any(op.get('kind') == 'rename' for op in report_operations(repeated))
+
+
+@windows
+@pytest.mark.parametrize('choice', ['', 't'])
+def test_deep_qualifier_choice_before_duplicate_analysis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, choice: str
+) -> None:
+    root = tmp_path / 'music'
+    root.mkdir()
+    title = 'Title (Original; 2022 Remaster)'
+    source = root / 'Artist - Title (Original_ 2022 Remaster).mp3'
+    numbered = root / f'Artist - {title} (1).mp3'
+    synthetic_audio(source, title=title)
+    shutil.copyfile(source, numbered)
+    before = snapshot(root)
+    _, report = run_cli(
+        tmp_path, monkeypatch, ['deep', 'run', str(root), choice, 'n'], dry_run=True
+    )
+    ops = report_operations(report)
+    renamed = [op['target'] for op in ops if op.get('kind') == 'rename']
+    deletes = [op['path'] for op in ops if op.get('kind') == 'duplicate_delete']
+    assert renamed == ([str(root / f'Artist - {title}.mp3')] if choice else [])
+    assert deletes == ([str(numbered)] if choice else [])
+    assert 'Уточнения (имя): Original; 2022 Remaster' in report
+    if not choice:
+        assert 'Уточнения (имя): Original_ 2022 Remaster' in report
+        assert 'Выбор копии пропущен' in report
+    assert snapshot(root) == before
