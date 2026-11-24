@@ -10,6 +10,7 @@ from config import (
 )
 
 _BRACKET_GROUP = re.compile(r'\(([^()\[\]]*)\)|\[([^()\[\]]*)\]')
+COPY_SUFFIX = re.compile(r' \([1-9][0-9]*\)')
 _BRACKET_CHAR = re.compile(r'[()\[\]]')
 
 
@@ -70,7 +71,60 @@ def normalize_title_spacing(text: str) -> str:
     return text.strip()
 
 
-def build_safe_filename(artist: str, title: str, extension: str) -> str:
+def split_qualifiers(text: str) -> tuple[str, tuple[str, ...]]:
+    """Отделяет хвостовые группы, сохраняя порядок и вид парных скобок."""
+    base = text.rstrip()
+    groups: list[str] = []
+    while base.endswith((')', ']')):
+        expected = []
+        for index in range(len(base) - 1, -1, -1):
+            char = base[index]
+            if char in ')]':
+                expected.append('(' if char == ')' else '[')
+            elif char in '([':
+                if char != expected.pop():
+                    return base, tuple(reversed(groups))
+                if not expected:
+                    break
+        else:
+            break
+        group = base[index:]
+        if not group[1:-1].strip():
+            break
+        groups.append(group)
+        base = base[:index].rstrip()
+    return base or text, tuple(reversed(groups))
+
+
+def preserve_name_qualifiers(stem: str, source_stem: str) -> str:
+    """Дополняет только создаваемое имя после выбора способа санитизации."""
+    cleaned = remove_junk(source_stem)
+    _, groups = split_qualifiers(cleaned)
+    _, existing = split_qualifiers(stem)
+
+    def key(group: str) -> str:
+        _, normalized = normalize_feat_pair('', group)
+        return normalize_filename_stem(normalized[1:-1]).casefold()
+
+    available = [key(group) for group in existing]
+    if (
+        groups
+        and cleaned.endswith(' ' + groups[-1])
+        and COPY_SUFFIX.fullmatch(' ' + groups[-1])
+    ):
+        groups = groups[:-1]
+    for group in groups:
+        value = key(group)
+        if value in available:
+            available.remove(value)
+        else:
+            stem += ' ' + group
+    return stem
+
+
+def build_safe_filename(
+    artist: str, title: str, extension: str, *, source_stem: str = ''
+) -> str:
     """Формирует безопасное имя файла из тегов.
 
     Args:
@@ -91,7 +145,7 @@ def build_safe_filename(artist: str, title: str, extension: str) -> str:
     raw_name = normalize_title_spacing(raw_name)
     cleaned = INVALID_FILENAME_CHARS.sub('', raw_name)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    return f'{cleaned}{extension}'
+    return f'{preserve_name_qualifiers(cleaned, source_stem)}{extension}'
 
 
 def remove_annotation_from_text(text: str, annotation: str) -> str:

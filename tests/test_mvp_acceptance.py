@@ -308,3 +308,91 @@ def test_safe_refuses_tag_write_with_id3v1_trailer(
     assert inspect_file(source) == identity and source.read_bytes() == original
     assert repo.read_tags_uncached(source).tags == tags
     assert {p.name for p in (root / DIRECTORY_NAME).iterdir()} == {'owner', 'lock'}
+
+
+@windows
+@pytest.mark.parametrize(
+    'qualifier', ['(Album Version)', '(Original Mix)', '(Archive Take Z)']
+)
+def test_name_only_version_reaches_deep_analysis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, qualifier: str
+) -> None:
+    root = tmp_path / 'music'
+    root.mkdir()
+    source = root / f'Artist - Title {qualifier}.mp3'
+    synthetic_audio(source, title='Title')
+    original = source.read_bytes()
+    for dry_run in (True, False):
+        _, report = run_cli(tmp_path, monkeypatch, ['safe', str(root)], dry_run=dry_run)
+        assert not any(
+            op.get('kind') in ('tags', 'rename') for op in report_operations(report)
+        )
+        assert source.read_bytes() == original
+    shutil.copyfile(source, root / 'Artist - Title (1).mp3')
+    before = snapshot(root)
+    # Keep the numbered candidate for duplicate analysis.
+    _, report = run_cli(
+        tmp_path, monkeypatch, ['deep', 'run', str(root), 'n'], dry_run=True
+    )
+    assert f'Уточнения (имя): {qualifier[1:-1]}' in report
+    assert 'в группе нет единственного имени, соответствующего тегам' in report
+    assert 'Уточнения в имени и теге расходятся' in report
+    assert not any(
+        op.get('kind') in ('rename', 'duplicate_delete', 'tags')
+        for op in report_operations(report)
+    )
+    assert f'{source.name}  ->' not in report
+    assert snapshot(root) == before
+    assert TagRepository().read_tags_uncached(source).tags == AudioTags(
+        'Artist', 'Title'
+    )
+
+
+def report_operations(report: str) -> list[dict]:
+    return [json.loads(line) for line in report.splitlines() if line.startswith('{')]
+
+
+@windows
+@pytest.mark.parametrize('occupied', [False, True])
+def test_safe_sanitizes_name_and_keeps_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, occupied: bool
+) -> None:
+    root = tmp_path / 'music'
+    root.mkdir()
+    source = root / 'Old - Title (Album Version) [Archive Take Z] (vksaver).mp3'
+    synthetic_audio(source, artist='Art/ist', title='Title (Album Version)')
+    original = source.read_bytes()
+    target = root / 'Artist - Title (Album Version) [Archive Take Z].mp3'
+    if occupied:
+        synthetic_audio(
+            target, artist='Art/ist', title='Title (Album Version)', frequency=660
+        )
+    before = snapshot(root)
+    for dry_run in (True, False):
+        _, report = run_cli(
+            tmp_path, monkeypatch, ['safe', str(root), 'y', '1', 'y'], dry_run=dry_run
+        )
+        renames = [op for op in report_operations(report) if op.get('kind') == 'rename']
+        assert len(renames) == 2
+        assert Path(renames[0]['target']).name == source.name.replace(' (vksaver)', '')
+        assert Path(renames[1]['target']) == target
+        assert renames[1]['result'] == (
+            'конфликт' if occupied else 'ПРЕДЛОЖЕНИЕ' if dry_run else 'успех'
+        )
+        if dry_run:
+            assert snapshot(root) == before
+    current = (
+        source.with_name(source.name.replace(' (vksaver)', '')) if occupied else target
+    )
+    assert current.read_bytes() == original
+    assert TagRepository().read_tags_uncached(current).tags == AudioTags(
+        'Art/ist', 'Title (Album Version)'
+    )
+    if occupied:
+        assert target.read_bytes() == before[target.name]
+    else:
+        _, repeated = run_cli(tmp_path, monkeypatch, ['safe', str(root)])
+        assert not any(
+            op.get('kind') in ('tags', 'rename') for op in report_operations(repeated)
+        )
+        assert target.read_bytes() == original
