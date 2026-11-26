@@ -437,6 +437,8 @@ class TagRenamingStage:
                 if invalid_chars:
                     problem_key = self._invalid_name_group(raw_name, invalid_chars)
 
+                    if self._already_sanitized(raw_name, f.stem, problem_key):
+                        continue
                     if problem_key in strategies:
                         strategy, params = strategies[problem_key]
 
@@ -840,13 +842,7 @@ class TagRenamingStage:
                 continue
 
             problem_key = self._invalid_name_group(raw_name, invalid_chars)
-            cleaned = (
-                raw_name.replace('/', '_')
-                if problem_key == 'qualifier_slash'
-                else INVALID_FILENAME_CHARS.sub('', raw_name)
-            )
-            cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-            if qualifier_name_candidate(cleaned, f.stem)[0] == f.stem:
+            if self._already_sanitized(raw_name, f.stem, problem_key):
                 continue
 
             if problem_key not in problems:
@@ -975,6 +971,16 @@ class TagRenamingStage:
         if idx == 3:
             return ('manual', {})
         return ('skip', {})
+
+    @staticmethod
+    def _already_sanitized(raw_name: str, source_stem: str, problem_key: str) -> bool:
+        cleaned = (
+            raw_name.replace('/', '_')
+            if problem_key == 'qualifier_slash'
+            else INVALID_FILENAME_CHARS.sub('', raw_name)
+        )
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        return qualifier_name_candidate(cleaned, source_stem)[0] == source_stem
 
     @staticmethod
     def _invalid_name_group(raw_name: str, invalid_chars: set[str]) -> str:

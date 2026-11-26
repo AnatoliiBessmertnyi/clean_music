@@ -413,6 +413,7 @@ def test_safe_qualifier_slash(
     for dry_run in (True, False):
         answers = ['safe', str(root), '1'] + (['y'] if target != source else [])
         _, report = run_cli(tmp_path, monkeypatch, answers, dry_run=dry_run)
+        assert 'способ исправления имени не выбран' not in report
         renames = [op for op in report_operations(report) if op.get('kind') == 'rename']
         assert [op['target'] for op in renames] == (
             [str(target)] if source != target else []
@@ -422,6 +423,7 @@ def test_safe_qualifier_slash(
     assert target.read_bytes() == original
     assert TagRepository().read_tags_uncached(target).tags == AudioTags('Artist', title)
     _, repeated = run_cli(tmp_path, monkeypatch, ['safe', str(root), '1'])
+    assert 'способ исправления имени не выбран' not in repeated
     assert not any(op.get('kind') == 'rename' for op in report_operations(repeated))
 
 
@@ -492,4 +494,26 @@ def test_deep_qualifier_choice_before_duplicate_analysis(
     if not choice:
         assert 'Уточнения (имя): Original_ 2022 Remaster' in report
         assert 'Выбор копии пропущен' in report
+    assert snapshot(root) == before
+
+
+@windows
+def test_already_sanitized_name_is_independent_of_group_choice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / 'music'
+    root.mkdir()
+    fixed = root / 'First - Title (from Work).mp3'
+    other = root / 'Second - Title.mp3'
+    title = 'Title (from "Work")'
+    synthetic_audio(fixed, artist='First', title=title)
+    synthetic_audio(other, artist='Second', title=title)
+    before = snapshot(root)
+    _, report = run_cli(
+        tmp_path, monkeypatch, ['safe', str(root), '2', 'y'], dry_run=True
+    )
+    assert 'способ исправления имени не выбран' not in report
+    [rename] = [op for op in report_operations(report) if op.get('kind') == 'rename']
+    assert rename['path'] == str(other)
+    assert Path(rename['target']).name == 'Second - Title (from -Work-).mp3'
     assert snapshot(root) == before
