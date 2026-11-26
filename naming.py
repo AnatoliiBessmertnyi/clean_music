@@ -96,8 +96,48 @@ def split_qualifiers(text: str) -> tuple[str, tuple[str, ...]]:
     return base or text, tuple(reversed(groups))
 
 
-def preserve_name_qualifiers(stem: str, source_stem: str) -> str:
-    """Дополняет только создаваемое имя после выбора способа санитизации."""
+def title_separator(title: str) -> int | None:
+    """Первый слэш вне скобок. При нарушенной парности деление небезопасно."""
+    expected = []
+    separator = None
+    for index, char in enumerate(title):
+        if char in '([':
+            expected.append(')' if char == '(' else ']')
+        elif char in ')]':
+            if not expected or expected.pop() != char:
+                return None
+        elif char == '/' and not expected and separator is None:
+            separator = index
+    return None if expected else separator
+
+
+def _matches_windows_form(raw: str, value: str) -> bool:
+    """Сопоставляет ключи одной группы с независимой заменой каждого знака."""
+    # Ключ уже обрезан. Граничные пробелы позволяют так же свернуть пробел,
+    # возникший после замены, как это делает normalize_filename_stem.
+    padded = f' {value} '
+    positions = {1}
+    for char in raw:
+        options: tuple[str, ...] = (char,)
+        if INVALID_FILENAME_CHARS.fullmatch(char):
+            options = ('', '_', '-', ' ', "'") if char == '"' else ('', '_', '-', ' ')
+        following = set()
+        for pos in positions:
+            for option in options:
+                if not option or (option == ' ' and padded[pos - 1] == ' '):
+                    following.add(pos)
+                elif padded.startswith(option, pos):
+                    following.add(pos + 1)
+        if not following:
+            return False
+        positions = following
+    return len(padded) - 1 in positions or len(padded) in positions
+
+
+def qualifier_name_candidate(
+    stem: str, source_stem: str, raw_name: str = ''
+) -> tuple[str, bool]:
+    """Имя с написанием из тегов и признак необходимости отдельного выбора."""
     cleaned = remove_junk(source_stem)
     _, groups = split_qualifiers(cleaned)
     _, existing = split_qualifiers(stem)
@@ -106,20 +146,61 @@ def preserve_name_qualifiers(stem: str, source_stem: str) -> str:
         _, normalized = normalize_feat_pair('', group)
         return normalize_filename_stem(normalized[1:-1]).casefold()
 
+    # Возможные написания одной группы служат только для индивидуального выбора.
     available = [key(group) for group in existing]
+    raw_keys = [
+        key(group)
+        for group in split_qualifiers(raw_name)[1]
+        if INVALID_FILENAME_CHARS.search(group)
+    ]
+    origins = {
+        other: [raw for raw in raw_keys if _matches_windows_form(raw, other)]
+        for other in available
+    }
     if (
         groups
         and cleaned.endswith(' ' + groups[-1])
         and COPY_SUFFIX.fullmatch(' ' + groups[-1])
     ):
         groups = groups[:-1]
+    unmatched = []
     for group in groups:
         value = key(group)
         if value in available:
             available.remove(value)
         else:
+            unmatched.append((group, value))
+
+    ambiguous = False
+    for group, value in unmatched:
+        # Только сигнал для ручного выбора. Анализ дублей использует исходные признаки.
+        alternatives = [
+            other
+            for other in available
+            if any(_matches_windows_form(raw, value) for raw in origins.get(other, []))
+            or not origins.get(other)
+            and len(other) == len(value)
+            and all(
+                a == b
+                or (
+                    unicodedata.category(a).startswith('P')
+                    and unicodedata.category(b).startswith('P')
+                    and not INVALID_FILENAME_CHARS.search(a + b)
+                )
+                for a, b in zip(value, other, strict=True)
+            )
+        ]
+        if alternatives:
+            ambiguous = True
+            available.remove(alternatives[0])
+        else:
             stem += ' ' + group
-    return stem
+    return stem, ambiguous
+
+
+def preserve_name_qualifiers(stem: str, source_stem: str, raw_name: str = '') -> str:
+    proposed, ambiguous = qualifier_name_candidate(stem, source_stem, raw_name)
+    return source_stem if ambiguous else proposed
 
 
 def build_safe_filename(
@@ -141,11 +222,17 @@ def build_safe_filename(
         >>> build_safe_filename("AC/DC", "Back in Black", ".mp3")
         'ACDC - Back in Black.mp3'
     """
-    raw_name = f'{artist} - {title}'
-    raw_name = normalize_title_spacing(raw_name)
+    original_title = title
+    base, groups = split_qualifiers(title)
+    if groups and '/' in title:
+        suffix = ' '.join(group.replace('/', '_') for group in groups)
+        title = f'{base} {suffix}' if base != title else suffix
+    raw_name = normalize_title_spacing(f'{artist} - {title}')
     cleaned = INVALID_FILENAME_CHARS.sub('', raw_name)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    return f'{preserve_name_qualifiers(cleaned, source_stem)}{extension}'
+    return (
+        f'{preserve_name_qualifiers(cleaned, source_stem, original_title)}{extension}'
+    )
 
 
 def remove_annotation_from_text(text: str, annotation: str) -> str:

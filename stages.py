@@ -20,8 +20,10 @@ from naming import (
     normalize_filename_stem,
     normalize_title_spacing,
     preserve_name_qualifiers,
+    qualifier_name_candidate,
     remove_feat_guests_from_artist,
     remove_junk,
+    title_separator,
 )
 from parsing import (
     extract_title_from_filename,
@@ -411,6 +413,7 @@ class TagRenamingStage:
                 )
                 strategies[problem_key] = (strategy, params)
 
+        confirmed: list[tuple[int, Path, str]] = []
         safe_candidates: list[tuple[int, Path, str]] = []
         mismatch_candidates: list[tuple[Path, str, str]] = []
         missing: list[Path] = []
@@ -432,18 +435,10 @@ class TagRenamingStage:
 
                 invalid_chars = set(INVALID_FILENAME_CHARS.findall(raw_name))
                 if invalid_chars:
-                    if '/' in invalid_chars:
-                        slash_type = self._categorize_slash_usage(raw_name)
-                        if slash_type == 'bilingual_title':
-                            problem_key = 'bilingual_title'
-                        elif slash_type == 'artist_name':
-                            problem_key = 'artist_name'
-                        else:
-                            problem_key = 'other'
-                    else:
-                        chars_str = ''.join(sorted(invalid_chars))
-                        problem_key = f'other:{chars_str}'
+                    problem_key = self._invalid_name_group(raw_name, invalid_chars)
 
+                    if self._already_sanitized(raw_name, f.stem, problem_key):
+                        continue
                     if problem_key in strategies:
                         strategy, params = strategies[problem_key]
 
@@ -486,9 +481,23 @@ class TagRenamingStage:
                 else:
                     base_name = raw_name
 
-                new_name = f'{preserve_name_qualifiers(base_name, f.stem)}{f.suffix}'
-
+                proposed, ambiguous = qualifier_name_candidate(
+                    base_name, f.stem, raw_name
+                )
+                new_name = f'{proposed}{f.suffix}'
                 if new_name == f.name:
+                    continue
+                if ambiguous:
+                    interactor.display(
+                        f'  Разная пунктуация в уточнениях: {f.name} → {new_name}'
+                    )
+                    choice = prompt_command(
+                        interactor,
+                        '  t — выбрать написание из тегов, Enter — оставить имя: ',
+                        default='n',
+                    )
+                    if choice == 't':
+                        confirmed.append((position, f, new_name))
                     continue
 
                 if user_already_chose or self._titles_match(file_title, title):
@@ -507,11 +516,13 @@ class TagRenamingStage:
                 interactor,
             )
 
+            confirmed.extend(safe_candidates[i] for i in selected_indices)
+
+        if confirmed:
             renamed_count = 0
             duplicates_found: list[tuple[Path, Path]] = []
 
-            for i in selected_indices:
-                position, old_path, new_name = safe_candidates[i]
+            for position, old_path, new_name in confirmed:
                 new_path = old_path.with_name(new_name)
                 result = _file_executor.rename(
                     old_path, new_path, ctx, repo, interactor
@@ -832,22 +843,9 @@ class TagRenamingStage:
             if not invalid_chars:
                 continue
 
-            cleaned = INVALID_FILENAME_CHARS.sub('', raw_name)
-            cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-            if f'{preserve_name_qualifiers(cleaned, f.stem)}{f.suffix}' == f.name:
+            problem_key = self._invalid_name_group(raw_name, invalid_chars)
+            if self._already_sanitized(raw_name, f.stem, problem_key):
                 continue
-
-            if '/' in invalid_chars:
-                slash_type = self._categorize_slash_usage(raw_name)
-                if slash_type == 'bilingual_title':
-                    problem_key = 'bilingual_title'
-                elif slash_type == 'artist_name':
-                    problem_key = 'artist_name'
-                else:
-                    problem_key = 'other'
-            else:
-                chars_str = ''.join(sorted(invalid_chars))
-                problem_key = f'other:{chars_str}'
 
             if problem_key not in problems:
                 problems[problem_key] = []
@@ -863,6 +861,18 @@ class TagRenamingStage:
         interactor: UserInteractor,
     ) -> tuple[str, dict]:
         """Запрашивает у пользователя стратегию обработки для группы файлов."""
+        if problem_key == 'qualifier_slash':
+            interactor.display("  Слэш внутри уточнения: заменить '/' на '_' в имени?")
+            for path, _, raw_name in examples:
+                proposed, _ = qualifier_name_candidate(
+                    raw_name.replace('/', '_'), path.stem, raw_name
+                )
+                interactor.display(f'  {path.name} → {proposed}{path.suffix}')
+            choice = prompt_command(
+                interactor, '  1 — заменить, n — пропустить [1]: ', default='1'
+            )
+            return ('replace', {'char': '_'}) if choice == '1' else ('skip', {})
+
         if problem_key == 'bilingual_title':
             default_strategy = 'first_title'
         elif problem_key == 'artist_name':
@@ -895,7 +905,7 @@ class TagRenamingStage:
             interactor.display(f'     {proposed_name}')
             if preview_result:
                 interactor.display(
-                    f'     → {preserve_name_qualifiers(preview_result, f.stem)}'
+                    f'     → {qualifier_name_candidate(preview_result, f.stem, proposed_name)[0]}'
                 )
             else:
                 interactor.display(f'     → {proposed_name}')
@@ -964,22 +974,29 @@ class TagRenamingStage:
             return ('manual', {})
         return ('skip', {})
 
-    def _categorize_slash_usage(self, raw_name: str) -> str:
-        """Определяет тип использования '/' в имени."""
-        match = re.match(r'^(.+?)\s+-\s+(.+)$', raw_name)
-        if match:
-            artist_part = match.group(1)
-            title_part = match.group(2)
+    @staticmethod
+    def _already_sanitized(raw_name: str, source_stem: str, problem_key: str) -> bool:
+        cleaned = (
+            raw_name.replace('/', '_')
+            if problem_key == 'qualifier_slash'
+            else INVALID_FILENAME_CHARS.sub('', raw_name)
+        )
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        return (
+            qualifier_name_candidate(cleaned, source_stem, raw_name)[0] == source_stem
+        )
 
-            if '/' in artist_part:
+    @staticmethod
+    def _invalid_name_group(raw_name: str, invalid_chars: set[str]) -> str:
+        if '/' in invalid_chars:
+            artist, _, title = raw_name.partition(' - ')
+            if '/' in artist:
                 return 'artist_name'
-            if '/' in title_part:
+            if title_separator(title) is not None:
                 return 'bilingual_title'
-
-        if '/' in raw_name:
-            return 'artist_name'
-
-        return 'other'
+            if invalid_chars == {'/'}:
+                return 'qualifier_slash'
+        return 'other:' + ''.join(sorted(invalid_chars))
 
     def _titles_match(self, file_title: str, tag_title: str) -> bool:
         """Проверяет, совпадают ли названия (с допуском на различия)."""
@@ -1213,9 +1230,7 @@ class ArtistNormalizationStage:
                     else:
                         base_name = raw_name
 
-                    new_name = (
-                        f'{preserve_name_qualifiers(base_name, f.stem)}{f.suffix}'
-                    )
+                    new_name = f'{preserve_name_qualifiers(base_name, f.stem, raw_name)}{f.suffix}'
                     new_path = f.with_name(new_name)
                     renamed = _file_executor.rename(f, new_path, ctx, repo, interactor)
                     if renamed.is_confirmed_change or renamed.is_model_change:
@@ -1308,7 +1323,9 @@ class ManualInputStage:
             else:
                 base_name = raw_name
 
-            new_name = f'{preserve_name_qualifiers(base_name, f.stem)}{f.suffix}'
+            new_name = (
+                f'{preserve_name_qualifiers(base_name, f.stem, raw_name)}{f.suffix}'
+            )
             new_path = f.with_name(new_name)
             if new_path.name != f.name:
                 _file_executor.rename(f, new_path, ctx, repo, interactor)

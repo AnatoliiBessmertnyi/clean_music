@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 
 from config import INVALID_FILENAME_CHARS
 from interactor import UserInteractor
+from naming import split_qualifiers, title_separator
 
 
 class SanitizationStrategy(ABC):
@@ -46,26 +47,29 @@ class BilingualTitleStrategy(SanitizationStrategy):
         self.keep_first = keep_first
 
     def apply(self, raw_name: str, invalid_chars: set[str]) -> str | None:
-        feat_suffix = ''
-        feat_match = re.search(r'\s*\(feat\.\s*[^)]+\)\s*$', raw_name)
-        if feat_match:
-            feat_suffix = feat_match.group(0)
-            name_without_feat = raw_name[: feat_match.start()]
-        else:
-            name_without_feat = raw_name
-
-        slash_match = re.search(r'^(.*?\s+-\s+)([^/]+)\s*/\s*(.+)$', name_without_feat)
-        if slash_match:
-            prefix = slash_match.group(1)
-            first_title = slash_match.group(2).strip()
-            second_title = slash_match.group(3).strip()
-
-            chosen_title = first_title if self.keep_first else second_title
-            return f'{prefix}{chosen_title}{feat_suffix}'
-
-        # Если паттерн не найден, просто удаляем '/'
-        result = raw_name.replace('/', '')
-        return re.sub(r'\s+', ' ', result).strip()
+        artist, divider, title = raw_name.partition(' - ')
+        if divider:
+            separator = title_separator(title)
+            if separator is not None:
+                first, second = (
+                    title[:separator].strip(),
+                    title[separator + 1 :].strip(),
+                )
+                if first and second:
+                    second_base, groups = split_qualifiers(second)
+                    if self.keep_first:
+                        # Если всё второе название в скобках, оно само — вариант.
+                        title = (
+                            ' '.join([first, *groups])
+                            if second_base != second
+                            else first
+                        )
+                    else:
+                        title = second
+            raw_name = artist + divider + title
+        return INVALID_FILENAME_CHARS.sub(
+            lambda match: '_' if match[0] == '/' else '', raw_name
+        )
 
 
 class ManualInputStrategy(SanitizationStrategy):
