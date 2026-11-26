@@ -6,9 +6,19 @@ from naming import (
     build_safe_filename,
     normalize_dash,
     normalize_title_spacing,
+    qualifier_name_candidate,
     remove_junk,
 )
 from strategies import BilingualTitleStrategy
+
+
+@pytest.mark.parametrize('source', ['Part_Other-End', 'Part-Work.End', 'Part-Work End'])
+def test_windows_form_requires_literal_text_outside_replacements(source: str) -> None:
+    proposed, offer_choice = qualifier_name_candidate(
+        'Title (Part-Work;End)', f'Title ({source})', 'Title (Part:Work;End)'
+    )
+    assert not offer_choice
+    assert proposed == f'Title (Part-Work;End) ({source})'
 
 
 class TestNormalizeTitleSpacing:

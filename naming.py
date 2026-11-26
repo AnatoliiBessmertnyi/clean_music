@@ -111,6 +111,29 @@ def title_separator(title: str) -> int | None:
     return None if expected else separator
 
 
+def _matches_windows_form(raw: str, value: str) -> bool:
+    """Сопоставляет ключи одной группы с независимой заменой каждого знака."""
+    # Ключ уже обрезан. Граничные пробелы позволяют так же свернуть пробел,
+    # возникший после замены, как это делает normalize_filename_stem.
+    padded = f' {value} '
+    positions = {1}
+    for char in raw:
+        options: tuple[str, ...] = (char,)
+        if INVALID_FILENAME_CHARS.fullmatch(char):
+            options = ('', '_', '-', ' ', "'") if char == '"' else ('', '_', '-', ' ')
+        following = set()
+        for pos in positions:
+            for option in options:
+                if not option or (option == ' ' and padded[pos - 1] == ' '):
+                    following.add(pos)
+                elif padded.startswith(option, pos):
+                    following.add(pos + 1)
+        if not following:
+            return False
+        positions = following
+    return len(padded) - 1 in positions or len(padded) in positions
+
+
 def qualifier_name_candidate(
     stem: str, source_stem: str, raw_name: str = ''
 ) -> tuple[str, bool]:
@@ -124,18 +147,16 @@ def qualifier_name_candidate(
         return normalize_filename_stem(normalized[1:-1]).casefold()
 
     # Возможные написания одной группы служат только для индивидуального выбора.
-    projections = []
-    for raw_group in split_qualifiers(raw_name)[1]:
-        if INVALID_FILENAME_CHARS.search(raw_group):
-            forms = {
-                key(INVALID_FILENAME_CHARS.sub(replacement, raw_group))
-                for replacement in ('', '_', '-', ' ')
-            }
-            if '"' in raw_group:
-                forms.add(key(raw_group.replace('"', "'")))
-            projections.append(forms)
-
     available = [key(group) for group in existing]
+    raw_keys = [
+        key(group)
+        for group in split_qualifiers(raw_name)[1]
+        if INVALID_FILENAME_CHARS.search(group)
+    ]
+    origins = {
+        other: [raw for raw in raw_keys if _matches_windows_form(raw, other)]
+        for other in available
+    }
     if (
         groups
         and cleaned.endswith(' ' + groups[-1])
@@ -156,8 +177,9 @@ def qualifier_name_candidate(
         alternatives = [
             other
             for other in available
-            if any(other in forms and value in forms for forms in projections)
-            or len(other) == len(value)
+            if any(_matches_windows_form(raw, value) for raw in origins.get(other, []))
+            or not origins.get(other)
+            and len(other) == len(value)
             and all(
                 a == b
                 or (

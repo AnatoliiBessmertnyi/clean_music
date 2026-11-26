@@ -440,6 +440,9 @@ def test_safe_qualifier_slash(
         ),
         ('[Live] (from _Work_)', '[Live] (from "Work")', '[Live] (from Work)', ['1']),
         ("(from 'Work')", '(from "Work")', '(from Work)', ['1']),
+        ('[Live] (from _Work-)', '[Live] (from "Work")', '[Live] (from Work)', ['1']),
+        ("(from 'Work_)", '(from "Work")', '(from Work)', ['1']),
+        ('[Part_One-Two]', '[Part:One:Two]', '[Part-One-Two]', ['2']),
         ('[Part Work]', '[Part:Work]', '[Part-Work]', ['2']),
     ],
 )
@@ -519,13 +522,14 @@ def test_deep_qualifier_choice_before_duplicate_analysis(
 
 @windows
 @pytest.mark.parametrize('choice', ['', 't'])
+@pytest.mark.parametrize('source_group', ['from _Work_', 'from _Work-'])
 def test_deep_quote_projection_is_not_duplicate_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, choice: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, choice: str, source_group: str
 ) -> None:
     root = tmp_path / 'music'
     root.mkdir()
     title = 'Title (from "Work")'
-    source = root / 'Artist - Title (from _Work_).mp3'
+    source = root / f'Artist - Title ({source_group}).mp3'
     target = root / 'Artist - Title (from Work).mp3'
     numbered = root / 'Artist - Title (from Work) (1).mp3'
     synthetic_audio(source, title=title)
@@ -544,7 +548,7 @@ def test_deep_quote_projection_is_not_duplicate_evidence(
     assert not any(op.get('kind') == 'duplicate_delete' for op in ops)
     assert 'Уточнения (имя): from Work' in report
     if not choice:
-        assert 'Уточнения (имя): from _Work_' in report
+        assert f'Уточнения (имя): {source_group}' in report
     assert snapshot(root) == before
 
 
