@@ -481,7 +481,9 @@ class TagRenamingStage:
                 else:
                     base_name = raw_name
 
-                proposed, ambiguous = qualifier_name_candidate(base_name, f.stem)
+                proposed, ambiguous = qualifier_name_candidate(
+                    base_name, f.stem, raw_name
+                )
                 new_name = f'{proposed}{f.suffix}'
                 if new_name == f.name:
                     continue
@@ -863,7 +865,7 @@ class TagRenamingStage:
             interactor.display("  Слэш внутри уточнения: заменить '/' на '_' в имени?")
             for path, _, raw_name in examples:
                 proposed, _ = qualifier_name_candidate(
-                    raw_name.replace('/', '_'), path.stem
+                    raw_name.replace('/', '_'), path.stem, raw_name
                 )
                 interactor.display(f'  {path.name} → {proposed}{path.suffix}')
             choice = prompt_command(
@@ -903,7 +905,7 @@ class TagRenamingStage:
             interactor.display(f'     {proposed_name}')
             if preview_result:
                 interactor.display(
-                    f'     → {preserve_name_qualifiers(preview_result, f.stem)}'
+                    f'     → {qualifier_name_candidate(preview_result, f.stem, proposed_name)[0]}'
                 )
             else:
                 interactor.display(f'     → {proposed_name}')
@@ -980,7 +982,9 @@ class TagRenamingStage:
             else INVALID_FILENAME_CHARS.sub('', raw_name)
         )
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-        return qualifier_name_candidate(cleaned, source_stem)[0] == source_stem
+        return (
+            qualifier_name_candidate(cleaned, source_stem, raw_name)[0] == source_stem
+        )
 
     @staticmethod
     def _invalid_name_group(raw_name: str, invalid_chars: set[str]) -> str:
@@ -1226,9 +1230,7 @@ class ArtistNormalizationStage:
                     else:
                         base_name = raw_name
 
-                    new_name = (
-                        f'{preserve_name_qualifiers(base_name, f.stem)}{f.suffix}'
-                    )
+                    new_name = f'{preserve_name_qualifiers(base_name, f.stem, raw_name)}{f.suffix}'
                     new_path = f.with_name(new_name)
                     renamed = _file_executor.rename(f, new_path, ctx, repo, interactor)
                     if renamed.is_confirmed_change or renamed.is_model_change:
@@ -1321,7 +1323,9 @@ class ManualInputStage:
             else:
                 base_name = raw_name
 
-            new_name = f'{preserve_name_qualifiers(base_name, f.stem)}{f.suffix}'
+            new_name = (
+                f'{preserve_name_qualifiers(base_name, f.stem, raw_name)}{f.suffix}'
+            )
             new_path = f.with_name(new_name)
             if new_path.name != f.name:
                 _file_executor.rename(f, new_path, ctx, repo, interactor)

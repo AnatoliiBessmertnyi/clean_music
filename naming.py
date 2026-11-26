@@ -111,7 +111,9 @@ def title_separator(title: str) -> int | None:
     return None if expected else separator
 
 
-def qualifier_name_candidate(stem: str, source_stem: str) -> tuple[str, bool]:
+def qualifier_name_candidate(
+    stem: str, source_stem: str, raw_name: str = ''
+) -> tuple[str, bool]:
     """Имя с написанием из тегов и признак необходимости отдельного выбора."""
     cleaned = remove_junk(source_stem)
     _, groups = split_qualifiers(cleaned)
@@ -120,6 +122,18 @@ def qualifier_name_candidate(stem: str, source_stem: str) -> tuple[str, bool]:
     def key(group: str) -> str:
         _, normalized = normalize_feat_pair('', group)
         return normalize_filename_stem(normalized[1:-1]).casefold()
+
+    # Возможные написания одной группы служат только для индивидуального выбора.
+    projections = []
+    for raw_group in split_qualifiers(raw_name)[1]:
+        if INVALID_FILENAME_CHARS.search(raw_group):
+            forms = {
+                key(INVALID_FILENAME_CHARS.sub(replacement, raw_group))
+                for replacement in ('', '_', '-', ' ')
+            }
+            if '"' in raw_group:
+                forms.add(key(raw_group.replace('"', "'")))
+            projections.append(forms)
 
     available = [key(group) for group in existing]
     if (
@@ -142,7 +156,8 @@ def qualifier_name_candidate(stem: str, source_stem: str) -> tuple[str, bool]:
         alternatives = [
             other
             for other in available
-            if len(other) == len(value)
+            if any(other in forms and value in forms for forms in projections)
+            or len(other) == len(value)
             and all(
                 a == b
                 or (
@@ -161,8 +176,8 @@ def qualifier_name_candidate(stem: str, source_stem: str) -> tuple[str, bool]:
     return stem, ambiguous
 
 
-def preserve_name_qualifiers(stem: str, source_stem: str) -> str:
-    proposed, ambiguous = qualifier_name_candidate(stem, source_stem)
+def preserve_name_qualifiers(stem: str, source_stem: str, raw_name: str = '') -> str:
+    proposed, ambiguous = qualifier_name_candidate(stem, source_stem, raw_name)
     return source_stem if ambiguous else proposed
 
 
@@ -185,6 +200,7 @@ def build_safe_filename(
         >>> build_safe_filename("AC/DC", "Back in Black", ".mp3")
         'ACDC - Back in Black.mp3'
     """
+    original_title = title
     base, groups = split_qualifiers(title)
     if groups and '/' in title:
         suffix = ' '.join(group.replace('/', '_') for group in groups)
@@ -192,7 +208,9 @@ def build_safe_filename(
     raw_name = normalize_title_spacing(f'{artist} - {title}')
     cleaned = INVALID_FILENAME_CHARS.sub('', raw_name)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    return f'{preserve_name_qualifiers(cleaned, source_stem)}{extension}'
+    return (
+        f'{preserve_name_qualifiers(cleaned, source_stem, original_title)}{extension}'
+    )
 
 
 def remove_annotation_from_text(text: str, annotation: str) -> str:

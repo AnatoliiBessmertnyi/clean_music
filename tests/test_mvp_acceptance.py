@@ -429,27 +429,47 @@ def test_safe_qualifier_slash(
 
 @windows
 @pytest.mark.parametrize('occupied', [True, False])
+@pytest.mark.parametrize(
+    ('source_group', 'tag_group', 'target_group', 'strategy'),
+    [
+        (
+            '(Original_ 2022 Remaster)',
+            '(Original; 2022 Remaster)',
+            '(Original; 2022 Remaster)',
+            [],
+        ),
+        ('[Live] (from _Work_)', '[Live] (from "Work")', '[Live] (from Work)', ['1']),
+        ("(from 'Work')", '(from "Work")', '(from Work)', ['1']),
+        ('[Part Work]', '[Part:Work]', '[Part-Work]', ['2']),
+    ],
+)
 def test_safe_ambiguous_qualifier_choice(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, occupied: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    occupied: bool,
+    source_group: str,
+    tag_group: str,
+    target_group: str,
+    strategy: list[str],
 ) -> None:
     root = tmp_path / 'music'
     root.mkdir()
-    source = root / 'Artist - Title (Original_ 2022 Remaster).mp3'
-    title = 'Title (Original; 2022 Remaster)'
-    target = root / f'Artist - {title}.mp3'
+    source = root / f'Artist - Title {source_group}.mp3'
+    title = f'Title {tag_group}'
+    target = root / f'Artist - Title {target_group}.mp3'
     synthetic_audio(source, title=title)
     original = source.read_bytes()
     if occupied:
         synthetic_audio(target, title=title, frequency=660)
     target_before = target.read_bytes() if occupied else None
-    _, skipped = run_cli(tmp_path, monkeypatch, ['safe', str(root), ''])
+    _, skipped = run_cli(tmp_path, monkeypatch, ['safe', str(root), *strategy, ''])
     assert not any(
         op.get('kind') in ('rename', 'tags') for op in report_operations(skipped)
     )
     assert source.read_bytes() == original
     for dry_run in (True, False):
         _, report = run_cli(
-            tmp_path, monkeypatch, ['safe', str(root), 't'], dry_run=dry_run
+            tmp_path, monkeypatch, ['safe', str(root), *strategy, 't'], dry_run=dry_run
         )
         assert f'{source.name} → {target.name}' in report
         [rename] = [
@@ -465,7 +485,7 @@ def test_safe_ambiguous_qualifier_choice(
         assert target.read_bytes() == target_before
     else:
         assert target.read_bytes() == original
-        _, repeated = run_cli(tmp_path, monkeypatch, ['safe', str(root)])
+        _, repeated = run_cli(tmp_path, monkeypatch, ['safe', str(root), *strategy])
         assert not any(op.get('kind') == 'rename' for op in report_operations(repeated))
 
 
@@ -494,6 +514,37 @@ def test_deep_qualifier_choice_before_duplicate_analysis(
     if not choice:
         assert 'Уточнения (имя): Original_ 2022 Remaster' in report
         assert 'Выбор копии пропущен' in report
+    assert snapshot(root) == before
+
+
+@windows
+@pytest.mark.parametrize('choice', ['', 't'])
+def test_deep_quote_projection_is_not_duplicate_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, choice: str
+) -> None:
+    root = tmp_path / 'music'
+    root.mkdir()
+    title = 'Title (from "Work")'
+    source = root / 'Artist - Title (from _Work_).mp3'
+    target = root / 'Artist - Title (from Work).mp3'
+    numbered = root / 'Artist - Title (from Work) (1).mp3'
+    synthetic_audio(source, title=title)
+    shutil.copyfile(source, numbered)
+    before = snapshot(root)
+    _, report = run_cli(
+        tmp_path,
+        monkeypatch,
+        ['deep', 'run', str(root), '1', choice, 'n'],
+        dry_run=True,
+    )
+    ops = report_operations(report)
+    assert [op['target'] for op in ops if op.get('kind') == 'rename'] == (
+        [str(target)] if choice else []
+    )
+    assert not any(op.get('kind') == 'duplicate_delete' for op in ops)
+    assert 'Уточнения (имя): from Work' in report
+    if not choice:
+        assert 'Уточнения (имя): from _Work_' in report
     assert snapshot(root) == before
 
 
