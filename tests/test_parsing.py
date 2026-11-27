@@ -1,10 +1,49 @@
 """Тесты для функций парсинга."""
 
+import pytest
+
 from parsing import (
     extract_title_from_filename,
     is_track_number,
     parse_artist_title,
+    tags_from_filename,
 )
+
+
+@pytest.mark.parametrize(
+    ('stem', 'artist', 'title', 'expected'),
+    [
+        ('ACDC - Новая песня', 'AC/DC', 'Старая песня', ('AC/DC', 'Новая песня')),
+        (
+            'Группа - Песня (AB Remix)',
+            'Старое имя',
+            'Песня (A/B Remix)',
+            ('Группа', 'Песня (A/B Remix)'),
+        ),
+        (
+            'Группа - Песня (A-B Remix)',
+            'Группа',
+            'Песня (A:B Remix)',
+            ('Группа', 'Песня (A:B Remix)'),
+        ),
+        (
+            'Группа - Песня',
+            'Группа',
+            'Песня (Live) (feat. Ирина)',
+            ('Группа', 'Песня (Live) (feat. Ирина)'),
+        ),
+        (
+            'Группа - Песня',
+            'Группа',
+            'Песня / Song (Live)',
+            ('Группа', 'Песня / Song (Live)'),
+        ),
+    ],
+)
+def test_tags_from_filename_preserve_metadata(
+    stem: str, artist: str, title: str, expected: tuple[str, str]
+) -> None:
+    assert tags_from_filename(stem, artist, title) == expected
 
 
 class TestIsTrackNumber:

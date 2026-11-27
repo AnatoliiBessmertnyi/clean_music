@@ -4,11 +4,14 @@ import re
 import unicodedata
 
 from config import (
-    ARTIST_NAME_EXCEPTIONS,
     FEAT_VARIANTS_PATTERN,
     INVALID_FILENAME_CHARS,
     JUNK_PATTERN,
 )
+
+_BRACKET_GROUP = re.compile(r'\(([^()\[\]]*)\)|\[([^()\[\]]*)\]')
+COPY_SUFFIX = re.compile(r' \([1-9][0-9]*\)')
+_BRACKET_CHAR = re.compile(r'[()\[\]]')
 
 
 def normalize_filename_stem(stem: str) -> str:
@@ -33,7 +36,12 @@ def normalize_unicode(text: str) -> str:
 
 def remove_junk(text: str) -> str:
     """Удаляет мусорные вставки вида (vksaver) из строки."""
-    return JUNK_PATTERN.sub('', text).strip()
+
+    def remove_group(match: re.Match[str]) -> str:
+        group = match.group()
+        return '' if JUNK_PATTERN.fullmatch(group) else group
+
+    return re.sub(r'\s*(?:\([^()\[\]]*\)|\[[^()\[\]]*\])', remove_group, text).strip()
 
 
 def normalize_dash(text: str) -> str:
@@ -63,7 +71,141 @@ def normalize_title_spacing(text: str) -> str:
     return text.strip()
 
 
-def build_safe_filename(artist: str, title: str, extension: str) -> str:
+def split_qualifiers(text: str) -> tuple[str, tuple[str, ...]]:
+    """Отделяет хвостовые группы, сохраняя порядок и вид парных скобок."""
+    base = text.rstrip()
+    groups: list[str] = []
+    while base.endswith((')', ']')):
+        expected = []
+        for index in range(len(base) - 1, -1, -1):
+            char = base[index]
+            if char in ')]':
+                expected.append('(' if char == ')' else '[')
+            elif char in '([':
+                if char != expected.pop():
+                    return base, tuple(reversed(groups))
+                if not expected:
+                    break
+        else:
+            break
+        group = base[index:]
+        if not group[1:-1].strip():
+            break
+        groups.append(group)
+        base = base[:index].rstrip()
+    return base or text, tuple(reversed(groups))
+
+
+def title_separator(title: str) -> int | None:
+    """Первый слэш вне скобок. При нарушенной парности деление небезопасно."""
+    expected = []
+    separator = None
+    for index, char in enumerate(title):
+        if char in '([':
+            expected.append(')' if char == '(' else ']')
+        elif char in ')]':
+            if not expected or expected.pop() != char:
+                return None
+        elif char == '/' and not expected and separator is None:
+            separator = index
+    return None if expected else separator
+
+
+def _matches_windows_form(raw: str, value: str) -> bool:
+    """Сопоставляет ключи одной группы с независимой заменой каждого знака."""
+    # Ключ уже обрезан. Граничные пробелы позволяют так же свернуть пробел,
+    # возникший после замены, как это делает normalize_filename_stem.
+    padded = f' {value} '
+    positions = {1}
+    for char in raw:
+        options: tuple[str, ...] = (char,)
+        if INVALID_FILENAME_CHARS.fullmatch(char):
+            options = ('', '_', '-', ' ', "'") if char == '"' else ('', '_', '-', ' ')
+        following = set()
+        for pos in positions:
+            for option in options:
+                if not option or (option == ' ' and padded[pos - 1] == ' '):
+                    following.add(pos)
+                elif padded.startswith(option, pos):
+                    following.add(pos + 1)
+        if not following:
+            return False
+        positions = following
+    return len(padded) - 1 in positions or len(padded) in positions
+
+
+def qualifier_name_candidate(
+    stem: str, source_stem: str, raw_name: str = ''
+) -> tuple[str, bool]:
+    """Имя с написанием из тегов и признак необходимости отдельного выбора."""
+    cleaned = remove_junk(source_stem)
+    _, groups = split_qualifiers(cleaned)
+    _, existing = split_qualifiers(stem)
+
+    def key(group: str) -> str:
+        _, normalized = normalize_feat_pair('', group)
+        return normalize_filename_stem(normalized[1:-1]).casefold()
+
+    # Возможные написания одной группы служат только для индивидуального выбора.
+    available = [key(group) for group in existing]
+    raw_keys = [
+        key(group)
+        for group in split_qualifiers(raw_name)[1]
+        if INVALID_FILENAME_CHARS.search(group)
+    ]
+    origins = {
+        other: [raw for raw in raw_keys if _matches_windows_form(raw, other)]
+        for other in available
+    }
+    if (
+        groups
+        and cleaned.endswith(' ' + groups[-1])
+        and COPY_SUFFIX.fullmatch(' ' + groups[-1])
+    ):
+        groups = groups[:-1]
+    unmatched = []
+    for group in groups:
+        value = key(group)
+        if value in available:
+            available.remove(value)
+        else:
+            unmatched.append((group, value))
+
+    ambiguous = False
+    for group, value in unmatched:
+        # Только сигнал для ручного выбора. Анализ дублей использует исходные признаки.
+        alternatives = [
+            other
+            for other in available
+            if any(_matches_windows_form(raw, value) for raw in origins.get(other, []))
+            or not origins.get(other)
+            and len(other) == len(value)
+            and all(
+                a == b
+                or (
+                    unicodedata.category(a).startswith('P')
+                    and unicodedata.category(b).startswith('P')
+                    and not INVALID_FILENAME_CHARS.search(a + b)
+                )
+                for a, b in zip(value, other, strict=True)
+            )
+        ]
+        if alternatives:
+            ambiguous = True
+            available.remove(alternatives[0])
+        else:
+            stem += ' ' + group
+    return stem, ambiguous
+
+
+def preserve_name_qualifiers(stem: str, source_stem: str, raw_name: str = '') -> str:
+    proposed, ambiguous = qualifier_name_candidate(stem, source_stem, raw_name)
+    return source_stem if ambiguous else proposed
+
+
+def build_safe_filename(
+    artist: str, title: str, extension: str, *, source_stem: str = ''
+) -> str:
     """Формирует безопасное имя файла из тегов.
 
     Args:
@@ -80,11 +222,17 @@ def build_safe_filename(artist: str, title: str, extension: str) -> str:
         >>> build_safe_filename("AC/DC", "Back in Black", ".mp3")
         'ACDC - Back in Black.mp3'
     """
-    raw_name = f'{artist} - {title}'
-    raw_name = normalize_title_spacing(raw_name)
+    original_title = title
+    base, groups = split_qualifiers(title)
+    if groups and '/' in title:
+        suffix = ' '.join(group.replace('/', '_') for group in groups)
+        title = f'{base} {suffix}' if base != title else suffix
+    raw_name = normalize_title_spacing(f'{artist} - {title}')
     cleaned = INVALID_FILENAME_CHARS.sub('', raw_name)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    return f'{cleaned}{extension}'
+    return (
+        f'{preserve_name_qualifiers(cleaned, source_stem, original_title)}{extension}'
+    )
 
 
 def remove_annotation_from_text(text: str, annotation: str) -> str:
@@ -96,142 +244,75 @@ def remove_annotation_from_text(text: str, annotation: str) -> str:
 
 
 def normalize_feat_pair(artist: str, title: str) -> tuple[str, str]:
-    """Нормализует пару тегов: переносит feat из artist в title.
-
-    Правила:
-    - feat должен быть ТОЛЬКО в title
-    - Из artist feat удаляется
-    - Все гости объединяются в один блок (feat. X, Y, Z)
-    - Если в блоке feat есть тире (feat. X - Y), то Y — это название, X — гость
-    """
-    # 1. Извлекаем всех feat-гостей из artist
-    artist_guests: list[str] = []
-    feat_matches = list(FEAT_VARIANTS_PATTERN.finditer(artist))
-    if feat_matches:
-        for i, match in enumerate(feat_matches):
-            start = match.end()
-            end = (
-                feat_matches[i + 1].start()
-                if i + 1 < len(feat_matches)
-                else len(artist)
-            )
-            guest_part = artist[start:end].strip()
-            for g in re.split(r'\s*[&,]\s*', guest_part):
-                g = g.strip()
-                if g and g not in artist_guests:
-                    artist_guests.append(g)
-
-        base = artist
-        for i, match in enumerate(feat_matches):
-            end = (
-                feat_matches[i + 1].start()
-                if i + 1 < len(feat_matches)
-                else len(artist)
-            )
-            base = base[: match.start()] + base[end:]
-        cleaned_artist = re.sub(r'\s+', ' ', base).strip()
+    """Переносит однозначно выделенных гостей исполнителя в название."""
+    artist_feat = FEAT_VARIANTS_PATTERN.search(artist)
+    guests = ''
+    if artist_feat:
+        base_artist = artist[: artist_feat.start()].strip()
+        guests = artist[artist_feat.end() :].strip()
+        if (
+            not base_artist
+            or not guests
+            or _BRACKET_CHAR.search(artist)
+            or FEAT_VARIANTS_PATTERN.search(guests)
+            or re.search(r'\s+[-–—]\s+', guests)
+        ):
+            return artist, title
     else:
-        cleaned_artist = artist
+        base_artist = artist
 
-    # 2. Извлекаем feat-гостей из title
-    title_guests: list[str] = []
-    real_title_part = ''
+    outside_groups = _BRACKET_GROUP.sub(' ', title)
+    if _BRACKET_CHAR.search(outside_groups):
+        return artist, title
 
-    bracket_feat_pattern = re.compile(
-        r'[\(\[]\s*(?:feat(?:uring)?|ft)\b\.?\s*([^\)\]]+)[\)\]]', re.IGNORECASE
-    )
-    matches = list(bracket_feat_pattern.finditer(title))
-    if matches:
-        result_parts: list[str] = []
-        last_end = 0
-        for match in matches:
-            result_parts.append(title[last_end : match.start()])
-            guests_str = match.group(1)
-            for guest in re.split(r'\s*[&,]\s*', guests_str):
-                guest = guest.strip()
-                if guest and guest not in title_guests:
-                    title_guests.append(guest)
-            last_end = match.end()
-        result_parts.append(title[last_end:])
-        cleaned_title = ''.join(result_parts)
-        cleaned_title = re.sub(r'\s+', ' ', cleaned_title).strip()
-    else:
-        cleaned_title = title
+    title_feat = FEAT_VARIANTS_PATTERN.search(outside_groups)
+    if title_feat:
+        # В присутствии уточнений или тире границы списка гостей неоднозначны.
+        if outside_groups != title:
+            return artist, title
+        base_title = title[: title_feat.start()].strip()
+        title_guests = title[title_feat.end() :].strip()
+        if (
+            not base_title
+            or not title_guests
+            or FEAT_VARIANTS_PATTERN.search(title_guests)
+            or re.search(r'\s+[-–—]\s+', title_guests)
+        ):
+            return artist, title
+        title = f'{base_title} (feat. {title_guests})'
 
-    title_feat_matches = list(FEAT_VARIANTS_PATTERN.finditer(cleaned_title))
-    if title_feat_matches:
-        base_parts: list[str] = []
-        last_end = 0
-        for i, match in enumerate(title_feat_matches):
-            base_parts.append(cleaned_title[last_end : match.start()])
-            start = match.end()
-            end = (
-                title_feat_matches[i + 1].start()
-                if i + 1 < len(title_feat_matches)
-                else len(cleaned_title)
-            )
-            guest_part = cleaned_title[start:end].strip()
+    def normalize_group(match: re.Match[str]) -> str:
+        content = (match.group(1) or match.group(2) or '').strip()
+        marker = FEAT_VARIANTS_PATTERN.match(content)
+        if marker and content[marker.end() :]:
+            return f'(feat. {content[marker.end() :]})'
+        return match.group()
 
-            dash_match = re.search(r'\s+[-–—]\s+', guest_part)
-            if dash_match:
-                guest_only = guest_part[: dash_match.start()].strip()
-                title_part = guest_part[dash_match.end() :].strip()
-                if title_part:
-                    real_title_part = title_part
-
-                for g in re.split(r'\s*[&,]\s*', guest_only):
-                    g = g.strip()
-                    if g and g not in title_guests:
-                        title_guests.append(g)
-            else:
-                for g in re.split(r'\s*[&,]\s*', guest_part):
-                    g = g.strip()
-                    if g and g not in title_guests:
-                        title_guests.append(g)
-
-            last_end = end
-
-        base_parts.append(cleaned_title[last_end:])
-        cleaned_title = ''.join(base_parts)
-        cleaned_title = re.sub(r'\s+', ' ', cleaned_title).strip()
-
-        if real_title_part:
-            cleaned_title = real_title_part
-
-    # 3. Объединяем гостей
-    all_guests: list[str] = []
-    for g in artist_guests + title_guests:
-        if g not in all_guests:
-            all_guests.append(g)
-
-    # 4. Формируем финальный title с feat
-    if all_guests:
-        guests_str = ', '.join(all_guests)
-        final_title = f'{cleaned_title} (feat. {guests_str})'
-    else:
-        final_title = cleaned_title
-
-    final_title = normalize_title_spacing(final_title)
-
-    return cleaned_artist, final_title
+    title = _BRACKET_GROUP.sub(normalize_group, title)
+    if guests and f'(feat. {guests})' not in title:
+        title = f'{title} (feat. {guests})'
+    return base_artist, title
 
 
 def remove_feat_guests_from_artist(artist: str, title: str) -> str:
     """Удаляет гостей из Artist, если они уже указаны в Title через (feat.)."""
-    feat_pattern = re.compile(r'\(feat\.\s*([^\)]+)\)', re.IGNORECASE)
-    match = feat_pattern.search(title)
-    if not match:
+    if _BRACKET_CHAR.search(artist) or _BRACKET_CHAR.search(
+        _BRACKET_GROUP.sub('', title)
+    ):
         return artist
 
-    guests_str = match.group(1)
-    guests = [g.strip() for g in re.split(r'\s*,\s*', guests_str)]
+    feat_pattern = re.compile(r'\(feat\.\s*([^\)]+)\)', re.IGNORECASE)
+    blocks = feat_pattern.findall(title)
+    if not blocks:
+        return artist
+
+    guests = {g.strip().casefold() for block in blocks for g in block.split(',')}
 
     artists = [a.strip() for a in re.split(r'\s*[,;]\s*', artist)]
 
-    guests_lower = {g.lower() for g in guests}
-    filtered_artists = [a for a in artists if a.lower() not in guests_lower]
+    filtered_artists = [a for a in artists if a.casefold() not in guests]
 
-    if not filtered_artists:
+    if not filtered_artists or filtered_artists == artists:
         return artist
 
     return ', '.join(filtered_artists)
@@ -239,14 +320,6 @@ def remove_feat_guests_from_artist(artist: str, title: str) -> str:
 
 def normalize_artist_separators(artist: str) -> str:
     """Нормализует разделители исполнителей на запятую с пробелом."""
-    artist_lower = artist.lower()
-    for exception in ARTIST_NAME_EXCEPTIONS:
-        if exception.lower() in artist_lower:
-            result = artist.replace(';', ',')
-            result = re.sub(r'\s*,\s*', ', ', result)
-            return re.sub(r'\s+', ' ', result).strip()
-
-    result = artist.replace(';', ',')
-    result = re.sub(r'\s*/\s*', ', ', result)
-    result = re.sub(r'\s*,\s*', ', ', result)
-    return re.sub(r'\s+', ' ', result).strip()
+    if _BRACKET_CHAR.search(artist):
+        return artist
+    return re.sub(r'\s*[,;]\s*', ', ', artist)

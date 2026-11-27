@@ -12,6 +12,7 @@ from mutagen.id3 import ID3
 
 import main as cli
 from context import SessionContext
+from file_state import OperationStatus, inspect_file
 from interactor import ConsoleInteractor
 from pipeline_utils import safe_rename
 from run_report import FileSnapshot, RunReport, snapshot_file
@@ -21,8 +22,20 @@ from tag_repository import AudioTags, TagRepository
 def make_audio(path: Path) -> Path:
     # MPEG1 Layer III, 128kbps / 44100Hz: только синтетические кадры.
     path.write_bytes((b'\xff\xfb\x90\x64' + bytes(413)) * 5)
-    assert TagRepository().update_tags(path, 'Исполнитель', 'Название')
+    assert write_fixture_tags(path, 'Исполнитель', 'Название')
     return path
+
+
+def write_fixture_tags(path: Path, artist: str, title: str) -> bool:
+    repo = TagRepository()
+
+    def save(a: str | None, t: str | None) -> tuple[OperationStatus, str]:
+        with path.open('r+b') as stream:
+            repo.save_work_tags(path, stream, a, t)
+        return OperationStatus.SUCCESS, 'изменена синтетическая фикстура'
+
+    result = repo.apply_tags(path, artist, title, simulated=False, publish=save)
+    return result.status in (OperationStatus.SUCCESS, OperationStatus.NOOP)
 
 
 def file_records(path: Path) -> list[dict[str, object]]:
@@ -57,11 +70,11 @@ def test_actual_states_and_rename_chain(tmp_path: Path) -> None:
         lower = folder / 'final.mp3'
         final.rename(lower)
         report.record_rename(final, lower)
-        assert TagRepository().update_tags(modified, 'Новый', 'Тег')
+        assert write_fixture_tags(modified, 'Новый', 'Тег')
         new_combined = folder / 'new-combined.mp3'
         combined.rename(new_combined)
         report.record_rename(combined, new_combined)
-        assert TagRepository().update_tags(new_combined, 'Другой', 'Трек')
+        assert write_fixture_tags(new_combined, 'Другой', 'Трек')
         missing.unlink()
         make_audio(folder / 'added.mp3')
     records = file_records(report.path)
@@ -134,7 +147,7 @@ def test_uncached_tags_bypass_pipeline_simulation(tmp_path: Path) -> None:
     assert snapshot_file(path, repo).tags == AudioTags('Исполнитель', 'Название')
 
 
-def test_partial_tags_are_visible_without_changing_pipeline_contract(
+def test_partial_tags_are_visible_in_pipeline_and_report(
     tmp_path: Path,
 ) -> None:
     path = make_audio(tmp_path / 'track.mp3')
@@ -142,8 +155,8 @@ def test_partial_tags_are_visible_without_changing_pipeline_contract(
     tags.delall('TIT2')
     tags.save(path)
     repo = TagRepository()
-    assert repo.get_tags(path) is None
-    assert repo.read_tags_uncached(path) == AudioTags('Исполнитель', '')
+    assert repo.get_tags(path).tags == AudioTags('Исполнитель', '')
+    assert repo.read_tags_uncached(path).tags == AudioTags('Исполнитель', '')
 
 
 def test_report_serializes_asf_attribute_values(
@@ -159,7 +172,8 @@ def test_report_serializes_asf_attribute_values(
                 tags={
                     'Author': [ASFUnicodeAttribute('Исполнитель')],
                     'Title': [ASFUnicodeAttribute('Название')],
-                }
+                },
+                info=None,
             )
         ),
     )
@@ -211,6 +225,7 @@ def test_safe_rename_records_only_real_success(tmp_path: Path, dry_run: bool) ->
     with RunReport(tmp_path / 'logs', dry_run) as report:
         report.start(folder)
         ctx = SessionContext(dry_run, False, report=report)
+        ctx.registry.register(old, identity=inspect_file(old))
         status, _ = safe_rename(old, new, ctx, TagRepository(), ConsoleInteractor())
     assert status == ('planned' if dry_run else 'renamed')
     text = report.path.read_text(encoding='utf-8')
@@ -236,7 +251,7 @@ def test_dialog_answers_and_errors_in_one_log(
         ui = ConsoleInteractor()
         ui.display('Список вариантов')
         assert ui.prompt('Выбор [y]: ', 'y') == 'y'
-        assert ui.prompt('Имя: ') == 'текст'
+        assert ui.prompt('Имя: ') == 'ТЕКСТ'
         ui.display_error('Не удалось выполнить действие')
     text = report.path.read_text(encoding='utf-8')
     for expected in (
@@ -259,12 +274,12 @@ def test_cli_failure_still_compares_disk(
     folder.mkdir()
     path = make_audio(folder / 'track.mp3')
     monkeypatch.setattr(cli, '__file__', str(tmp_path / 'main.py'))
-    monkeypatch.setattr('builtins.input', lambda _: str(folder))
+    monkeypatch.setattr('builtins.input', Mock(side_effect=['', str(folder)]))
 
     def interrupted_run(
         self: cli.AudioProcessingPipeline, **kwargs: object
     ) -> list[Path]:
-        assert TagRepository().update_tags(path, 'Уже записано', 'До прерывания')
+        assert write_fixture_tags(path, 'Уже записано', 'До прерывания')
         raise failure('test interruption')
 
     monkeypatch.setattr(cli.AudioProcessingPipeline, 'run', interrupted_run)
@@ -285,7 +300,7 @@ def test_cli_empty_folder_and_unique_logs(
     folder = tmp_path / 'empty'
     folder.mkdir()
     monkeypatch.setattr(cli, '__file__', str(tmp_path / 'main.py'))
-    monkeypatch.setattr('builtins.input', lambda _: str(folder))
+    monkeypatch.setattr('builtins.input', Mock(side_effect=['', str(folder)] * 2))
     cli.main()
     cli.main()
     logs = list((tmp_path / 'logs').glob('*.log'))
@@ -300,7 +315,7 @@ def test_cli_eof_before_path_is_logged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(cli, '__file__', str(tmp_path / 'main.py'))
-    monkeypatch.setattr('builtins.input', Mock(side_effect=EOFError))
+    monkeypatch.setattr('builtins.input', Mock(side_effect=['', EOFError]))
     with pytest.raises(EOFError):
         cli.main()
     log = next((tmp_path / 'logs').glob('*.log'))

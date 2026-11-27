@@ -1,13 +1,21 @@
 """CLI-скрипт для очистки и переименования аудиофайлов."""
 
+import os
 import sys
 from collections import Counter
+from contextlib import ExitStack
 from pathlib import Path
 
+from audio_verification import find_ffmpeg_tool
 from config import SUPPORTED_EXTENSIONS
 from context import SessionContext
-from interactor import ConsoleInteractor, logged_input
+from file_state import check_directory, inspect_file
+from interactor import ConsoleInteractor, UserInteractor, choose_mode, logged_input
 from pipeline import AudioProcessingPipeline
+from pipeline_utils import windows_local_ntfs
+from recovery import recover_renames
+from recovery_store import RecoveryStore
+from report_events import log_operation
 from run_report import RunReport
 from stages import (
     ArtistNormalizationStage,
@@ -33,9 +41,33 @@ def get_valid_path() -> Path:
         )
 
 
-def get_audio_files(directory: Path) -> list[Path]:
-    """Возвращает список всех аудиофайлов в заданной директории."""
-    return [f for f in directory.iterdir() if f.suffix.lower() in SUPPORTED_EXTENSIONS]
+def get_audio_files(
+    directory: Path, ctx: SessionContext, interactor: UserInteractor
+) -> list[Path] | None:
+    """Регистрирует физические объекты, допущенные при сканировании."""
+    try:
+        check_directory(directory)
+        if os.name == 'nt' and not windows_local_ntfs(directory):
+            raise OSError('требуется локальный NTFS в Windows')
+        entries = list(directory.iterdir())
+    except OSError as exc:
+        interactor.display_error(f'{directory}: сканирование пропущено: {exc}')
+        log_operation('scan', directory, 'отказ', str(exc))
+        return None
+
+    files = []
+    for path in entries:
+        if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            continue
+        try:
+            identity = inspect_file(path)
+        except OSError as exc:
+            interactor.display_error(f'{path.name}: пропущен при сканировании: {exc}')
+            log_operation('scan', path, 'отказ', str(exc))
+            continue
+        ctx.registry.register(path, identity=identity)
+        files.append(path)
+    return files
 
 
 def get_format_stats(files: list[Path]) -> dict[str, int]:
@@ -60,12 +92,12 @@ def main() -> None:
     except OSError as exc:
         sys.stderr.write(f'Не удалось создать журнал; обработка не начата: {exc}\n')
         raise SystemExit(1) from exc
-    with report:
+    with ExitStack() as recovery_session, report:
         ConsoleInteractor().display(f'Отчёт запуска: {report.path}')
-        _run(report)
+        _run(report, recovery_session)
 
 
-def _run(report: RunReport) -> None:
+def _run(report: RunReport, recovery_session: ExitStack) -> None:
     """Выполняет прежний конвейер внутри журнала запуска."""
     # 1. Инициализация зависимостей
     ctx = SessionContext(
@@ -73,20 +105,69 @@ def _run(report: RunReport) -> None:
         debug='--debug' in sys.argv,
         report=report,
     )
-    repo = TagRepository()
     interactor = ConsoleInteractor()
 
     interactor.display('=== Обработчик аудиофайлов ===')
     if ctx.dry_run:
         interactor.display(
-            '*** СУХОЙ РЕЖИМ: действия конвейера — предложения; итог сверяется с диском ***'
+            '*** СУХОЙ РЕЖИМ: действия конвейера — предложения. '
+            'Проверки записи и восстановления выполняются не полностью, '
+            'итог отчёта сверяется с диском. ***'
         )
 
+    mode = choose_mode(interactor, dry_run=ctx.dry_run)
+    if mode is None:
+        return
+    ctx.deep = mode == 'deep'
+    interactor.display(
+        'Выбран глубокий режим (deep).'
+        if ctx.deep
+        else 'Выбран безопасный режим (safe).'
+    )
+    repo = TagRepository()
     target_dir = get_valid_path()
     ctx.target_dir = target_dir
+    notices = []
+    if find_ffmpeg_tool('ffprobe') is None:
+        notices.append(
+            'ffprobe недоступен. Для прогноза запись тегов моделируется без ffprobe.'
+            if ctx.dry_run
+            else 'ffprobe недоступен. Будут пропущены изменения тегов artist/title '
+            'и переименования, требующие успешной записи этих тегов.'
+        )
+        ctx.ffprobe_missing_reported = True
+    if find_ffmpeg_tool('ffmpeg') is None:
+        notices.append('ffmpeg недоступен. Операции CLI не требуют этого инструмента.')
+    if notices:
+        interactor.display(' '.join(notices))
+    diagnostic = ctx.dry_run or os.name != 'nt'
+    try:
+        if os.name == 'nt' and not windows_local_ntfs(target_dir.absolute()):
+            raise OSError('требуется локальный NTFS в Windows')
+        recovery = RecoveryStore(target_dir, diagnostic=diagnostic)
+        if recovery_session.enter_context(recovery.session()):
+            recover_renames(recovery, ctx, interactor, diagnostic=diagnostic)
+        if not diagnostic:
+            ctx.recovery = recovery
+    except OSError as exc:
+        interactor.display_error(f'{target_dir}: обработка остановлена: {exc}')
+        log_operation('recovery', target_dir, 'отказ', str(exc), proposed=diagnostic)
+        return
+    _process(target_dir, ctx, report, repo, interactor)
+
+
+def _process(
+    target_dir: Path,
+    ctx: SessionContext,
+    report: RunReport,
+    repo: TagRepository,
+    interactor: UserInteractor,
+) -> None:
+    files = get_audio_files(target_dir, ctx, interactor)
+    if files is None:
+        return
     interactor.display('Снимаю исходное состояние файлов (SHA-256 и теги)...')
     report.start(target_dir)
-    files = get_audio_files(target_dir)
 
     total = len(files)
     stats = get_format_stats(files)
@@ -119,27 +200,29 @@ def _run(report: RunReport) -> None:
 
     # 4. Финальная статистика
     interactor.display('\n' + '=' * 60)
-    interactor.display('=== Счётчики конвейера (не итоговая сверка диска) ===')
+    label = 'Запланированные изменения' if ctx.dry_run else 'Подтверждённые изменения'
+    interactor.display(f'=== {label} по счётчикам конвейера ===')
+    counts = ctx.planned_stats if ctx.dry_run else ctx.stats
     interactor.display('=' * 60)
-    interactor.display(f'Очистка от мусора (имена): {ctx.get_stat("junk_removed")}')
-    interactor.display(f'Очистка от мусора (теги): {ctx.get_stat("tags_cleaned")}')
+    interactor.display(f'Очистка от мусора (имена): {counts.get("junk_removed", 0)}')
+    interactor.display(f'Очистка от мусора (теги): {counts.get("tags_cleaned", 0)}')
     interactor.display(
-        f'Нормализация тире и пробелов: {ctx.get_stat("dash_normalized")}'
+        f'Нормализация тире и пробелов: {counts.get("dash_normalized", 0)}'
     )
-    interactor.display(f'Удалено дубликатов: {ctx.get_stat("duplicates_removed")}')
-    interactor.display(f'Переименовано по тегам: {ctx.get_stat("renamed_by_tags")}')
-    interactor.display(f'Записано тегов: {ctx.get_stat("tags_written")}')
+    interactor.display(f'Удалено дубликатов: {counts.get("duplicates_removed", 0)}')
+    interactor.display(f'Переименовано по тегам: {counts.get("renamed_by_tags", 0)}')
+    interactor.display(f'Записано тегов: {counts.get("tags_written", 0)}')
     interactor.display(
         f'Нормализовано исполнителей: '
-        f'{ctx.get_stat("artists_normalized")} файлов '
-        f'({ctx.get_stat("artists_normalized_unique")} уникальных)'
+        f'{counts.get("artists_normalized", 0)} файлов '
+        f'({counts.get("artists_normalized_unique", 0)} уникальных)'
     )
-    interactor.display(f'Ручной ввод: {ctx.get_stat("manual_input")}')
+    interactor.display(f'Ручной ввод: {counts.get("manual_input", 0)}')
 
     still_missing: list[Path] = getattr(ctx, '_still_missing', [])
     if still_missing:
         interactor.display(
-            f'\nВнимание! {len(still_missing)} файлов осталось без метаданных:'
+            f'\nВнимание! Остались файлы с незаполненными тегами: {len(still_missing)}'
         )
         for f in still_missing:
             interactor.display(f'  - {f.name}')

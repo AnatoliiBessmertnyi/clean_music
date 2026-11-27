@@ -10,12 +10,13 @@ import pytest
 
 import run_report
 from context import SessionContext
+from file_state import OperationStatus
 from interactor import ConsoleInteractor
 from pipeline_utils import safe_rename
 from report_events import log_operation
 from run_report import RunReport
 from tag_repository import TagRepository
-from tests.test_run_report import file_records, make_audio
+from tests.test_run_report import file_records, make_audio, write_fixture_tags
 
 APPENDIX = '=== ПРИЛОЖЕНИЕ: JSONL И ДИАЛОГ ===\n'
 
@@ -60,7 +61,7 @@ def test_compact_layout_deltas_hashes_and_lossless_appendix(
         renamed = folder / 'after.mp3'
         modified.rename(renamed)
         report.record_rename(modified, renamed)
-        assert TagRepository().update_tags(renamed, 'Другой', 'Новый трек')
+        assert write_fixture_tags(renamed, 'Другой', 'Новый трек')
     data = report.path.read_bytes()
     header, appendix = data.split(APPENDIX.encode(), 1)
     text = header.decode('utf-8')
@@ -230,7 +231,7 @@ def test_written_tags_and_conflicting_rename_in_one_problem_record(
     with RunReport(tmp_path / 'logs', False) as report:
         report.start(folder)
         report.stage = 'Обновление и переименование'
-        assert TagRepository().update_tags(source, 'Новый', 'Название')
+        assert write_fixture_tags(source, 'Новый', 'Название')
         status, _ = safe_rename(
             source,
             target,
@@ -261,7 +262,7 @@ def test_rename_chain_correlates_tag_events_to_original(tmp_path: Path) -> None:
         report.start(folder)
         source.rename(middle)
         report.record_rename(source, middle)
-        assert TagRepository().update_tags(middle, 'Новый', 'Тег')
+        assert write_fixture_tags(middle, 'Новый', 'Тег')
         middle.rename(final)
         report.record_rename(middle, final)
     operations = appendix_records(report.path, 'ОПЕРАЦИЯ')
@@ -280,7 +281,7 @@ def test_identity_correlates_event_after_unregistered_external_rename(
     with RunReport(tmp_path / 'logs', False) as report:
         report.start(folder)
         source.rename(target)
-        assert TagRepository().update_tags(target, 'Новый', 'Тег')
+        assert write_fixture_tags(target, 'Новый', 'Тег')
     assert report.operations[-1].originals == (str(source),)
     assert 'отсутствует после запуска' in report.path.read_text(encoding='utf-8')
 
@@ -333,17 +334,22 @@ def test_git_metadata_failure_does_not_break_report(
     assert report.verification_complete
 
 
-def test_tag_write_failure_has_structured_reason(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_tag_write_failure_has_structured_reason(tmp_path: Path) -> None:
     folder = tmp_path / 'music'
     folder.mkdir()
     path = make_audio(folder / 'track.mp3')
     repo = TagRepository()
     with RunReport(tmp_path / 'logs', False) as report:
         report.start(folder)
-        monkeypatch.setattr(repo, '_write_to_disk', Mock(return_value=False))
-        assert not repo.update_tags(path, 'Не записано', 'Тег')
+        write = Mock(
+            return_value=(OperationStatus.ERROR, 'запись тегов не подтверждена')
+        )
+        assert (
+            repo.apply_tags(
+                path, 'Не записано', 'Тег', simulated=False, publish=write
+            ).status
+            is OperationStatus.ERROR
+        )
     header = report.path.read_text(encoding='utf-8').split(APPENDIX)[0]
     assert 'запись тегов не подтверждена' in header
     assert report.counts == {'не изменён': 1}

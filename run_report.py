@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 import os
-import stat
 import subprocess
 import sys
 import tempfile
@@ -20,9 +19,8 @@ from types import TracebackType
 from typing import override
 from uuid import uuid4
 
-from mutagen import MutagenError
-
 from config import SUPPORTED_EXTENSIONS
+from file_state import FileIdentity, check_directory, regular_file_info
 from report_events import Operation, log_operation
 from report_format import render_compact
 from tag_repository import AudioTags, TagRepository
@@ -99,34 +97,19 @@ def _git_commit() -> str:
     return 'unknown'
 
 
-def _check_regular_path(path: Path) -> os.stat_result:
-    """Не читать содержимое ссылок и reparse points, включая родителей."""
-    info = path.lstat()
-    for entry in (path, *path.parents):
-        entry_info = info if entry == path else entry.lstat()
-        if stat.S_ISLNK(entry_info.st_mode) or (
-            getattr(entry_info, 'st_file_attributes', 0)
-            & stat.FILE_ATTRIBUTE_REPARSE_POINT
-        ):
-            raise OSError(f'ссылка или reparse point: {entry}')
-    if not stat.S_ISREG(info.st_mode):
-        raise OSError('не является обычным файлом')
-    return info
-
-
 def snapshot_file(path: Path, repo: TagRepository) -> FileSnapshot:
     """Читает файл и теги с диска, не используя кэш конвейера."""
     result = FileSnapshot(str(path))
     try:
-        before = _check_regular_path(path)
+        before = regular_file_info(path)
         result.identity = (before.st_dev, before.st_ino)
         with path.open('rb') as stream:
             result.sha256 = hashlib.file_digest(stream, 'sha256').hexdigest()
-        try:
-            result.tags = repo.read_tags_uncached(path)
-        except (OSError, MutagenError, ValueError) as exc:
-            result.errors.append(f'чтение тегов: {exc}')
-        after = path.lstat()
+        metadata = repo.read_tags_uncached(path)
+        result.tags = metadata.tags
+        if metadata.error is not None:
+            result.errors.append(f'чтение тегов: {metadata.error}')
+        after = regular_file_info(path)
         if (
             before.st_dev,
             before.st_ino,
@@ -192,6 +175,7 @@ class RunReport:
         self.verification_seconds = 0.0
         self._started = time.perf_counter()
         self._proposed_paths: dict[str, tuple[str, ...]] = {}
+        self._published_identities: dict[str, FileIdentity] = {}
         self._handler.observe = self._observe
 
     @property
@@ -225,19 +209,15 @@ class RunReport:
             snapshot = snapshot_file(path, TagRepository())
             self._before[snapshot.path] = snapshot
             self._current_paths[snapshot.path] = snapshot.path
+            if self.dry_run:
+                self._proposed_paths[os.path.normcase(snapshot.path)] = (snapshot.path,)
             self._write_json('ДО', _snapshot_data(snapshot))
         self._initial_complete = True
 
     def _audio_entries(self) -> list[Path]:
         assert self._directory is not None
         # Не следовать ссылке на выбранную папку даже при чтении отчёта.
-        for entry in (self._directory, *self._directory.parents):
-            info = entry.lstat()
-            if stat.S_ISLNK(info.st_mode) or (
-                getattr(info, 'st_file_attributes', 0)
-                & stat.FILE_ATTRIBUTE_REPARSE_POINT
-            ):
-                raise OSError(f'ссылка или reparse point в пути папки: {entry}')
+        check_directory(self._directory)
         return sorted(
             (
                 path
@@ -262,22 +242,30 @@ class RunReport:
                 self._current_paths[original] = new
         self._write_json('ПЕРЕИМЕНОВАНИЕ ВЫПОЛНЕНО', {'old': old, 'new': new})
 
+    def record_tag_publication(self, path: Path, identity: FileIdentity) -> None:
+        current = path.absolute()
+        for original, name in self._current_paths.items():
+            if Path(name) == current:
+                self._published_identities[original] = identity
+                break
+
     def _observe(self, operation: Operation) -> None:
         """Связывает наблюдение с исходным файлом, не управляя обработкой."""
         path = os.path.normcase(operation.path)
-        originals = tuple(
-            original
-            for original, current in self._current_paths.items()
-            if os.path.normcase(current) == path
-        )
-        if not originals and self.dry_run:
+        if self.dry_run:
             originals = self._proposed_paths.get(path, ())
-        if not originals and operation.identity is not None:
+        else:
             originals = tuple(
                 original
-                for original, snapshot in self._before.items()
-                if snapshot.identity == operation.identity
+                for original, current in self._current_paths.items()
+                if os.path.normcase(current) == path
             )
+            if not originals and operation.identity is not None:
+                originals = tuple(
+                    original
+                    for original, snapshot in self._before.items()
+                    if snapshot.identity == operation.identity
+                )
         self.operations.append(
             replace(operation, originals=originals, stage=self.stage)
         )
@@ -286,7 +274,10 @@ class RunReport:
             and operation.result == 'ПРЕДЛОЖЕНИЕ'
             and operation.target is not None
         ):
+            self._proposed_paths.pop(path, None)
             self._proposed_paths[os.path.normcase(operation.target)] = originals
+        elif operation.kind == 'duplicate_delete' and operation.result == 'ПРЕДЛОЖЕНИЕ':
+            self._proposed_paths.pop(path, None)
 
     def _write_json(self, label: str, data: object) -> None:
         logger.info(
@@ -316,17 +307,40 @@ class RunReport:
         self.changes = []
         verification_complete = self._initial_complete
         matched: set[str] = set()
+        deleted = {
+            original
+            for operation in self.operations
+            if operation.kind == 'duplicate_delete'
+            and operation.result == 'успех'
+            and not operation.proposed
+            for original in operation.originals
+        }
+        uncertain = {
+            original
+            for operation in self.operations
+            if operation.kind == 'duplicate_delete'
+            and operation.result == 'неопределённость'
+            for original in operation.originals
+        }
         for original, before in self._before.items():
             current = self._current_paths[original]
-            final = after.get(current)
+            final = None if original in deleted else after.get(current)
             if final is not None:
                 matched.add(current)
-            if final is None:
+            if original in deleted:
+                status = 'удалён как точная копия'
+            elif original in uncertain:
+                status = 'результат удаления неопределён'
+                verification_complete = False
+            elif final is None:
                 status = 'отсутствует после запуска (удаление не подтверждено)'
             elif before.errors or final.errors:
                 status = 'ошибка проверки'
                 verification_complete = False
-            elif before.identity != final.identity:
+            elif (
+                self._published_identities.get(original, before.identity)
+                != final.identity
+            ):
                 status = 'ошибка проверки: файловый объект заменён'
                 verification_complete = False
             else:

@@ -5,19 +5,32 @@ import os
 import re
 import stat
 import sys
+from collections.abc import Iterator
+from contextlib import closing
 from pathlib import Path
-
-from mutagen.asf import ASF
-from mutagen.flac import FLAC
-from mutagen.mp3 import MP3
-from mutagen.mp4 import MP4
-from mutagen.oggvorbis import OggVorbis
 
 from config import FEAT_VARIANTS_PATTERN, INVALID_FILENAME_CHARS, LEADING_TRACK_PATTERN
 from context import SessionContext
-from interactor import UserInteractor
-from naming import normalize_filename_stem, normalize_unicode
+from duplicate_analysis import (
+    ByteStatus,
+    Candidate,
+    CandidateGroup,
+    compare_candidates,
+    decide_copies,
+    find_candidate_groups,
+)
+from duplicate_removal import Stamp, file_stamp, remove_exact_copies
+from file_state import (
+    FileIdentity,
+    OperationStatus,
+    entry_info,
+    inspect_file,
+    regular_file_info,
+)
+from interactor import UserInteractor, prompt_command
 from parsing import parse_artist_title
+from recovery import begin_rename, recover_renames, settle_rename
+from recovery_store import RecoveryStore
 from report_events import log_operation
 from tag_repository import TagRepository
 
@@ -30,8 +43,11 @@ def select_indices(
     for i, item in enumerate(items, 1):
         interactor.display(f'  [✓] {i}. {item}')
 
-    prompt = '(Enter - применить ко всем / номера - ИСКЛЮЧИТЬ из обработки / n - отменить все): '
-    choice = interactor.prompt(prompt, default='').strip().lower()
+    prompt = (
+        '(Enter - применить ко всем / номера через пробел или запятую - '
+        'ИСКЛЮЧИТЬ из обработки / n - отменить все): '
+    )
+    choice = prompt_command(interactor, prompt)
 
     if not choice or choice in ('y', 'yes', 'д', 'да'):
         return list(range(len(items)))
@@ -39,15 +55,20 @@ def select_indices(
         return []
 
     try:
-        excluded = {int(p) for p in re.split(r'[,\s]+', choice) if p}
-        selected = [i for i in range(len(items)) if (i + 1) not in excluded]
-        skipped = len(items) - len(selected)
-        if skipped:
-            interactor.display(f'Исключено {skipped} файлов.')
-        return selected
+        excluded = {int(part) for part in re.split(r'\s*,\s*|\s+', choice)}
     except ValueError:
-        interactor.display('Некорректный ввод, применяю ко всем.')
-        return list(range(len(items)))
+        interactor.display_error(
+            'Введите номера через пробел или запятую. Группа пропущена.'
+        )
+        return []
+    if any(not 1 <= number <= len(items) for number in excluded):
+        interactor.display_error(
+            f'Допустимые номера: от 1 до {len(items)}. Группа пропущена.'
+        )
+        return []
+
+    interactor.display(f'Исключено {len(excluded)} файлов.')
+    return [i for i in range(len(items)) if i + 1 not in excluded]
 
 
 def files_are_same(old_path: Path, new_path: Path) -> bool:
@@ -64,7 +85,7 @@ WSL_MODIFICATION_DISABLED = (
 )
 
 
-def _windows_local_ntfs(path: Path) -> bool:
+def windows_local_ntfs(path: Path) -> bool:
     """Подтверждает локальный NTFS; неизвестные тома не допускаются."""
     if sys.platform != 'win32':
         return False
@@ -93,22 +114,20 @@ def modification_allowed(
     try:
         if os.name != 'nt':
             raise OSError(WSL_MODIFICATION_DISABLED + ' (POSIX не подтверждён)')
-        absolute = path.absolute()
-        for entry in (absolute, *absolute.parents):
-            info = os.lstat(entry)
-            if stat.S_ISLNK(info.st_mode) or (
-                getattr(info, 'st_file_attributes', 0)
-                & stat.FILE_ATTRIBUTE_REPARSE_POINT
-            ):
-                raise OSError(f'ссылки и reparse points не поддерживаются: {entry}')
-            if entry == absolute and (
-                not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-            ):
-                raise OSError('требуется обычный файл с одной жёсткой ссылкой')
-        if not _windows_local_ntfs(absolute):
+        record = ctx.registry.track(path)
+        physical = ctx.registry.physical_path(record) if ctx.dry_run else path
+        absolute = physical.absolute()
+        if ctx.target_dir is not None and absolute.parent != ctx.target_dir.absolute():
+            raise OSError('файл находится вне выбранного каталога')
+        identity = inspect_file(absolute)
+        if not windows_local_ntfs(absolute.parent):
             raise OSError(
                 'модификация поддерживается только на локальном NTFS в Windows'
             )
+        if record.identity is None:
+            raise OSError('исходная физическая идентичность файла неизвестна')
+        if identity != record.identity:
+            raise OSError('физический объект подменён после сканирования')
     except OSError as exc:
         ctx.block_path(path, str(exc))
         interactor.display_error(f'{path.name}: {exc}')
@@ -116,25 +135,24 @@ def modification_allowed(
     return True
 
 
-def rename_case_sensitive(old_path: Path, new_path: Path, ctx: SessionContext) -> bool:
-    """Один Windows rename; написание проверяется по записи каталога."""
-    try:
-        old_path.rename(new_path)
-        actual = next(
-            (
-                entry
-                for entry in new_path.parent.iterdir()
-                if entry.name == new_path.name
-            ),
-            None,
-        )
-        if actual is None or not actual.samefile(new_path):
-            raise OSError('фактическое написание имени после rename не подтверждено')
-    except OSError as exc:
-        ctx.block_path(old_path, str(exc))
-        ctx.block_path(new_path, str(exc))
-        return False
-    return True
+def _matches_rename_entry(path: Path, identity: FileIdentity) -> bool:
+    """Проверяет точное написание записи и идентичность исходного файла."""
+    return any(
+        entry.name == path.name and inspect_file(entry) == identity
+        for entry in path.parent.iterdir()
+    )
+
+
+def _observed_rename_path(
+    old_path: Path, new_path: Path, identity: FileIdentity
+) -> Path | None:
+    for candidate in (new_path, old_path):
+        try:
+            if _matches_rename_entry(candidate, identity):
+                return candidate.absolute()
+        except OSError:
+            continue
+    return None
 
 
 def simple_rename(
@@ -164,6 +182,22 @@ def simulate_rename(
     )
 
 
+def _rename_source_allowed(
+    old_path: Path, new_path: Path, ctx: SessionContext, interactor: UserInteractor
+) -> bool:
+    if modification_allowed(old_path, ctx, interactor):
+        return True
+    log_operation(
+        'rename',
+        old_path,
+        'блокировка',
+        ctx.get_block_reason(old_path) or 'модификация не разрешена',
+        target=new_path,
+        proposed=ctx.dry_run,
+    )
+    return False
+
+
 def safe_rename(
     old_path: Path,
     new_path: Path,
@@ -172,15 +206,7 @@ def safe_rename(
     interactor: UserInteractor,
 ) -> tuple[str, Path | None]:
     """Один Windows rename без replace, удаления и временных путей."""
-    if not modification_allowed(old_path, ctx, interactor):
-        log_operation(
-            'rename',
-            old_path,
-            'блокировка',
-            ctx.get_block_reason(old_path) or 'модификация не разрешена',
-            target=new_path,
-            proposed=ctx.dry_run,
-        )
+    if not _rename_source_allowed(old_path, new_path, ctx, interactor):
         return 'skipped', None
     if ctx.is_path_blocked(new_path):
         ctx.block_path(old_path, 'целевой путь заблокирован')
@@ -209,24 +235,37 @@ def safe_rename(
     if str(old_path.absolute()) == str(new_path.absolute()):
         return 'unchanged', old_path
     try:
-        try:
-            target_info = os.lstat(new_path)
-        except FileNotFoundError:
+        registry = ctx.registry
+        record = registry.track(old_path)
+        owner = registry.id_for(new_path) if ctx.dry_run else None
+        vacated = ctx.dry_run and registry.source_vacated(new_path)
+        physical = registry.physical_path(record)
+        case_change = old_path.name.casefold() == new_path.name.casefold()
+        if owner is not None and owner != record.id:
+            occupied = True
+            case_change = False
+        elif owner == record.id and new_path.absolute() != physical.absolute():
+            occupied = True
+        elif vacated:
             occupied = False
         else:
-            occupied = True
-        case_change = old_path.name.casefold() == new_path.name.casefold() and (
-            not occupied
-            or (
-                stat.S_ISREG(target_info.st_mode)
-                and target_info.st_nlink == 1
-                and not (
-                    getattr(target_info, 'st_file_attributes', 0)
-                    & stat.FILE_ATTRIBUTE_REPARSE_POINT
-                )
-                and files_are_same(old_path, new_path)
-            )
-        )
+            try:
+                os.lstat(new_path)
+            except FileNotFoundError:
+                occupied = False
+            else:
+                occupied = True
+            if case_change and occupied:
+                try:
+                    target_info = entry_info(new_path.absolute())
+                except OSError:
+                    case_change = False
+                else:
+                    case_change = (
+                        stat.S_ISREG(target_info.st_mode)
+                        and target_info.st_nlink == 1
+                        and (target_info.st_dev, target_info.st_ino) == record.identity
+                    )
         if occupied and not case_change:
             ctx.block_path(old_path, 'конфликт целевого имени; оба файла сохранены')
             interactor.display(
@@ -241,26 +280,80 @@ def safe_rename(
                 proposed=ctx.dry_run,
             )
             return 'duplicate_exists', new_path
+        if not _rename_source_allowed(old_path, new_path, ctx, interactor):
+            return 'skipped', None
         if ctx.dry_run:
             simulate_rename(old_path, new_path, repo, interactor)
             return 'planned', new_path
-        if case_change:
-            if not rename_case_sensitive(old_path, new_path, ctx):
-                interactor.display_error(
-                    f'{old_path.name}: {ctx.get_block_reason(old_path)}'
-                )
-                log_operation(
-                    'rename',
-                    old_path,
-                    'отказ',
-                    ctx.get_block_reason(old_path) or 'переименование не подтверждено',
-                    target=new_path,
-                )
-                return 'failed', None
-        else:
-            # Windows отказывает при появлении цели, в том числе после lstat.
-            old_path.rename(new_path)
+        identity = ctx.registry.track(old_path).identity
+        if identity is None:
+            raise OSError('исходная физическая идентичность файла неизвестна')
+    except OSError as exc:
+        ctx.block_path(old_path, str(exc))
+        interactor.display_error(f'{old_path.name}: {exc}')
+        log_operation(
+            'rename', old_path, 'отказ', str(exc), target=new_path, proposed=ctx.dry_run
+        )
+        return 'skipped', None
+
+    if ctx.recovery is not None:
+        return _execute_rename(
+            old_path, new_path, identity, ctx.recovery, ctx, repo, interactor
+        )
+    try:
+        store = RecoveryStore(old_path.absolute().parent)
+        with store.session():
+            recover_renames(store, ctx, interactor)
+            return _execute_rename(
+                old_path, new_path, identity, store, ctx, repo, interactor
+            )
+    except OSError as exc:
+        ctx.block_path(old_path, str(exc))
+        ctx.block_path(new_path, str(exc))
+        interactor.display_error(f'Переименование {old_path.name} отклонено: {exc}')
+        return 'skipped', None
+
+
+def _execute_rename(
+    old_path: Path,
+    new_path: Path,
+    identity: FileIdentity,
+    store: RecoveryStore,
+    ctx: SessionContext,
+    repo: TagRepository,
+    interactor: UserInteractor,
+) -> tuple[str, Path | None]:
+    if ctx.is_path_blocked(old_path) or ctx.is_path_blocked(new_path):
+        return 'skipped', None
+    try:
+        record, intent = begin_rename(store, old_path, new_path, identity)
+        if inspect_file(old_path) != identity:
+            raise OSError('физический объект подменён перед rename')
+    except (OSError, ValueError) as exc:
+        ctx.block_path(old_path, str(exc))
+        ctx.block_path(new_path, str(exc))
+        interactor.display_error(
+            f'Не удалось подготовить rename {old_path.name}: {exc}'
+        )
+        return 'skipped', None
+
+    try:
+        # Windows отказывает при появлении цели, в том числе после lstat.
+        old_path.rename(new_path)
     except FileExistsError:
+        try:
+            if (
+                settle_rename(
+                    store, record, intent, ctx, interactor, expected='original'
+                )
+                is None
+            ):
+                return 'failed', None
+        except OSError as exc:
+            ctx.block_path(old_path, str(exc))
+            ctx.block_path(new_path, str(exc))
+            interactor.display_error(f'Не удалось завершить запись rename: {exc}')
+            return 'failed', None
         ctx.block_path(old_path, 'целевой путь занят; переименование отклонено')
         interactor.display_error(f'Целевой путь занят: {new_path.name}')
         log_operation(
@@ -274,14 +367,35 @@ def safe_rename(
     except OSError as exc:
         ctx.block_path(old_path, str(exc))
         ctx.block_path(new_path, str(exc))
-        interactor.display_error(
-            f'Переименование {old_path.name} не подтверждено: {exc}'
-        )
+        interactor.display_error(f'Переименование {old_path.name} отклонено: {exc}')
         log_operation('rename', old_path, 'отказ', str(exc), target=new_path)
+        return 'skipped', None
+
+    try:
+        if not _matches_rename_entry(new_path, identity):
+            raise OSError('целевое имя или физическая идентичность не подтверждены')
+        if (
+            settle_rename(store, record, intent, ctx, interactor, expected='renamed')
+            is None
+        ):
+            raise OSError('содержимое или состояние путей не подтверждены')
+    except OSError as exc:
+        actual = _observed_rename_path(old_path, new_path, identity)
+        observed = str(actual) if actual is not None else 'не установлено'
+        reason = (
+            f'Переименование не подтверждено ({exc}). '
+            f'Запрошено: {old_path.absolute()} → {new_path.absolute()}. '
+            f'Фактическое местонахождение исходного файла: {observed}'
+        )
+        ctx.block_path(old_path, reason)
+        ctx.block_path(new_path, reason)
+        interactor.display_error(reason)
+        log_operation('rename', old_path, 'отказ', reason, target=new_path)
         return 'failed', None
     if ctx.report is not None:
         ctx.report.record_rename(old_path, new_path)
-    repo.simulate_rename(old_path, new_path)
+    repo.invalidate(old_path)
+    repo.invalidate(new_path)
     return 'renamed', new_path
 
 
@@ -304,21 +418,8 @@ def handle_rename_result(
 
 def get_audio_duration(filepath: Path) -> float | None:
     """Возвращает длительность аудиофайла в секундах или None."""
-    ext = filepath.suffix.lower()
-    try:
-        if ext == '.mp3':
-            return float(MP3(filepath).info.length)  # type: ignore[attr-defined]
-        if ext in ('.m4a', '.mp4'):
-            return float(MP4(filepath).info.length)  # type: ignore[attr-defined]
-        if ext == '.flac':
-            return float(FLAC(filepath).info.length)  # type: ignore[union-attr]
-        if ext == '.ogg':
-            return float(OggVorbis(filepath).info.length)  # type: ignore[attr-defined]
-        if ext == '.wma':
-            return float(ASF(filepath).info.length)  # type: ignore[attr-defined]
-    except Exception:
-        pass
-    return None
+    info = TagRepository().read_tags_uncached(filepath).info
+    return info.duration if info is not None else None
 
 
 def format_duration(seconds: float) -> str:
@@ -498,7 +599,7 @@ def sanitize_filename_interactive(
             f"  [Подсказка: вы уже {count} раз выбрали этот вариант. Нажмите 'a', чтобы запомнить.]"
         )
 
-    choice = interactor.prompt('  Выберите вариант [1]: ', default='1')
+    choice = prompt_command(interactor, '  Выберите вариант [1]: ', default='1')
 
     if choice == 'a':
         ctx.remembered_choices[chars_key] = 0
@@ -545,30 +646,38 @@ def clean_filename_safely(
 
 
 def find_duplicates(files: list[Path], repo: TagRepository) -> list[list[Path]]:
-    """Находит дубликаты файлов по тегам и нормализованным именам."""
-    tag_map: dict[tuple[str, str, str], list[Path]] = {}
-    for f in files:
-        tags = repo.get_tags(f)
-        normalized_name = normalize_filename_stem(f.stem).lower()
-
-        if tags:
-            artist_norm = normalize_unicode(tags.artist).lower().strip()
-            title_norm = normalize_unicode(tags.title).lower().strip()
-            key = (artist_norm, title_norm, 'tags')
-        else:
-            name_norm = normalize_unicode(normalized_name)
-            key = (name_norm, '', 'name')
-
-        if key not in tag_map:
-            tag_map[key] = []
-        tag_map[key].append(f)
-
-    return [group for group in tag_map.values() if len(group) > 1]
+    """Возвращает пути кандидатов для вызывающих мест, которым нужны только группы."""
+    return [
+        [candidate.path for candidate in group.candidates]
+        for group in find_candidate_groups(files, repo)
+    ]
 
 
 def get_best_name_from_group(group: list[Path]) -> Path:
     """Выбирает файл с наиболее правильным именем из группы дубликатов."""
     return max(group, key=name_quality_score)
+
+
+def _display_candidate(candidate: Candidate, interactor: UserInteractor) -> None:
+    metadata = candidate.metadata
+    status = metadata.status.name
+    if metadata.error:
+        status += f' ({metadata.error})'
+    interactor.display(f'    {candidate.path} — теги {status}')
+    known = ', '.join(
+        f'{field}={value!r}'
+        for field, value in candidate.values().items()
+        if value is not None
+    )
+    interactor.display(f'      {known}')
+    for source, qualifiers in (
+        ('имя', candidate.name_qualifiers),
+        ('тег названия', candidate.tag_qualifiers),
+    ):
+        if qualifiers:
+            interactor.display(f'      Уточнения ({source}): {", ".join(qualifiers)}')
+    if candidate.qualifier_disagreement:
+        interactor.display('      Уточнения в имени и теге расходятся.')
 
 
 def process_duplicates(
@@ -577,16 +686,140 @@ def process_duplicates(
     repo: TagRepository,
     interactor: UserInteractor,
 ) -> list[Path]:
-    """Только показывает кандидатов; совпадение не разрешает объединение."""
-    duplicates = find_duplicates(files, repo)
+    """Анализирует группы и применяет решения о точных копиях в deep."""
+    file_ids = ctx.file_ids(files)
+    duplicates = find_candidate_groups(files, repo)
     interactor.display(f'  Групп кандидатов в дубликаты: {len(duplicates)}')
     for i, group in enumerate(duplicates, 1):
-        interactor.display(f'  Группа {i}:')
-        for path in group:
-            interactor.display(f'    {path.name}')
-    if duplicates:
+        interactor.display(f'  Группа {i}: {group.source} {group.key!r}')
+        for number, candidate in enumerate(group.candidates, 1):
+            interactor.display(f'    Файл {number}')
+            _display_candidate(candidate, interactor)
+        numbers = {
+            candidate.path: number
+            for number, candidate in enumerate(group.candidates, 1)
+        }
+        expected: dict[Path, Stamp] = {}
+        reason = ''
+        if ctx.deep and not ctx.dry_run:
+            try:
+                for candidate in group.candidates:
+                    expected[candidate.path] = file_stamp(
+                        regular_file_info(candidate.path)
+                    )
+            except OSError as exc:
+                reason = str(exc)
+        pairs = list(compare_candidates(group, ctx.registry))
+        winner = None
+        copies = []
+        for decision in decide_copies(group, pairs):
+            pair = decision.pair
+            left, right = numbers[pair.left.path], numbers[pair.right.path]
+            interactor.display(f'    Файлы {left} и {right}: {pair.byte_status}.')
+            if pair.byte_error:
+                interactor.display(f'      Ошибка чтения: {pair.byte_error}')
+            if pair.differences:
+                interactor.display(f'      Различия: {", ".join(pair.differences)}')
+            if pair.missing:
+                interactor.display(
+                    f'      Недостаточно данных: {", ".join(pair.missing)}'
+                )
+            if decision.keep is not None and decision.redundant is not None:
+                winner = decision.keep
+                copies.append(decision.redundant)
+                keep = numbers[decision.keep]
+                redundant = numbers[decision.redundant]
+                interactor.display(
+                    f'      Результат анализа: сохранить файл {keep}, '
+                    f'файл {redundant} — лишняя копия. Основание: {decision.reason}.'
+                )
+            else:
+                interactor.display(f'      Выбор копии пропущен: {decision.reason}.')
+        if ctx.deep and winner is not None:
+            if any(
+                pair.byte_status in (ByteStatus.ERROR, ByteStatus.UNKNOWN)
+                for pair in pairs
+            ):
+                reason = reason or 'побайтовое сравнение группы не завершено'
+            _apply_copy_decisions(
+                group, winner, tuple(copies), expected, reason, ctx, repo, interactor
+            )
+    if duplicates and not ctx.deep:
         interactor.display('  Объединение отключено; все файлы сохранены.')
-    return files
+    return ctx.present_paths(file_ids)
+
+
+def _apply_copy_decisions(
+    group: CandidateGroup,
+    winner: Path,
+    copies: tuple[Path, ...],
+    expected: dict[Path, Stamp],
+    reason: str,
+    ctx: SessionContext,
+    repo: TagRepository,
+    interactor: UserInteractor,
+) -> None:
+    for candidate in group.candidates:
+        reason = reason or ctx.get_block_reason(candidate.path) or ''
+    if not ctx.dry_run and not windows_local_ntfs(winner.parent):
+        reason = reason or (
+            WSL_MODIFICATION_DISABLED if os.name != 'nt' else 'требуется локальный NTFS'
+        )
+
+    def results() -> Iterator[tuple[Path, OperationStatus, str]]:
+        if reason:
+            yield copies[0], OperationStatus.ERROR, reason
+        elif ctx.dry_run:
+            for copy in copies:
+                yield copy, OperationStatus.SIMULATED, 'план удаления точной копии'
+        else:
+            with closing(
+                remove_exact_copies(group, winner, copies, expected, ctx.registry, repo)
+            ) as execution:
+                yield from execution
+
+    completed = set()
+    interactor.display(f'  Сохраняемая копия: {winner.name}')
+    for copy, status, detail in results():
+        completed.add(copy)
+        if status in (OperationStatus.SUCCESS, OperationStatus.SIMULATED):
+            ctx.registry.mark_missing(
+                ctx.registry.track(copy).id, simulated=ctx.dry_run
+            )
+            if ctx.dry_run:
+                repo.simulate_unlink(copy)
+            else:
+                repo.invalidate(copy)
+            ctx.increment_stat('duplicates_removed')
+            label = 'Запланировано удаление' if ctx.dry_run else 'Удалён'
+            result = 'ПРЕДЛОЖЕНИЕ' if ctx.dry_run else 'успех'
+        elif status is OperationStatus.UNCERTAIN:
+            label, result = 'Удаление не подтверждено', 'неопределённость'
+            ctx.block_path(copy, detail)
+            ctx.block_path(winner, detail)
+        else:
+            label, result = 'Пропущен', 'отказ'
+        interactor.display(f'  {label}: {copy.name}. {detail}')
+        log_operation(
+            'duplicate_delete',
+            copy,
+            result,
+            detail,
+            target=winner,
+            proposed=ctx.dry_run,
+        )
+    for copy in copies:
+        if copy not in completed:
+            detail = 'обработка группы остановлена после первого сбоя'
+            interactor.display(f'  Пропущен: {copy.name}. {detail}')
+            log_operation(
+                'duplicate_delete',
+                copy,
+                'отказ',
+                detail,
+                target=winner,
+                proposed=ctx.dry_run,
+            )
 
 
 def find_artist_variations(
@@ -595,7 +828,7 @@ def find_artist_variations(
     """Находит разные варианты написания одного исполнителя."""
     artist_map: dict[str, list[tuple[Path, str, str]]] = {}
     for f in files:
-        tags = repo.get_tags(f)
+        tags = repo.get_tags(f).complete_tags
         if tags:
             full_artist = tags.artist.strip()
             individual_artists = [

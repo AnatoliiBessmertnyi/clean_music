@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -12,6 +13,7 @@ from file_state import FileRegistry
 from report_events import log_operation
 
 if TYPE_CHECKING:
+    from recovery_store import RecoveryStore
     from run_report import RunReport
 
 logger = logging.getLogger('clean_music')
@@ -52,10 +54,39 @@ class SessionContext:
             'manual_input': 0,
         }
     )
+    planned_stats: dict[str, int] = field(default_factory=dict)
     missing_files: list[Path] = field(default_factory=list)
     blocked_paths: dict[Path, str] = field(default_factory=dict)
     report: RunReport | None = None
     registry: FileRegistry = field(default_factory=FileRegistry)
+    recovery: RecoveryStore | None = None
+    ffprobe_missing_reported: bool = False
+    deep: bool = False
+
+    def file_ids(self, paths: Iterable[Path]) -> list[int]:
+        """Фиксирует порядок входных файлов и устраняет повторы по ID."""
+        return list(dict.fromkeys(self.registry.track(path).id for path in paths))
+
+    def present_path(self, file_id: int) -> Path | None:
+        record = self.registry.record_of(file_id)
+        if not record.present:
+            return None
+        try:
+            self.registry.physical_path(record).lstat()
+        except FileNotFoundError:
+            self.registry.mark_missing(file_id)
+            return None
+        except OSError:
+            # Недоступность пути не подтверждает исчезновение.
+            pass
+        return record.path
+
+    def present_paths(self, file_ids: Iterable[int]) -> list[Path]:
+        return [
+            path
+            for file_id in file_ids
+            if (path := self.present_path(file_id)) is not None
+        ]
 
     def block_path(self, path: Path, reason: str) -> None:
         """Запрещает дальнейшие изменения по пути, сохраняя первую причину.
@@ -96,7 +127,8 @@ class SessionContext:
             key: Ключ статистики
             amount: На сколько увеличить (по умолчанию 1)
         """
-        self.stats[key] = self.stats.get(key, 0) + amount
+        counts = self.planned_stats if self.dry_run else self.stats
+        counts[key] = counts.get(key, 0) + amount
 
     def get_stat(self, key: str) -> int:
         """Возвращает значение счетчика статистики.

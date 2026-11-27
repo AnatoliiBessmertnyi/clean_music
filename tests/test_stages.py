@@ -1,6 +1,7 @@
-"""Только цепочки изменений, затронутые защитой Issue #9."""
+"""Проверки сохранности файлов и тегов в этапах конвейера."""
 
 import os
+from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock
@@ -9,8 +10,241 @@ import pytest
 
 import stages
 from context import SessionContext
+from file_operations import FileExecutor
+from file_state import FileRecord, OperationStatus
+from interactor import ConsoleInteractor, UserInteractor
 from pipeline import AudioProcessingPipeline
-from tests.test_pipeline_utils import Interactor, MemoryRepository, windows
+from pipeline_utils import simulate_rename
+from recovery_store import RecoveryStore
+from tag_repository import AudioTags, ReadStatus, TagRepository
+from tests.test_pipeline_utils import Interactor, MemoryRepository, admit, windows
+from tests.test_tag_publication import synthetic_audio
+from tests.test_tag_repository import write_mp3
+
+
+@pytest.fixture(autouse=True)
+def memory_tag_publication(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = FileExecutor._publish_tag_change
+
+    def publish(
+        path: Path,
+        record: FileRecord,
+        artist: str | None,
+        title: str | None,
+        ctx: SessionContext,
+        repo: TagRepository,
+        interactor: UserInteractor,
+    ) -> tuple[OperationStatus, str]:
+        if isinstance(repo, MemoryRepository):
+            return repo._write_to_disk(path, artist, title)
+        return original(path, record, artist, title, ctx, repo, interactor)
+
+    monkeypatch.setattr(FileExecutor, '_publish_tag_change', staticmethod(publish))
+
+
+@pytest.fixture
+def model_platform_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Подменяет проверку NTFS в WSL для тестов с dry-run и кэшем в памяти."""
+    if os.name != 'nt':
+        guard = Mock(return_value=True)
+        monkeypatch.setattr('file_operations.modification_allowed', guard)
+        monkeypatch.setattr('pipeline_utils.modification_allowed', guard)
+
+
+@pytest.mark.usefixtures('model_platform_guard')
+@pytest.mark.parametrize(
+    ('source_title', 'title'),
+    [
+        ('Песня (Live)', 'Песня (Live)'),
+        ('Песня (Ирина Remix)', 'Песня (Ирина Remix)'),
+        ('Песня (Acoustic)', 'Песня (Acoustic)'),
+        ('Песня (Instrumental)', 'Песня (Instrumental)'),
+        ('Песня [2024 Remaster]', 'Песня [2024 Remaster]'),
+        ('Песня (Radio Edit)', 'Песня (Radio Edit)'),
+        ('Песня (Album Version)', 'Песня (Album Version)'),
+        ('Песня (Архивная запись)', 'Песня (Архивная запись)'),
+        ('Песня (Live) [Ирина Remix]', 'Песня (Live) [Ирина Remix]'),
+        ('Песня (Live) (vksaver)', 'Песня (Live)'),
+        ('Песня (Live [vksaver])', 'Песня (Live)'),
+        ('Песня (Live) (ft. Ирина)', 'Песня (Live) (feat. Ирина)'),
+        ('Песня feat. Ирина (Live)', 'Песня feat. Ирина (Live)'),
+        ('Песня (Концерт feat. Ирина)', 'Песня (Концерт feat. Ирина)'),
+    ],
+)
+def test_tag_writing_preserves_annotations(
+    tmp_path: Path, source_title: str, title: str
+) -> None:
+    source = tmp_path / f'Исполнитель - {source_title}.mp3'
+    source.touch()
+    ctx, repo, ui = SessionContext(True, False), MemoryRepository(), Interactor('y')
+    admit(ctx, source)
+    [current] = stages.TagWritingStage().execute([source], ctx, repo, ui)
+    assert repo.get_tags(current).complete_tags == AudioTags('Исполнитель', title)
+
+
+@pytest.mark.parametrize('denied', [False, True])
+def test_tag_writing_skips_unreadable_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, denied: bool
+) -> None:
+    source = tmp_path / 'Filename Artist - Filename Title.mp3'
+    source.write_bytes(b'corrupt')
+    if denied:
+        monkeypatch.setattr(
+            'tag_repository.MP3', Mock(side_effect=PermissionError('denied'))
+        )
+    repo = TagRepository()
+    write = Mock()
+    monkeypatch.setattr(repo, 'apply_tags', write)
+    ui = Interactor()
+    ctx = SessionContext(False, False)
+    assert stages.TagWritingStage().execute([source], ctx, repo, ui) == [source]
+    assert not write.called and not ui.prompts
+    assert source.read_bytes() == b'corrupt'
+
+
+@pytest.mark.usefixtures('model_platform_guard')
+@pytest.mark.parametrize('dry_run', [True, pytest.param(False, marks=windows)])
+@pytest.mark.parametrize(
+    ('artist', 'title', 'expected'),
+    [
+        ('AC/DC', '', AudioTags('AC/DC', 'Filename Title')),
+        ('', 'Original / Title', AudioTags('Filename Artist', 'Original / Title')),
+    ],
+)
+def test_tag_writing_fills_only_missing_field(
+    tmp_path: Path, dry_run: bool, artist: str, title: str, expected: AudioTags
+) -> None:
+    source = tmp_path / 'Filename Artist - Filename Title.mp3'
+    if dry_run:
+        write_mp3(source, artist=artist, title=title)
+    else:
+        synthetic_audio(source, artist=artist, title=title)
+    repo = TagRepository()
+    before = source.read_bytes()
+    ctx = SessionContext(dry_run, False)
+    admit(ctx, source)
+    with ExitStack() as stack:
+        if not dry_run:
+            ctx.recovery = RecoveryStore(tmp_path)
+            stack.enter_context(ctx.recovery.session())
+        [result] = stages.TagWritingStage().execute([source], ctx, repo, Interactor())
+    assert repo.get_tags(result).tags == expected
+    if dry_run:
+        assert not result.exists() and source.read_bytes() == before
+        assert repo.read_tags_uncached(source).tags == AudioTags(artist, title)
+    else:
+        assert repo.read_tags_uncached(result).tags == expected
+
+
+@pytest.mark.usefixtures('model_platform_guard')
+@pytest.mark.parametrize('dry_run', [True, pytest.param(False, marks=windows)])
+@pytest.mark.parametrize('artist', ['AC/DC', 'Исполнитель/Группа'])
+def test_tag_renaming_preserves_metadata_on_second_pass(
+    tmp_path: Path, dry_run: bool, artist: str
+) -> None:
+    source = tmp_path / 'Песня.mp3'
+    source.touch()
+    ctx, repo, ui = SessionContext(dry_run, False), MemoryRepository(), Interactor()
+    assert repo.update_tags(
+        source, f'{artist} featuring Ирина', 'Песня (Live) [A/B Remix]'
+    )
+    repo.writes.clear()
+    expected = AudioTags(artist, 'Песня (Live) [A/B Remix] (feat. Ирина)')
+    target = (
+        tmp_path
+        / f'{artist.replace("/", "")} - Песня (Live) [AB Remix] (feat. Ирина).mp3'
+    )
+    admit(ctx, source)
+    stage = stages.TagRenamingStage()
+
+    assert stage.execute([source], ctx, repo, ui) == [target]
+    assert repo.get_tags(target).complete_tags == expected
+    assert stage.execute([target], ctx, repo, ui) == [target]
+    assert repo.get_tags(target).complete_tags == expected
+    assert source.exists() == dry_run
+    assert target.exists() != dry_run
+    assert len(repo.writes) == int(not dry_run)
+
+
+@pytest.mark.usefixtures('model_platform_guard')
+def test_manual_artist_keeps_case_through_console(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / 'Song.mp3'
+    source.touch()
+    ctx, repo = SessionContext(True, False), MemoryRepository()
+    admit(ctx, source)
+    ctx.missing_files = [source]
+    monkeypatch.setattr(stages, 'modification_allowed', Mock(return_value=True))
+    monkeypatch.setattr('builtins.input', Mock(side_effect=['Y', 'McCartney']))
+
+    [current] = stages.ManualInputStage().execute(
+        [source], ctx, repo, ConsoleInteractor()
+    )
+
+    assert current.name == 'McCartney - Song.mp3'
+    assert repo.get_tags(current).tags == AudioTags('McCartney', 'Song')
+
+
+def test_manual_input_skips_metadata_read_error(tmp_path: Path) -> None:
+    source = tmp_path / 'Unreadable.mp3'
+    source.write_bytes(b'corrupt')
+    ui = Interactor()
+    ctx = SessionContext(False, False)
+    assert stages.ManualInputStage().execute([source], ctx, TagRepository(), ui) == [
+        source
+    ]
+    assert not ui.prompts
+    assert not ctx.missing_files
+    assert any('обработка тегов пропущена' in message for message in ui.messages)
+
+
+@pytest.mark.parametrize('answer', ['N', 'ошибка'])
+def test_invalid_filename_group_skip_never_calls_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: str
+) -> None:
+    files = [tmp_path / 'First.mp3', tmp_path / 'Second.mp3']
+    ctx, repo, ui = SessionContext(False, False), MemoryRepository(), Interactor(answer)
+    for source in files:
+        source.touch()
+        repo.simulate_update_tags(source, 'AC/DC', source.stem)
+    rename = Mock()
+    monkeypatch.setattr(stages._file_executor, 'rename', rename)
+
+    assert stages.TagRenamingStage().execute(files, ctx, repo, ui) == files
+    assert len(ui.prompts) == 1
+    rename.assert_not_called()
+
+
+@pytest.mark.usefixtures('model_platform_guard')
+@pytest.mark.parametrize('dry_run', [True, pytest.param(False, marks=windows)])
+def test_mismatch_write_retains_artist_sanitized_in_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry_run: bool
+) -> None:
+    source = tmp_path / 'ACDC - Correct title.mp3'
+    source.touch()
+    ctx, repo, ui = SessionContext(dry_run, False), MemoryRepository(), Interactor()
+    repo.simulate_update_tags(source, 'AC/DC', 'Old title')
+    monkeypatch.setattr(ui, 'prompt', Mock(side_effect=['1', 'f']))
+
+    admit(ctx, source)
+    stage = stages.TagRenamingStage()
+    assert stage.execute([source], ctx, repo, ui) == [source]
+    assert repo.get_tags(source).complete_tags == AudioTags('AC/DC', 'Correct title')
+
+
+@pytest.mark.usefixtures('model_platform_guard')
+def test_encoding_repair_preserves_title_annotations(tmp_path: Path) -> None:
+    source = tmp_path / 'Исполнитель - Песня.mp3'
+    source.touch()
+    ctx, repo, ui = SessionContext(True, False), MemoryRepository(), Interactor('y')
+    admit(ctx, source)
+    repo.simulate_update_tags(source, 'ÐÐ', 'Песня (Live)')
+
+    assert stages.TagRenamingStage().execute([source], ctx, repo, ui) == [source]
+    assert repo.get_tags(source).complete_tags == AudioTags(
+        'Исполнитель', 'Песня (Live)'
+    )
 
 
 @windows
@@ -22,6 +256,7 @@ def test_junk_rename_failure_blocks_tag_cleanup(
     target = tmp_path / 'Artist - Title.mp3'
     path.write_bytes(b'original')
     repo, ctx, ui = MemoryRepository(), SessionContext(False, False), Interactor()
+    admit(ctx, path)
     repo.simulate_update_tags(path, 'Artist', 'Title (vksaver)')
     files = [path]
     if conflict:
@@ -51,7 +286,7 @@ def test_junk_then_normalization_preserves_file_id(
     old.write_bytes(b'original')
     neighbor.write_bytes(b'neighbor')
     ctx, repo, ui = SessionContext(dry_run, False), MemoryRepository(), Interactor()
-    file_id = ctx.registry.register(old).id
+    file_id = admit(ctx, old, neighbor).id
     pipeline = AudioProcessingPipeline(
         [stages.JunkCleaningStage(), stages.NormalizationStage()]
     )
@@ -85,7 +320,7 @@ def test_tag_rename_passes_current_paths_to_mismatches(
     repo, ui = MemoryRepository(), Interactor()
     repo.simulate_update_tags(old, 'Artist', 'Title')
     repo.simulate_update_tags(neighbor, 'Artist', 'Other')
-    file_id = ctx.registry.register(old).id
+    file_id = admit(ctx, old).id
     neighbor_id = ctx.registry.register(neighbor).id
     if outcome == 'denied':
         monkeypatch.setattr(Path, 'rename', Mock(side_effect=PermissionError('locked')))
@@ -114,12 +349,87 @@ def test_tag_rename_passes_current_paths_to_mismatches(
 
 
 @windows
+@pytest.mark.parametrize('dry_run', [False, True])
+def test_tag_rename_applies_mismatches_in_input_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry_run: bool
+) -> None:
+    individual = tmp_path / 'Artist - Original.mp3'
+    safe = tmp_path / 'Matching.mp3'
+    neighbor = tmp_path / 'Artist - Unchanged.mp3'
+    group = tmp_path / 'Without separator.mp3'
+    files = [individual, safe, neighbor, group]
+    expected = [
+        tmp_path / 'Artist - Corrected.mp3',
+        tmp_path / 'Artist - Matching.mp3',
+        neighbor,
+        tmp_path / 'Artist - Grouped.mp3',
+    ]
+    ctx, repo, ui = SessionContext(dry_run, False), MemoryRepository(), Interactor()
+    monkeypatch.setattr(ui, 'prompt', Mock(side_effect=['', 'y', 't']))
+    titles = ['Corrected', 'Matching', 'Unchanged', 'Grouped']
+    ids = []
+    for source, title in zip(files, titles, strict=True):
+        source.write_bytes(title.encode())
+        repo.simulate_update_tags(source, 'Artist', title)
+        ids.append(admit(ctx, source).id)
+
+    assert stages.TagRenamingStage().execute(files, ctx, repo, ui) == expected
+    assert [ctx.registry.id_for(path) for path in expected] == ids
+    assert [ctx.registry.path_of(file_id) for file_id in ids] == expected
+    assert ctx.get_stat('renamed_by_tags') == (0 if dry_run else 3)
+    for source, target, title in zip(files, expected, titles, strict=True):
+        assert (source if dry_run else target).read_bytes() == title.encode()
+        if source != target:
+            assert not (target if dry_run else source).exists()
+            assert ctx.registry.id_for(source) is None
+
+
+@windows
+@pytest.mark.parametrize('outcome', ['conflict', 'denied', 'blocked'])
+def test_tag_mismatch_keeps_original_path_on_rename_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    source = tmp_path / 'Without separator.mp3'
+    target = tmp_path / 'Artist - Corrected.mp3'
+    source.write_bytes(b'original')
+    ctx, repo, ui = SessionContext(False, False), MemoryRepository(), Interactor('y')
+    repo.simulate_update_tags(source, 'Artist', 'Corrected')
+    file_id = admit(ctx, source).id
+    files = [source]
+    if outcome == 'conflict':
+        target.write_bytes(b'occupied')
+        files.append(target)
+        target_id = ctx.registry.register(target).id
+        reason = 'конфликт целевого имени; оба файла сохранены'
+    elif outcome == 'denied':
+        reason = 'locked'
+        monkeypatch.setattr(Path, 'rename', Mock(side_effect=PermissionError(reason)))
+    else:
+        reason = 'ранее заблокирован'
+        ctx.block_path(source, reason)
+
+    assert stages.TagRenamingStage().execute(files, ctx, repo, ui) == files
+    assert ctx.registry.path_of(file_id) == source
+    assert ctx.registry.id_for(source) == file_id
+    assert ctx.get_stat('renamed_by_tags') == 0
+    assert ctx.get_block_reason(source) == reason
+    assert source.read_bytes() == b'original'
+    if outcome == 'conflict':
+        assert target.read_bytes() == b'occupied'
+        assert ctx.registry.id_for(target) == target_id
+    else:
+        assert not target.exists()
+        assert ctx.get_block_reason(target) == (reason if outcome == 'denied' else None)
+
+
+@windows
 @pytest.mark.parametrize('answer', ['', 'y', 'yes'])
 def test_tag_rename_conflict_keeps_both(tmp_path: Path, answer: str) -> None:
     old, new = tmp_path / 'Title.mp3', tmp_path / 'Artist - Title.mp3'
     old.write_bytes(b'old')
     new.write_bytes(b'new target')
     repo, ctx, ui = MemoryRepository(), SessionContext(False, False), Interactor(answer)
+    admit(ctx, old, new)
     repo.simulate_update_tags(old, 'Artist', 'Title')
     repo.simulate_update_tags(new, 'Artist', 'Title')
     assert stages.TagRenamingStage()._rename_by_tags([old, new], ctx, repo, ui) == [
@@ -147,8 +457,59 @@ def test_duplicate_stage_preserves_files_and_cache(
         repo.simulate_update_tags(path, 'Artist', 'Title')
     assert stages.DuplicateResolutionStage().execute(files, ctx, repo, ui) == files
     assert [path.read_bytes() for path in files] == [b'A', b'BBBB']
-    assert all(repo.get_tags(path) is not None for path in files)
+    assert all(repo.get_tags(path).complete_tags is not None for path in files)
     assert not ctx.get_stat('duplicates_removed') and not ui.prompts
+    output = '\n'.join(ui.messages)
+    assert 'нормализованные исполнитель и название из тегов' in output
+    assert 'Байты различаются. Совпадение музыкальной записи не установлено' in output
+    assert 'Недостаточно данных: формат, кодек' in output
+    assert 'полное совпадение байтов не подтверждено' in output
+
+
+@pytest.mark.parametrize(
+    ('suffix', 'explanation'),
+    [
+        (' (1)', 'Результат анализа: сохранить файл 1, файл 2 — лишняя копия'),
+        (' (Live)', 'Выбор копии пропущен: имена или исходные теги'),
+    ],
+)
+def test_duplicate_stage_explains_equal_bytes(
+    tmp_path: Path, suffix: str, explanation: str
+) -> None:
+    original = write_mp3(tmp_path / 'Artist - Song.mp3', artist='Artist', title='Song')
+    copy = tmp_path / f'Artist - Song{suffix}.mp3'
+    content = original.read_bytes()
+    copy.write_bytes(content)
+    files = [original, copy]
+    ctx, repo, ui = SessionContext(False, False), TagRepository(), Interactor()
+    assert stages.DuplicateResolutionStage().execute(files, ctx, repo, ui) == files
+    output = '\n'.join(ui.messages)
+    assert 'Побайтовое совпадение подтверждено' in output
+    assert explanation in output
+    assert [path.read_bytes() for path in files] == [content, content]
+    assert not ui.prompts
+
+
+@pytest.mark.usefixtures('model_platform_guard')
+def test_duplicate_stage_after_virtual_tag_write(tmp_path: Path) -> None:
+    original = tmp_path / 'Artist - Song.mp3'
+    copy = tmp_path / 'Artist - Song (1).mp3'
+    files = [original, copy]
+    for path in files:
+        path.write_bytes(b'identical')
+    ctx, repo, ui = SessionContext(True, False), MemoryRepository(), Interactor('y')
+    admit(ctx, original, copy)
+    # У файла с заполненными тегами виртуальная запись не требуется.
+    repo.simulate_update_tags(copy, 'Artist', 'Song')
+    assert stages.TagWritingStage().execute(files, ctx, repo, ui) == files
+    assert ctx.registry.track(original).modeled_content
+    assert stages.DuplicateResolutionStage().execute(files, ctx, repo, ui) == files
+    output = '\n'.join(ui.messages)
+    assert 'Будущие размер и байты неизвестны' in output
+    assert 'полное совпадение байтов не подтверждено' in output
+    assert 'Побайтовое совпадение подтверждено' not in output
+    assert 'Результат анализа: сохранить' not in output
+    assert [path.read_bytes() for path in files] == [b'identical', b'identical']
 
 
 @windows
@@ -159,20 +520,191 @@ def test_tag_writing_before_failed_rename(
     path = tmp_path / 'Artist - Title (vksaver).mp3'
     path.write_bytes(b'original')
     repo, ctx, ui = MemoryRepository(), SessionContext(False, False), Interactor()
+    admit(ctx, path)
     repo.succeed = write_succeeds
     rename = Mock(side_effect=PermissionError('locked'))
     monkeypatch.setattr(Path, 'rename', rename)
-    stages.TagWritingStage().execute([path], ctx, repo, ui)
+    assert stages.TagWritingStage().execute([path], ctx, repo, ui) == [path]
     assert len(repo.writes) == 1
     assert rename.call_count == int(write_succeeds)
     assert ctx.get_stat('tags_written') == int(write_succeeds)
     assert ctx.get_stat('renamed_by_tags') == 0 and ctx.is_path_blocked(path)
+    assert repo.get_tags(path).complete_tags == (
+        AudioTags('Artist', 'Title') if write_succeeds else None
+    )
+    assert not path.with_name('Artist - Title.mp3').exists()
     assert path.read_bytes() == b'original'
 
 
 @windows
+def test_late_stages_keep_input_order_and_identity_without_rescan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / 'artist - Title (vksaver).mp3'
+    intermediate = tmp_path / 'artist - Title.mp3'
+    final = tmp_path / 'Artist - Title.mp3'
+    neighbor = tmp_path / 'Artist - One.mp3'
+    outsider = tmp_path / 'Untracked.mp3'
+    synthetic_audio(source, artist='', title='')
+    write_mp3(neighbor, artist='Artist', title='One')
+    outsider.touch()
+    repo = TagRepository()
+    ctx, ui = SessionContext(False, False, target_dir=tmp_path), Interactor()
+    admit(ctx, neighbor, source)
+    variations = Mock(wraps=stages.find_artist_variations)
+    monkeypatch.setattr(stages, 'find_artist_variations', variations)
+
+    pipeline = AudioProcessingPipeline(
+        [
+            stages.TagWritingStage(),
+            stages.ArtistNormalizationStage(),
+            stages.ManualInputStage(),
+        ]
+    )
+    store = RecoveryStore(tmp_path)
+    with store.session():
+        ctx.recovery = store
+        assert pipeline.run([neighbor, source, source], ctx, repo, ui) == [
+            neighbor,
+            final,
+        ], ui.messages
+    variations.assert_called_once_with([neighbor, intermediate], repo)
+    file_id = ctx.registry.track(source).id
+    assert ctx.registry.id_for(final) == file_id
+    assert ctx.registry.id_for(outsider) is None
+    assert ctx.registry.current_paths() == [neighbor, final]
+    assert stages.TagWritingStage().execute([source, final, source], ctx, repo, ui) == [
+        final
+    ]
+    assert ctx.registry.current_paths() == [neighbor, final]
+    assert repo.read_tags_uncached(final).tags == AudioTags('Artist', 'Title')
+    assert ctx.get_stat('tags_written') == ctx.get_stat('artists_normalized') == 1
+    assert ctx.get_stat('renamed_by_tags') == 2
+
+
+def test_missing_file_uses_model_path_and_disappeared_file_stays_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = tmp_path / 'Track  Name.mp3'
+    current = tmp_path / 'Track Name.mp3'
+    final = tmp_path / 'Artist - Track Name.mp3'
+    gone = tmp_path / 'Gone.mp3'
+    original.write_bytes(b'original')
+    gone.touch()
+    ctx, repo, ui = SessionContext(True, False), MemoryRepository(), Interactor()
+    assert stages.TagRenamingStage().execute([original, gone], ctx, repo, ui) == [
+        original,
+        gone,
+    ]
+    original_id, gone_id = ctx.file_ids([original, gone])
+    gone.unlink()
+    assert ctx.present_path(gone_id) is None
+    gone.touch()
+
+    def model_rename(
+        old: Path, new: Path, _: SessionContext, tags: TagRepository, ui: UserInteractor
+    ) -> tuple[str, Path]:
+        simulate_rename(old, new, tags, ui)
+        return 'planned', new
+
+    monkeypatch.setattr(stages, '_file_executor', FileExecutor(model_rename))
+    monkeypatch.setattr('file_operations.modification_allowed', Mock(return_value=True))
+    monkeypatch.setattr(stages, 'modification_allowed', Mock(return_value=True))
+    assert stages.NormalizationStage().execute([original, gone], ctx, repo, ui) == [
+        current
+    ]
+    assert ctx.missing_files == [current]
+    monkeypatch.setattr(ui, 'prompt', Mock(side_effect=['', 'Artist']))
+    assert stages.ManualInputStage().execute(
+        [original, current, gone], ctx, repo, ui
+    ) == [final]
+    assert not ctx.missing_files
+    assert ctx.registry.id_for(final) == original_id
+    assert not repo.writes and not ctx.get_stat('manual_input')
+    assert (
+        original.read_bytes() == b'original'
+        and not current.exists()
+        and not final.exists()
+    )
+
+
+def test_modeled_tag_write_after_rename_uses_current_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = tmp_path / 'Artist - Title (vksaver).mp3'
+    current = tmp_path / 'Artist - Title.mp3'
+    original.write_bytes(b'original')
+    ctx, repo, ui = SessionContext(True, False), MemoryRepository(), Interactor()
+    guard = Mock(return_value=True)
+    monkeypatch.setattr('file_operations.modification_allowed', guard)
+
+    def plan_rename(
+        old: Path, new: Path, _: SessionContext, tags: TagRepository, ui: UserInteractor
+    ) -> tuple[str, Path]:
+        simulate_rename(old, new, tags, ui)
+        return 'planned', new
+
+    executor = FileExecutor(plan_rename)
+    assert executor.rename(original, current, ctx, repo, ui).is_model_change
+    assert executor.write_tags(
+        original, 'Artist', 'Title', ctx, repo, ui
+    ).is_model_change
+    assert (
+        executor.write_tags(current, 'Artist', 'Title', ctx, repo, ui).status
+        is OperationStatus.NOOP
+    )
+    assert ctx.registry.current_paths() == [current]
+    assert ctx.registry.track(original).id == ctx.registry.id_for(current)
+    assert repo.get_tags(current).complete_tags == AudioTags('Artist', 'Title')
+    assert all(call.args[0] == current for call in guard.call_args_list)
+    assert (
+        not repo.writes
+        and original.read_bytes() == b'original'
+        and not current.exists()
+    )
+
+
+@pytest.mark.parametrize('uncertain', [False, True])
+def test_unconfirmed_tag_write_blocks_dependent_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, uncertain: bool
+) -> None:
+    source = tmp_path / 'Artist - Title (vksaver).mp3'
+    source.write_bytes(b'original')
+    ctx, repo, ui = SessionContext(False, False), TagRepository(), Interactor()
+    parser = Mock(return_value=Mock(tags={}, info=None))
+    monkeypatch.setattr('tag_repository.MP3', parser)
+    status = OperationStatus.UNCERTAIN if uncertain else OperationStatus.ERROR
+    publish = Mock(return_value=(status, 'publication failed'))
+    monkeypatch.setattr(FileExecutor, '_publish_tag_change', staticmethod(publish))
+    monkeypatch.setattr('file_operations.modification_allowed', Mock(return_value=True))
+    journal = Mock()
+    monkeypatch.setattr('tag_repository.log_operation', journal)
+    rename = Mock()
+    executor = FileExecutor(rename)
+    monkeypatch.setattr(stages, '_file_executor', executor)
+    write_tags = Mock(wraps=executor.write_tags)
+    monkeypatch.setattr(executor, 'write_tags', write_tags)
+
+    assert stages.TagWritingStage().execute([source, source], ctx, repo, ui) == [source]
+    assert write_tags.call_count == journal.call_count == 1
+    # Та же ошибка на входе исполнителя возвращает типизированный исход.
+    direct_ctx = SessionContext(False, False)
+    outcome = executor.write_tags(source, 'Artist', 'Title', direct_ctx, repo, ui)
+    assert outcome.status is (
+        OperationStatus.UNCERTAIN if uncertain else OperationStatus.ERROR
+    )
+    assert publish.call_count == 2
+    assert not rename.called and ctx.is_path_blocked(source)
+    assert (
+        repo.get_tags(source).status is ReadStatus.EMPTY
+        and source.read_bytes() == b'original'
+    )
+    assert ctx.get_stat('tags_written') == ctx.get_stat('renamed_by_tags') == 0
+
+
+@windows
 @pytest.mark.parametrize('blocked_before', [False, True])
-def test_artist_rescan_and_write_failure_block_rename(
+def test_artist_write_failure_blocks_rename(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocked_before: bool
 ) -> None:
     canonical, variant = tmp_path / 'Artist - One.mp3', tmp_path / 'artist - Two.mp3'
@@ -183,24 +715,25 @@ def test_artist_rescan_and_write_failure_block_rename(
     repo.simulate_update_tags(variant, 'artist', 'Two')
     repo.succeed = False
     ctx, ui = SessionContext(False, False, target_dir=tmp_path), Interactor()
+    admit(ctx, canonical, variant)
     if blocked_before:
         ctx.block_path(variant, '')
     rename = Mock(side_effect=AssertionError('dependent rename'))
     monkeypatch.setattr(Path, 'rename', rename)
-    stages.ArtistNormalizationStage().execute([], ctx, repo, ui)
+    stages.ArtistNormalizationStage().execute([canonical, variant], ctx, repo, ui)
     assert len(repo.writes) == (0 if blocked_before else 1)
     assert not rename.called and ctx.is_path_blocked(variant)
     assert canonical.read_bytes() == b'one' and variant.read_bytes() == b'two'
 
 
-def test_manual_rescan_keeps_blocked_missing_file(tmp_path: Path) -> None:
+def test_manual_stage_keeps_blocked_missing_file(tmp_path: Path) -> None:
     path = tmp_path / 'Track.mp3'
     path.write_bytes(b'original')
     ctx = SessionContext(False, False, target_dir=tmp_path)
     ctx.missing_files = [path]
     ctx.block_path(path, '')
     ui, repo = Interactor(), MemoryRepository()
-    stages.ManualInputStage().execute([], ctx, repo, ui)
+    stages.ManualInputStage().execute([path], ctx, repo, ui)
     assert ctx.missing_files == [path]
     assert not any('Введите исполнителя' in prompt for prompt in ui.prompts)
     assert not repo.writes and path.read_bytes() == b'original'
@@ -215,7 +748,7 @@ def test_tag_writing_rejects_hardlink(tmp_path: Path, dry_run: bool) -> None:
     alias.hardlink_to(path)
     repo, ctx = MemoryRepository(), SessionContext(dry_run, False)
     stages.TagWritingStage().execute([path], ctx, repo, Interactor())
-    assert not repo.writes and repo.get_tags(path) is None
+    assert not repo.writes and repo.get_tags(path).complete_tags is None
     assert ctx.is_path_blocked(path)
     assert path.read_bytes() == alias.read_bytes() == b'original'
 
@@ -233,7 +766,7 @@ def test_wsl_mounted_tag_write_refused(dry_run: bool) -> None:
         repo, ctx, ui = MemoryRepository(), SessionContext(dry_run, False), Interactor()
         stages.TagWritingStage().execute([path], ctx, repo, ui)
         assert ctx.is_path_blocked(path)
-        assert not repo.writes and repo.get_tags(path) is None
+        assert not repo.writes and repo.get_tags(path).complete_tags is None
         assert not ctx.get_stat('tags_written')
         assert 'Модификация на монтированных файловых системах WSL' in '\n'.join(
             ui.messages
