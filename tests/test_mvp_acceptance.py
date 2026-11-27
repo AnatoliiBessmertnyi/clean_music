@@ -444,6 +444,13 @@ def test_safe_qualifier_slash(
         ("(from 'Work_)", '(from "Work")', '(from Work)', ['1']),
         ('[Part_One-Two]', '[Part:One:Two]', '[Part-One-Two]', ['2']),
         ('[Part Work]', '[Part:Work]', '[Part-Work]', ['2']),
+        ('(From _22Work_22)', '(From "Work")', '(From Work)', ['1']),
+        (
+            '(From _22Work_22) [Mix _22A_22] (feat. Guest)',
+            '(From "Work") [Mix "A"] (feat. Guest)',
+            '(From Work) [Mix A] (feat. Guest)',
+            ['1'],
+        ),
     ],
 )
 def test_safe_ambiguous_qualifier_choice(
@@ -522,7 +529,9 @@ def test_deep_qualifier_choice_before_duplicate_analysis(
 
 @windows
 @pytest.mark.parametrize('choice', ['', 't'])
-@pytest.mark.parametrize('source_group', ['from _Work_', 'from _Work-'])
+@pytest.mark.parametrize(
+    'source_group', ['from _Work_', 'from _Work-', 'from _22Work_22']
+)
 def test_deep_quote_projection_is_not_duplicate_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, choice: str, source_group: str
 ) -> None:
@@ -549,6 +558,55 @@ def test_deep_quote_projection_is_not_duplicate_evidence(
     assert 'Уточнения (имя): from Work' in report
     if not choice:
         assert f'Уточнения (имя): {source_group}' in report
+    assert snapshot(root) == before
+
+
+@windows
+def test_safe_legacy_quotes_preserve_whole_name_until_explicit_choice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / 'music'
+    root.mkdir()
+    source = root / 'Artist Title (From _22Work_22).mp3'
+    title = 'Title (From "Work")'
+    synthetic_audio(source, title=title)
+    original = source.read_bytes()
+    for dry_run in (True, False):
+        _, report = run_cli(
+            tmp_path, monkeypatch, ['safe', str(root), '', ''], dry_run=dry_run
+        )
+        assert not any(
+            op.get('kind') in ('rename', 'tags') for op in report_operations(report)
+        )
+        assert list(root.glob('*.mp3')) == [source]
+        assert source.read_bytes() == original
+    _, report = run_cli(tmp_path, monkeypatch, ['safe', str(root), '', 't'])
+    target = root / 'Artist - Title (From Work).mp3'
+    assert f'{source.name} → {target.name}' in report
+    assert target.read_bytes() == original
+    assert TagRepository().read_tags_uncached(target).tags == AudioTags('Artist', title)
+
+
+@windows
+def test_deep_literal_legacy_text_keeps_canonical_numbered_copy_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / 'music'
+    root.mkdir()
+    title = 'Title (From _22Work_22)'
+    source = root / f'Artist - {title}.mp3'
+    numbered = root / f'Artist - {title} (1).mp3'
+    synthetic_audio(source, title=title)
+    shutil.copyfile(source, numbered)
+    before = snapshot(root)
+    _, report = run_cli(
+        tmp_path, monkeypatch, ['deep', 'run', str(root), 'n'], dry_run=True
+    )
+    ops = report_operations(report)
+    assert not any(op.get('kind') in ('rename', 'tags') for op in ops)
+    assert [op['path'] for op in ops if op.get('kind') == 'duplicate_delete'] == [
+        str(numbered)
+    ]
     assert snapshot(root) == before
 
 
