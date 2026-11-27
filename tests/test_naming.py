@@ -21,6 +21,24 @@ def test_windows_form_requires_literal_text_outside_replacements(source: str) ->
     assert proposed == f'Title (Part-Work;End) ({source})'
 
 
+@pytest.mark.parametrize(
+    'raw, sanitized, source',
+    [
+        ('"Work"', 'Work', '_22Other_22'),
+        (':Work:', 'Work', '_22Work_22'),
+        ('"Work"', 'Work', '_23Work_23'),
+    ],
+)
+def test_legacy_quote_requires_matching_text_and_quote_positions(
+    raw: str, sanitized: str, source: str
+) -> None:
+    target = f'Title (From {sanitized})'
+    group = f'(From {source})'
+    assert qualifier_name_candidate(
+        target, f'Title {group}', f'Title (From {raw})'
+    ) == (f'{target} {group}', False)
+
+
 class TestNormalizeTitleSpacing:
     """Тесты для normalize_title_spacing."""
 

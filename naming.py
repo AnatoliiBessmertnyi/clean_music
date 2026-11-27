@@ -120,14 +120,16 @@ def _matches_windows_form(raw: str, value: str) -> bool:
     for char in raw:
         options: tuple[str, ...] = (char,)
         if INVALID_FILENAME_CHARS.fullmatch(char):
-            options = ('', '_', '-', ' ', "'") if char == '"' else ('', '_', '-', ' ')
+            options = ('', '_', '-', ' ')
+            if char == '"':
+                options += ("'", '_22')
         following = set()
         for pos in positions:
             for option in options:
                 if not option or (option == ' ' and padded[pos - 1] == ' '):
                     following.add(pos)
                 elif padded.startswith(option, pos):
-                    following.add(pos + 1)
+                    following.add(pos + len(option))
         if not following:
             return False
         positions = following
