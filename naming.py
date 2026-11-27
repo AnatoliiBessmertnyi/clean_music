@@ -159,12 +159,6 @@ def qualifier_name_candidate(
         other: [raw for raw in raw_keys if _matches_windows_form(raw, other)]
         for other in available
     }
-    if (
-        groups
-        and cleaned.endswith(' ' + groups[-1])
-        and COPY_SUFFIX.fullmatch(' ' + groups[-1])
-    ):
-        groups = groups[:-1]
     unmatched = []
     for group in groups:
         value = key(group)
