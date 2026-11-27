@@ -71,15 +71,15 @@ def test_deep_cli_plan_apply_and_repeat(
     winner_id = inspect_file(a)
 
     prompts, planned = run_cli(
-        tmp_path, monkeypatch, ['deep', 'run', str(plan), 'n'], dry_run=True
+        tmp_path, monkeypatch, ['deep', 'run', str(plan)], dry_run=True
     )
-    assert prompts.call_count == 4
+    assert prompts.call_count == 3
     assert 'прогноз удаления' in capsys.readouterr().out
     assert {path.name: path.read_bytes() for path in plan.iterdir()} == before
     assert not settings_path().exists()
 
-    prompts, applied = run_cli(tmp_path, monkeypatch, ['deep', 'run', str(root), 'n'])
-    assert prompts.call_count == 4
+    prompts, applied = run_cli(tmp_path, monkeypatch, ['deep', 'run', str(root)])
+    assert prompts.call_count == 3
     assert 'Точные дубли будут удалены безвозвратно' in capsys.readouterr().out
     assert not b.exists() and not c.exists()
     assert inspect_file(a) == winner_id

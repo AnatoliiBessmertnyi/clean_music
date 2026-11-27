@@ -71,20 +71,10 @@ def test_cli_collection_matrix(
             del expected_paths[copy]
 
     answers = ['deep', 'run'] if deep else ['safe']
-    # Оставляем номера копий для этапа анализа. Принимаем остальные
-    # предложения этапа переименования по тегам в порядке списка CLI.
-    rename_candidates = [
-        p.name for p in root.iterdir() if p.name in {copy, version.name, case, conflict}
-    ]
-    excluded = ' '.join(
-        str(i)
-        for i, name in enumerate(rename_candidates, 1)
-        if name in {copy, version.name}
-    )
     prompts, report = run_cli(
         tmp_path,
         monkeypatch,
-        [*answers, str(root), 'y', excluded, 'n'],
+        [*answers, str(root), 'y', '', 'n'],
         dry_run=dry_run,
     )
     output = capsys.readouterr().out
@@ -330,7 +320,6 @@ def test_name_only_version_reaches_deep_analysis(
         assert source.read_bytes() == original
     shutil.copyfile(source, root / 'Artist - Title (1).mp3')
     before = snapshot(root)
-    # Keep the numbered candidate for duplicate analysis.
     _, report = run_cli(
         tmp_path, monkeypatch, ['deep', 'run', str(root), 'n'], dry_run=True
     )
@@ -608,6 +597,92 @@ def test_deep_literal_legacy_text_keeps_canonical_numbered_copy_decision(
         str(numbered)
     ]
     assert snapshot(root) == before
+
+
+@windows
+@pytest.mark.parametrize(
+    ('title', 'suffixes', 'redundant'),
+    [
+        ('Title', [' (1)', ' (2)'], []),
+        ('Title', ['', ' (1) (2)'], []),
+        ('Title', [' (1)'], []),
+        ('Title (1)', ['', ' (1)'], [' (1)']),
+        ('Title', ['', ' (01)', ' (0)'], []),
+        ('Title', ['', ' (1)', ' (2)'], [' (1)', ' (2)']),
+    ],
+)
+def test_copy_suffixes_reach_deep_with_original_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    title: str,
+    suffixes: list[str],
+    redundant: list[str],
+) -> None:
+    root = tmp_path / 'music'
+    root.mkdir()
+    base = f'Artist - {title}'
+    paths = [root / f'{base}{suffix}.mp3' for suffix in suffixes]
+    synthetic_audio(paths[0], title=title)
+    for path in paths[1:]:
+        shutil.copyfile(paths[0], path)
+    original = paths[0].read_bytes()
+    for mode, dry_run in [
+        ('safe', True),
+        ('safe', False),
+        ('safe', False),
+        ('deep', True),
+    ]:
+        answers = ['deep', 'run'] if mode == 'deep' else ['safe']
+        _, report = run_cli(
+            tmp_path, monkeypatch, [*answers, str(root), ''], dry_run=dry_run
+        )
+        ops = report_operations(report)
+        assert not any(op.get('kind') in ('rename', 'tags') for op in ops)
+        assert {
+            Path(op['path']).name for op in ops if op.get('kind') == 'duplicate_delete'
+        } == (
+            {f'{base}{suffix}.mp3' for suffix in redundant} if mode == 'deep' else set()
+        )
+        assert set(root.glob('*.mp3')) == set(paths)
+        assert all(path.read_bytes() == original for path in paths)
+
+
+@windows
+@pytest.mark.parametrize('occupied', [False, True])
+def test_rename_keeps_version_and_number_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, occupied: bool
+) -> None:
+    root = tmp_path / 'music'
+    root.mkdir()
+    tail = 'Title (Album Version) [Live] (2) (1)'
+    source = root / f'Old - {tail}.mp3'
+    target = root / f'Artist - {tail}.mp3'
+    synthetic_audio(source, title='Title (Album Version)')
+    original = source.read_bytes()
+    if occupied:
+        synthetic_audio(target, title='Title (Album Version)', frequency=660)
+    target_before = target.read_bytes() if occupied else None
+    for dry_run in (True, False, False):
+        should_rename = source.exists()
+        _, report = run_cli(
+            tmp_path, monkeypatch, ['safe', str(root), ''], dry_run=dry_run
+        )
+        renames = [op for op in report_operations(report) if op.get('kind') == 'rename']
+        if should_rename:
+            [rename] = renames
+            assert Path(rename['path']) == source
+            assert Path(rename['target']) == target
+            assert rename['result'] == (
+                'конфликт' if occupied else 'ПРЕДЛОЖЕНИЕ' if dry_run else 'успех'
+            )
+        else:
+            assert not renames
+        if dry_run or occupied:
+            assert source.read_bytes() == original
+        if occupied:
+            assert target.read_bytes() == target_before
+        elif not dry_run:
+            assert not source.exists() and target.read_bytes() == original
 
 
 @windows
