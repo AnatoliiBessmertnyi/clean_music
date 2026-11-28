@@ -316,11 +316,10 @@ def test_cli_eof_before_path_is_logged(
 ) -> None:
     monkeypatch.setattr(cli, '__file__', str(tmp_path / 'main.py'))
     monkeypatch.setattr('builtins.input', Mock(side_effect=['', EOFError]))
-    with pytest.raises(EOFError):
-        cli.main()
+    cli.main()
     log = next((tmp_path / 'logs').glob('*.log'))
     text = log.read_text(encoding='utf-8')
-    assert 'ВОПРОС: Введите путь к папке:' in text
+    assert 'ВОПРОС: 2/2 Укажите папку:' in text
     assert 'Папка не выбрана' in text
 
 

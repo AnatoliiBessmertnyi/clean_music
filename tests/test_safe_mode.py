@@ -36,24 +36,24 @@ def test_mode_lifecycle(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     path = settings_path()
-    enter_collection = Mock(side_effect=EOFError)
+    enter_collection = Mock(return_value=path.parents[2])
+    monkeypatch.setattr(cli, '_process', Mock())
+    # Настоящая сессия восстановления работает только во временной папке.
+    monkeypatch.setattr(cli, 'windows_local_ntfs', lambda _: True)
     monkeypatch.setattr(cli, 'get_valid_path', enter_collection)
     for answers, starts, preferred in [
-        ([''], True, 'safe'),
+        ([''], True, None),
+        (['safe'], True, 'safe'),
         ([''], True, 'safe'),
         (['deep', 'deep'], False, 'deep'),
         (['run'], True, 'deep'),
-        ([''], False, 'deep'),
+        ([''], True, 'deep'),
         (['once'], True, 'deep'),
         (['safe'], True, 'safe'),
     ]:
         enter_collection.reset_mock()
         cli_prompts.side_effect = answers
-        if starts:
-            with pytest.raises(EOFError):
-                cli.main()
-        else:
-            cli.main()
+        cli.main()
         assert enter_collection.call_count == int(starts)
         assert load_mode(path) == preferred
         output = capsys.readouterr().out
@@ -63,7 +63,7 @@ def test_mode_lifecycle(
             assert 'Сохранённое предпочтение остаётся прежним' in output
 
 
-@pytest.mark.parametrize('answer', ['', 'cancel', EOFError(), KeyboardInterrupt()])
+@pytest.mark.parametrize('answer', ['cancel', EOFError(), KeyboardInterrupt()])
 def test_deep_exit_never_reaches_recovery(
     answer: str | BaseException, cli_prompts: Mock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -109,8 +109,7 @@ def test_bad_settings_offer_safe(
         path.write_text(payload, encoding='utf-8')
     cli_prompts.side_effect = ['']
     monkeypatch.setattr(cli, 'get_valid_path', Mock(side_effect=EOFError))
-    with pytest.raises(EOFError):
-        cli.main()
+    cli.main()
     output = capsys.readouterr().out
     assert 'Не удалось прочитать настройки' in output
     assert 'Выбран безопасный режим' in output
@@ -350,3 +349,28 @@ def test_tag_model_matches_successful_cli_run(
             'Other - Clash.mp3': AudioTags('Other', 'Clash'),
         }
     )
+
+
+@pytest.mark.parametrize('interrupt', [EOFError(), KeyboardInterrupt()])
+@pytest.mark.parametrize('answers', [['2'], ['3', 'run']])
+def test_path_interrupt_precedes_collection_and_save(
+    cli_prompts: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt: BaseException,
+    answers: list[str],
+) -> None:
+    cli_prompts.side_effect = [*answers, '   ', interrupt]
+    monkeypatch.setattr(cli, 'find_ffmpeg_tool', Mock(side_effect=AssertionError))
+    monkeypatch.setattr(cli, 'RecoveryStore', Mock(side_effect=AssertionError))
+    cli.main()
+    assert not settings_path().exists()
+
+
+def test_invalid_folder_preserves_preference(
+    cli_prompts: Mock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_mode(settings_path(), 'deep')
+    cli_prompts.side_effect = ['2', str(tmp_path / 'missing')]
+    monkeypatch.setattr(cli, 'RecoveryStore', Mock(side_effect=AssertionError))
+    cli.main()
+    assert load_mode(settings_path()) == 'deep'

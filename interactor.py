@@ -1,6 +1,8 @@
 """Интерфейс и реализация взаимодействия с пользователем."""
 
 import logging
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 from user_settings import Mode, load_mode, save_mode, settings_path
@@ -40,101 +42,125 @@ def prompt_command(interactor: UserInteractor, message: str, default: str = '') 
     return interactor.prompt(message, default=default).strip().lower()
 
 
-def choose_mode(interactor: UserInteractor, *, dry_run: bool) -> Mode | None:
-    """Выбирает режим обработки с явным подтверждением deep."""
+_MENU = (
+    ('once', 'Safe один раз — без изменения предпочтения'),
+    ('safe', 'Сохранить safe и запустить'),
+    ('confirm', 'Запустить deep — после run сохранить deep (кроме dry-run)'),
+    ('remember_deep', 'Сохранить deep и выйти'),
+    ('cancel', 'Отмена'),
+)
+
+
+def _warn_deep(ui: UserInteractor, dry_run: bool) -> None:
+    if dry_run:
+        ui.display(
+            'Deep в dry-run выполняет прогноз удаления. Для запуска введите run.'
+        )
+    else:
+        ui.display(
+            'Программа не может проверить отсутствие сторонних изменений. '
+            'Они могут добавить поток NTFS или подменить имя после проверки.'
+        )
+        ui.display(
+            'Точные дубли будут удалены безвозвратно. Приостановите синхронизацию '
+            'и другие программы, которые могут менять эту папку. Для запуска введите run'
+        )
+
+
+def _line_action(ui: UserInteractor, preferred: Mode | None, dry_run: bool) -> str:
+    if preferred == 'deep':
+        _warn_deep(ui, dry_run)
+    for number, (_, label) in enumerate(_MENU, 1):
+        ui.display(f'[{number}] {label}')
+    aliases = {str(i): action for i, (action, _) in enumerate(_MENU, 1)}
+    aliases.update(
+        {
+            '': 'once',
+            'once': 'once',
+            'safe': 'safe',
+            'cancel': 'cancel',
+            'deep': 'confirm',
+        }
+    )
+    if preferred == 'deep':
+        aliases.update({'deep': 'remember_deep', 'run': 'run'})
+    while True:
+        answer = prompt_command(
+            ui, '1/2 Выберите номер или команду [1 — Safe один раз]: '
+        )
+        if answer in aliases:
+            return aliases[answer]
+        ui.display_error('Неизвестная команда. Выберите вариант из меню.')
+
+
+@dataclass(frozen=True)
+class ModeChoice:
+    mode: Mode
+    remember: bool
+    path: Path | None
+
+    def save_preference(self, ui: UserInteractor) -> None:
+        if self.remember:
+            try:
+                if self.path is None:
+                    raise OSError('путь недоступен')
+                save_mode(self.path, self.mode)
+            except OSError as exc:
+                ui.display_error(f'Не удалось сохранить предпочтение: {exc}')
+            else:
+                ui.display(f'Сохранено предпочтение: {self.mode}.')
+
+
+def choose_mode(interactor: UserInteractor, *, dry_run: bool) -> ModeChoice | None:
     path = None
     preferred = None
+    interactor.display('1/2 Выберите режим')
     try:
         path = settings_path()
         preferred = load_mode(path)
+        if preferred:
+            interactor.display(f'Сохранённое предпочтение: {preferred}.')
     except (OSError, RuntimeError, ValueError) as exc:
         interactor.display_error(
             f'Не удалось прочитать настройки: {exc}. Доступен safe.'
         )
 
-    def remember(mode: Mode) -> None:
-        if dry_run:
-            interactor.display(
-                'В dry-run предпочтение сохраняется только на этот запуск.'
-            )
-            return
-        if path is None:
-            interactor.display_error(
-                'Не удалось сохранить предпочтение: путь недоступен.'
-            )
-            return
-        try:
-            save_mode(path, mode)
-        except OSError as exc:
-            interactor.display_error(f'Не удалось сохранить предпочтение: {exc}')
-        else:
-            interactor.display(
-                f'Сохранено предпочтение для следующего запуска: {mode}.'
-            )
-
-    def choose_after_deep() -> Mode | None:
-        if dry_run:
-            interactor.display(
-                'Deep в dry-run выполняет прогноз удаления. Для запуска введите run.'
-            )
-        else:
-            interactor.display(
-                'Программа не может проверить отсутствие сторонних изменений. '
-                'Они могут добавить поток NTFS или подменить имя после проверки.'
-            )
-            interactor.display(
-                'Точные дубли будут удалены безвозвратно. Приостановите синхронизацию '
-                'и другие программы, которые могут менять эту папку. Для запуска введите run'
-            )
-        while True:
-            choice = prompt_command(
-                interactor,
-                'once — запустить safe один раз, safe — сохранить и запустить safe, '
-                'run — запустить deep, deep — сохранить deep и выйти, Enter/cancel — выйти: ',
-            )
-            if choice in ('', 'cancel'):
-                return None
-            if choice == 'run':
-                if preferred != 'deep':
-                    remember('deep')
-                return 'deep'
-            if choice == 'once':
-                interactor.display(
-                    'Разовый запуск safe. Сохранённое предпочтение остаётся прежним.'
-                )
-                return 'safe'
-            if choice == 'safe' or choice == 'deep':
-                mode: Mode = 'safe' if choice == 'safe' else 'deep'
-                if mode != preferred:
-                    remember(mode)
-                return 'safe' if mode == 'safe' else None
-            interactor.display_error('Неизвестная команда. Выберите вариант из меню.')
-
     try:
-        if preferred == 'deep':
-            interactor.display('Сохранённое предпочтение: deep.')
-            return choose_after_deep()
-        if preferred == 'safe':
-            interactor.display('Сохранённое предпочтение: safe.')
-        while True:
-            choice = prompt_command(
-                interactor,
-                'Enter/safe — запустить безопасный режим, deep — выбрать глубокий, '
-                'cancel — выйти: ',
-                default='safe',
-            )
-            if choice == 'safe':
-                if preferred != 'safe':
-                    remember('safe')
-                return 'safe'
-            if choice == 'deep':
-                return choose_after_deep()
-            if choice == 'cancel':
-                return None
-            interactor.display_error('Неизвестная команда. Выберите вариант из меню.')
-    except (EOFError, KeyboardInterrupt):
-        interactor.display('Выбор режима прерван. Обработка не начата.')
+        action = _line_action(interactor, preferred, dry_run)
+        if action == 'confirm':
+            _warn_deep(interactor, dry_run)
+            while True:
+                answer = prompt_command(
+                    interactor, '1/2 run — запустить deep, Enter/cancel — выйти: '
+                )
+                if answer in ('', 'cancel', 'once', 'safe', 'deep', 'run'):
+                    action = {'': 'cancel', 'deep': 'remember_deep'}.get(answer, answer)
+                    break
+                interactor.display_error('Для запуска deep требуется команда run.')
+    except (EOFError, KeyboardInterrupt) as exc:
+        interactor.display(f'1/2 {type(exc).__name__}: выбор прерван.')
+        action = 'cancel'
+
+    mode: Mode | None = None
+    if action in ('once', 'safe'):
+        mode = 'safe'
+    elif action == 'run':
+        mode = 'deep'
+
+    interactor.display(f'1/2 Выбор режима: {action}. Запуск: {mode or "отмена"}.')
+    if action == 'once':
+        interactor.display(
+            'Разовый запуск safe. Сохранённое предпочтение остаётся прежним.'
+        )
+    if action == 'remember_deep':
+        ModeChoice('deep', not dry_run and preferred != 'deep', path).save_preference(
+            interactor
+        )
+    if mode is None:
         return None
+    return ModeChoice(
+        mode, action != 'once' and mode != preferred and not dry_run, path
+    )
 
 
 class ConsoleInteractor:

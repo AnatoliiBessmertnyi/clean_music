@@ -32,13 +32,10 @@ from tag_repository import TagRepository
 def get_valid_path() -> Path:
     """Запрашивает у пользователя путь и проверяет его корректность."""
     while True:
-        raw = logged_input('Введите путь к папке: ').strip().strip('"')
-        path_obj = Path(raw)
-        if path_obj.is_dir():
-            return path_obj
-        ConsoleInteractor().display(
-            'Ошибка: путь не является папкой. Попробуйте снова.'
-        )
+        raw = logged_input('2/2 Укажите папку: ').strip().strip('"')
+        if raw.strip():
+            return Path(raw)
+        ConsoleInteractor().display_error('Введите непустой путь к папке.')
 
 
 def get_audio_files(
@@ -118,15 +115,22 @@ def _run(report: RunReport, recovery_session: ExitStack) -> None:
     mode = choose_mode(interactor, dry_run=ctx.dry_run)
     if mode is None:
         return
-    ctx.deep = mode == 'deep'
+    ctx.deep = mode.mode == 'deep'
     interactor.display(
         'Выбран глубокий режим (deep).'
         if ctx.deep
         else 'Выбран безопасный режим (safe).'
     )
     repo = TagRepository()
-    target_dir = get_valid_path()
+    try:
+        target_dir = get_valid_path()
+    except (EOFError, KeyboardInterrupt) as exc:
+        interactor.display(f'2/2 {type(exc).__name__}: запуск отменён.')
+        return
+    execution = 'прогноз' if ctx.dry_run else 'обычный запуск'
+    interactor.display(f'2/2 Выбрано: {target_dir} | {mode.mode} | {execution}')
     ctx.target_dir = target_dir
+    interactor.display('Проверка инструментов...')
     notices = []
     if find_ffmpeg_tool('ffprobe') is None:
         notices.append(
@@ -142,8 +146,12 @@ def _run(report: RunReport, recovery_session: ExitStack) -> None:
         interactor.display(' '.join(notices))
     diagnostic = ctx.dry_run or os.name != 'nt'
     try:
+        interactor.display('Проверка папки и восстановление...')
+        if not target_dir.is_dir():
+            raise OSError('путь не является доступной папкой')
         if os.name == 'nt' and not windows_local_ntfs(target_dir.absolute()):
             raise OSError('требуется локальный NTFS в Windows')
+        mode.save_preference(interactor)
         recovery = RecoveryStore(target_dir, diagnostic=diagnostic)
         if recovery_session.enter_context(recovery.session()):
             recover_renames(recovery, ctx, interactor, diagnostic=diagnostic)
