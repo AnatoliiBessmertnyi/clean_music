@@ -23,9 +23,11 @@ def test_default_preserves_settings(
         path.parent.mkdir(parents=True)
         path.write_bytes(b'broken')
     before = path.read_bytes() if path.exists() else None
-    monkeypatch.setattr('builtins.input', lambda _: '')
+    answers = iter(['', 'run'] if preferred == 'deep' else [''])
+    monkeypatch.setattr('builtins.input', lambda _: next(answers))
     choice = ui.choose_mode(ui.ConsoleInteractor(), dry_run=dry_run)
-    assert choice and choice.mode == 'safe' and not choice.remember
+    assert choice and choice.mode == ('deep' if preferred == 'deep' else 'safe')
+    assert not choice.remember
     assert (path.read_bytes() if path.exists() else None) == before
 
 

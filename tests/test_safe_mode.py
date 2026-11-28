@@ -47,7 +47,8 @@ def test_mode_lifecycle(
         ([''], True, 'safe'),
         (['deep', 'deep'], False, 'deep'),
         (['run'], True, 'deep'),
-        ([''], True, 'deep'),
+        (['', ''], False, 'deep'),
+        (['', 'run'], True, 'deep'),
         (['once'], True, 'deep'),
         (['safe'], True, 'safe'),
     ]:

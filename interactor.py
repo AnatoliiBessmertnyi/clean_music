@@ -74,12 +74,14 @@ def _line_action(ui: UserInteractor, preferred: Mode | None, dry_run: bool) -> s
     )
     if dry_run:
         ui.display('Сейчас включён прогноз: файлы и настройка режима не изменятся.')
+    default_number = {'safe': '2', 'deep': '3'}.get(preferred or '', '1')
     for number, (_, label) in enumerate(_MENU, 1):
-        ui.display(f'[{number}] {label}')
+        marker = ' (по умолчанию)' if str(number) == default_number else ''
+        ui.display(f'[{number}] {label}{marker}')
     aliases = {str(i): action for i, (action, _) in enumerate(_MENU, 1)}
     aliases.update(
         {
-            '': 'once',
+            '': aliases[default_number],
             'once': 'once',
             'safe': 'safe',
             'cancel': 'cancel',
@@ -91,7 +93,7 @@ def _line_action(ui: UserInteractor, preferred: Mode | None, dry_run: bool) -> s
         _warn_deep(ui, dry_run)
         aliases.update({'deep': 'remember_deep', 'run': 'run'})
     while True:
-        answer = prompt_command(ui, 'Ваш выбор (Enter = 1): ')
+        answer = prompt_command(ui, f'Ваш выбор (Enter = {default_number}): ')
         if answer in aliases:
             return aliases[answer]
         ui.display_error('Неизвестная команда. Выберите вариант из меню.')
