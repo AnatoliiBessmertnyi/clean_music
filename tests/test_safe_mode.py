@@ -39,11 +39,12 @@ def test_mode_lifecycle(
     enter_collection = Mock(side_effect=EOFError)
     monkeypatch.setattr(cli, 'get_valid_path', enter_collection)
     for answers, starts, preferred in [
-        ([''], True, 'safe'),
+        ([''], True, None),
+        (['safe'], True, 'safe'),
         ([''], True, 'safe'),
         (['deep', 'deep'], False, 'deep'),
         (['run'], True, 'deep'),
-        ([''], False, 'deep'),
+        ([''], True, 'deep'),
         (['once'], True, 'deep'),
         (['safe'], True, 'safe'),
     ]:
@@ -63,7 +64,7 @@ def test_mode_lifecycle(
             assert 'Сохранённое предпочтение остаётся прежним' in output
 
 
-@pytest.mark.parametrize('answer', ['', 'cancel', EOFError(), KeyboardInterrupt()])
+@pytest.mark.parametrize('answer', ['cancel', EOFError(), KeyboardInterrupt()])
 def test_deep_exit_never_reaches_recovery(
     answer: str | BaseException, cli_prompts: Mock, monkeypatch: pytest.MonkeyPatch
 ) -> None:

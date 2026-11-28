@@ -102,7 +102,7 @@ def test_deep_cli_plan_apply_and_repeat(
         == {b.name, c.name}
     )
     assert 'удалён как точная копия: 2' in applied
-    prompts, _ = run_cli(tmp_path, monkeypatch, [''])
+    prompts, _ = run_cli(tmp_path, monkeypatch, ['cancel'])
     assert prompts.call_count == 1
     assert 'Точные дубли будут удалены безвозвратно' in capsys.readouterr().out
 
