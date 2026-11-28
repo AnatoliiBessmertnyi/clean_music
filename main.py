@@ -116,11 +116,6 @@ def _run(report: RunReport, recovery_session: ExitStack) -> None:
     if mode is None:
         return
     ctx.deep = mode.mode == 'deep'
-    interactor.display(
-        'Выбран глубокий режим (deep).'
-        if ctx.deep
-        else 'Выбран безопасный режим (safe).'
-    )
     repo = TagRepository()
     try:
         target_dir = get_valid_path()

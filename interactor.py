@@ -43,10 +43,10 @@ def prompt_command(interactor: UserInteractor, message: str, default: str = '') 
 
 
 _MENU = (
-    ('once', 'Safe один раз — без изменения предпочтения'),
-    ('safe', 'Сохранить safe и запустить'),
-    ('confirm', 'Запустить deep — после run сохранить deep (кроме dry-run)'),
-    ('remember_deep', 'Сохранить deep и выйти'),
+    ('once', 'Safe один раз — запустить safe и оставить прежнюю настройку'),
+    ('safe', 'Запустить safe и запомнить safe для следующих запусков'),
+    ('confirm', 'Запустить deep и запомнить deep (потребуется run)'),
+    ('remember_deep', 'Только запомнить deep и выйти без обработки папки'),
     ('cancel', 'Отмена'),
 )
 
@@ -68,8 +68,12 @@ def _warn_deep(ui: UserInteractor, dry_run: bool) -> None:
 
 
 def _line_action(ui: UserInteractor, preferred: Mode | None, dry_run: bool) -> str:
-    if preferred == 'deep':
-        _warn_deep(ui, dry_run)
+    ui.display(
+        'Safe обрабатывает файлы без удаления дублей. '
+        'Deep дополнительно может удалить точные дубли.'
+    )
+    if dry_run:
+        ui.display('Сейчас включён прогноз: файлы и настройка режима не изменятся.')
     for number, (_, label) in enumerate(_MENU, 1):
         ui.display(f'[{number}] {label}')
     aliases = {str(i): action for i, (action, _) in enumerate(_MENU, 1)}
@@ -83,11 +87,11 @@ def _line_action(ui: UserInteractor, preferred: Mode | None, dry_run: bool) -> s
         }
     )
     if preferred == 'deep':
+        ui.display('Предупреждение для запуска deep командой run:')
+        _warn_deep(ui, dry_run)
         aliases.update({'deep': 'remember_deep', 'run': 'run'})
     while True:
-        answer = prompt_command(
-            ui, '1/2 Выберите номер или команду [1 — Safe один раз]: '
-        )
+        answer = prompt_command(ui, 'Ваш выбор (Enter = 1): ')
         if answer in aliases:
             return aliases[answer]
         ui.display_error('Неизвестная команда. Выберите вариант из меню.')
@@ -147,11 +151,12 @@ def choose_mode(interactor: UserInteractor, *, dry_run: bool) -> ModeChoice | No
     elif action == 'run':
         mode = 'deep'
 
-    interactor.display(f'1/2 Выбор режима: {action}. Запуск: {mode or "отмена"}.')
     if action == 'once':
         interactor.display(
-            'Разовый запуск safe. Сохранённое предпочтение остаётся прежним.'
+            '1/2 Выбран безопасный режим на один запуск. Сохранённое предпочтение остаётся прежним.'
         )
+    else:
+        interactor.display(f'1/2 Выбор режима: {action}. Запуск: {mode or "отмена"}.')
     if action == 'remember_deep':
         ModeChoice('deep', not dry_run and preferred != 'deep', path).save_preference(
             interactor
